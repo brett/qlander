@@ -1,0 +1,4 @@
+[test]
+# Without a qlander.yml at the root (the public repo has none), the suite
+# runs on the neutral example config.
+preload = ["./test/preload.ts"]

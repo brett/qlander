@@ -1,0 +1,155 @@
+# A neutral example config (docs/deployment.md §1.2): an invented deployment,
+# with invented names, paths and jobs. The suite runs on it in CI
+# (scripts/test-on-example.ts) as well as on the control repo's own
+# qlander.yml, so a test that passes on both can't depend on a name copied
+# from either. Some of the suite's worked cases do assume particular limits,
+# such as a batch of 8, split twice, so those numbers stay what those cases need.
+version: 1
+
+control:
+  repo: halyard/tidepool-qlander
+  repoId: 2001
+
+target:
+  repo: halyard/tidepool
+  repoId: 2002
+  main: main
+
+runner:
+  mode: self-hosted-kill
+  cronMinutes: 10
+  jobTimeoutMinutes: 5
+  hostKillMinutes: 6
+  takeoverGraceMinutes: 2
+  runsOn:
+    - self-hosted
+    - qlander
+
+lease:
+  minutes: 8
+  fenceMarginMinutes: 2
+
+queue:
+  stateBranch: qlander-state
+  refs:
+    queuePrefix: queue/
+    buildPrefix: qlander-build/
+  labels:
+    ready: ready
+    bounce: qlander:bounce
+    solo: qlander:solo
+    unsolo: qlander:unsolo
+    go: qlander:go
+    priority: qlander:priority
+  priority:
+    preempt: false
+  controlLabels:
+    pause: pause
+    mirror: qlander-state
+  admission:
+    fastLane:
+      workflow: .github/workflows/ci.yml
+      event: pull_request
+      job: fast
+    review:
+      required: false
+      producerLogins:
+        - "github-actions[bot]"
+      producer:
+        adapter: job@main
+        workflow: .github/workflows/review.yml
+        events:
+          - workflow_run
+          - workflow_dispatch
+        jobTemplate: "Reviewed {sha}"
+        runNameTemplate: "Review {sha}"
+        searchPages: 10
+  policy:
+    paths:
+      - .github/**
+      - Makefile
+      - go.sum
+      - tools/ci/**
+    trustedAutomations:
+      - login: "deps-bot[bot]"
+        id: 4242
+        paths:
+          - go.sum
+    shareBatch:
+      max: 3
+    approvers: # login AND id must both match
+      - login: alice
+        id: 1001
+      - login: bob
+        id: 1002
+  preLanding:
+    - path: .github/workflows/ci.yml
+      name: CI
+      when: always
+      required_jobs:
+        - vet
+        - compile (linux)
+        - compile (darwin)
+        - unit (parser)
+        - unit (planner)
+        - unit (storage)
+        - integration (sqlite)
+        - integration (object store)
+        - golden files
+        - docs links
+        - licence headers
+        - race detector
+        - benchmarks stay within budget
+        - fuzz smoke
+      allow_skipped_jobs:
+        pr-gate: pull-request only
+  batch:
+    min: 2
+    max: 8
+    minFill: 4
+    maxWaitMinutes: 5
+    maxSplitDepth: 2
+    breakerBounces: 3
+  budget:
+    lineage: 20
+    window: 60
+    windowHours: 24
+  timeouts:
+    noRunMinutes: 15
+    inProgressMinutes: 150
+    queuedHours: 6
+    rerunBarrierMinutes: 60
+    reconcileMinutes: 30
+    cancelWindowMinutes: 30
+    cancelGiveUpHours: 6
+    maxOpTries: 3
+  verify:
+    ticks: 2
+    days: 5
+  historyLimit: 100
+
+release:
+  branch: release
+  stateBranch: qlander-release-state
+  labels:
+    pause: release-pause
+    alert: release-blocked
+    mirror: qlander-release-state
+  enabled: true
+  dryRun: true
+  maxCandidates: 20
+  historyLimit: 100
+  qualification:
+    provider: manifest
+    manifest:
+      source: target
+      path: .github/qualification.json
+      proof:
+        statusContext: qualified
+        workflow: .github/workflows/proof.yml
+        jobTemplate: "Qualified {sha}"
+
+watchdog:
+  labels:
+    alert: qlander-alert
+    status: qlander-status

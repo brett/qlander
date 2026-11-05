@@ -1,0 +1,7 @@
+#!/bin/sh
+# The maintainer's check before anything is published (docs/deployment.md §7).
+# Everything pushed here is public at once, and a tag can't be taken back, so
+# this runs before the push leaves the machine. It needs the rules:
+# PUBLIC_SCRUB_RULES, or a --rules file, and refuses the push without them.
+# Turn it on with: git config core.hooksPath .githooks
+exec bun scripts/public-scrub.ts --fail --forbid-excluded --pre-push -

@@ -1,0 +1,71 @@
+# Rendered from qlander.yml by `bun src/cli.ts render`; do not edit by
+# hand. `bun src/cli.ts render --check` fails when this file and the config
+# disagree.
+#
+# The watchdog (docs/operating.md, Monitoring). Every 15 minutes it checks that ticks
+# are running and passing, that a runner picks them up, that no pause has
+# sat open too long and that tick.yml is enabled. It keeps one
+# `qlander-alert` issue per alert kind and rewrites the pinned status issue
+# (`qlander-status`).
+#
+# It runs on a GitHub-hosted runner on purpose: it must still run when the
+# tick's runners are down, which is one of the things it watches for.
+#
+# It holds no App key and uses no environment. Its GITHUB_TOKEN reads this
+# repo's contents (the checkout) and Actions (tick.yml runs, jobs and logs),
+# and writes issues; nothing else. Bun is the same pinned release as
+# tick.yml, verified against .github/bun-release.txt, in a fresh temp
+# directory, with no cache and no package install.
+# So is qlander: the release pinned in .github/qlander-release.txt.
+
+name: watchdog
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  watchdog:
+    name: Watchdog
+    if: github.ref == 'refs/heads/main' && github.repository_id == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: qlander-watchdog # one writer of the alert and status issues at a time
+      cancel-in-progress: false
+    permissions:
+      contents: read # check out this repo (it may be private); nothing is written
+      issues: write # the alert issues and the status issue
+      actions: read # tick.yml's state, runs, jobs and job logs
+    steps:
+      - name: Check out your-repo-qlander
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the watchdog
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          QLANDER_MODE: ${{ vars.QLANDER_MODE }}
+        run: |
+          set -euo pipefail
+          # A pinned Bun release, checked against the committed sha256, in a
+          # directory that did not exist before this step.
+          read -r version asset sum < .github/bun-release.txt
+          dir="$(mktemp -d)"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$dir/$asset" "https://github.com/oven-sh/bun/releases/download/bun-v${version}/${asset}"
+          (cd "$dir" && echo "${sum}  ${asset}" | sha256sum -c -)
+          unzip -q "$dir/$asset" -d "$dir"
+          bun="$dir/${asset%.zip}/bun"
+          # The pinned qlander release, checked against the sha256 committed in
+          # .github/qlander-release.txt before it runs. The checksum is the trust root.
+          read -r relversion relasset relsum < .github/qlander-release.txt
+          [[ "$relasset" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.js$ ]]
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output "$dir/$relasset" "https://github.com/brett/qlander/releases/download/v${relversion}/${relasset}"
+          (cd "$dir" && echo "${relsum}  ${relasset}" | sha256sum -c -)
+          "$bun" "$dir/$relasset" watchdog --config qlander.yml

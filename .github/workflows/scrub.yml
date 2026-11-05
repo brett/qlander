@@ -1,0 +1,89 @@
+# The scrub check (docs/deployment.md §7): on every PR, whatever its base, and
+# a required status on main (.github/rulesets/main.json). It scans the PR head's tree (path names included, and any deny-listed
+# path is itself a hit), every PR commit's message and author and committer
+# identity, and the PR title, body and head branch name. Any hit fails it.
+#
+# The rules name what must not appear, so they are not in the repo: they come
+# from the PUBLIC_SCRUB_RULES secret. That is why this runs on
+# pull_request_target: it runs the base branch's copy of this workflow and of
+# scripts/public-scrub.ts, and reads the PR head only as data (git objects
+# fetched and scanned, never checked out or run), so fork PRs are checked too
+# without their code ever seeing the secret. Output is --redact: a hit names
+# where it is and a rule number, never the text or the rule.
+
+name: scrub
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] the PR head is fetched as data and never checked out or executed (above)
+    types: [opened, synchronize, reopened, edited]
+
+permissions: {}
+
+concurrency:
+  group: scrub-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scrub:
+    name: public scrub
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read # the PR's title, body and branch as they are now
+    steps:
+      - name: Check out main (never the PR), whatever the PR's base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true # this job must never write a cache another workflow could read
+
+      - name: Fetch the PR head as data
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The job's token (contents: read) as a header in git's environment
+          # config (a private repo needs it), never on a command line or in .git/config.
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$SERVER/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git fetch --quiet --no-tags --no-recurse-submodules "$SERVER/$REPO.git" "+refs/pull/$PR/head:refs/scrub/head"
+          git cat-file -e "$HEAD_SHA^{commit}"
+
+      # The text is read from the API now, not from this run's event: a rerun of an
+      # older run must not pass on an old title, and a step's env is printed in its
+      # public log before any redaction.
+      - name: Scrub the tree, the commits, the title, the body and the branch name
+        env:
+          PUBLIC_SCRUB_RULES: ${{ secrets.PUBLIC_SCRUB_RULES }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/scrub"
+          mkdir -p "$t"
+          gh api "repos/$REPO/pulls/$PR" > "$t/pr.json"
+          if [ "$(jq -r .head.sha "$t/pr.json")" != "$HEAD_SHA" ]; then
+            echo "::error::this run is for an older head of the PR"
+            exit 1
+          fi
+          jq -r '.title // ""' "$t/pr.json" > "$t/pr-title"
+          jq -r '.body // ""' "$t/pr.json" > "$t/pr-body"
+          jq -r .head.ref "$t/pr.json" > "$t/branch-name"
+          rm "$t/pr.json"
+          bun scripts/public-scrub.ts --fail --redact --summary --forbid-excluded \
+            --tree "$HEAD_SHA" --commits "$BASE_SHA..$HEAD_SHA" --commit-trees "$BASE_SHA..$HEAD_SHA" \
+            --text "$t/pr-title" --text "$t/pr-body" --text "$t/branch-name"

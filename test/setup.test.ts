@@ -1,0 +1,378 @@
+// `setup` against the fake GitHub (docs/deployment.md §5): a full
+// run and an idempotent second run, missing-permission detection, the
+// ruleset refusal before install, the control `main` ruleset's parameters,
+// verify, and permission changes reported per registration and installation.
+
+import { describe, expect, test } from "bun:test";
+import { runSetup } from "../src/setup/command";
+import { controlRulesets, full, targetRulesets } from "../src/setup/expected";
+import { installAll, world } from "./setup-world";
+
+const CONTROL_MAIN = "qlander-control-main";
+const STATE_RULESET = "qlander-state-branches";
+
+/** A world that has been set up end to end (the operator installs each App when asked). */
+async function setUp(o: { targetRulesets?: boolean } = {}) {
+  const w = world();
+  w.operator = () => installAll(w.f, w.specs);
+  const code = await runSetup(w.deps({ targetRulesets: o.targetRulesets ?? false }), ["apps", "install", "control", "target", "verify"]);
+  return { w, code };
+}
+
+describe("a full run", () => {
+  test("reaches the end state, and a second run writes nothing", async () => {
+    const { w, code } = await setUp({ targetRulesets: true });
+    expect(w.out.filter((l) => l.startsWith("FAIL"))).toEqual([]);
+    expect(code).toBe(0);
+    const n = w.c.config.names;
+    const control = w.f.repo(`${n.control.owner}/${n.control.name}`);
+    const target = w.f.repo(`${n.target.owner}/${n.target.name}`);
+    expect([...w.f.apps.keys()].sort()).toEqual(w.specs.map((s) => s.slug).sort());
+    expect([...control.envs.keys()].sort()).toEqual(["queue-write", "release-write"]);
+    expect([...control.envs.get("queue-write")!.secrets.keys()].sort()).toEqual(["QUEUE_APP_CLIENT_ID", "QUEUE_APP_PRIVATE_KEY", "STATE_APP_CLIENT_ID", "STATE_APP_PRIVATE_KEY"]);
+    expect([...control.envs.get("release-write")!.secrets.keys()].sort()).toEqual(["RELEASE_APP_CLIENT_ID", "RELEASE_APP_PRIVATE_KEY", "STATE_APP_CLIENT_ID", "STATE_APP_PRIVATE_KEY"]);
+    expect(control.envs.get("queue-write")!.policies.map((p) => p.name)).toEqual(["main"]);
+    expect(control.canApprove).toBe(false);
+    expect([...control.rulesets.values()].map((r) => r.name).sort()).toEqual(controlRulesets(w.c).map((r) => r.name).sort());
+    expect([...target.rulesets.values()].map((r) => r.name).sort()).toEqual(targetRulesets(w.c, true).map((r) => r.name).sort());
+    expect(target.labels.has(n.labels.ready)).toBe(true);
+    // Every secret holds the App's client id or its key (as the fake stores it in clear).
+    const queue = w.f.apps.get(w.specs[0]!.slug)!;
+    expect(control.envs.get("queue-write")!.secrets.get("QUEUE_APP_CLIENT_ID")).toBe(queue.clientId);
+    expect(control.envs.get("queue-write")!.secrets.get("QUEUE_APP_PRIVATE_KEY")).toContain("PRIVATE KEY");
+
+    const before = w.f.mutations.length;
+    const snap = JSON.stringify(w.f.snapshot());
+    w.out.length = 0;
+    expect(await runSetup(w.deps({ targetRulesets: true }), ["apps", "install", "control", "target", "verify"])).toBe(0);
+    expect(w.f.mutations.length).toBe(before);
+    expect(JSON.stringify(w.f.snapshot())).toBe(snap);
+    expect(w.out.filter((l) => /^(done|plan|todo|wait|FAIL)/.test(l))).toEqual([]);
+  });
+
+  test("plan mode writes nothing and says what it would do", async () => {
+    const w = world();
+    const code = await runSetup(w.deps({ apply: false }), ["apps"]);
+    expect(code).toBe(0);
+    expect(w.f.mutations).toEqual([]);
+    expect(w.out.filter((l) => l.startsWith("plan  create the"))).toHaveLength(w.specs.length);
+  });
+
+  test("plan mode on a finished setup plans nothing", async () => {
+    const { w } = await setUp();
+    w.out.length = 0;
+    const before = w.f.mutations.length;
+    expect(await runSetup(w.deps({ apply: false }), ["apps", "install", "control", "target", "verify"])).toBe(0);
+    expect(w.f.mutations.length).toBe(before);
+    // Only verify's negative test is left to plan: it is an attempted write.
+    expect(w.out.filter((l) => /^(done|plan|wait|FAIL)/.test(l))).toEqual([
+      `plan  try to create ${w.c.config.names.stateBranch} with the operator's token, expecting the ruleset to refuse it`,
+      `plan  try to create ${w.c.config.names.releaseStateBranch} with the operator's token, expecting the ruleset to refuse it`,
+    ]);
+  });
+});
+
+describe("apps", () => {
+  test("detects a permission GitHub dropped when it created the App", async () => {
+    const w = world();
+    w.f.dropOnCreate = ["workflows"];
+    expect(await runSetup(w.deps(), ["apps"])).toBe(1);
+    expect(w.out).toContain("        Workflows: has none, needs write");
+    expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("run setup --step permissions"))).toBe(true);
+  });
+
+  test("an App whose key was lost: prints where to generate one, waits for it, never makes a second App", async () => {
+    const w = world();
+    expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+    const slug = w.specs[0]!.slug;
+    const { rmSync, writeFileSync } = await import("node:fs");
+    rmSync(`${w.keysDir}/${slug}.pem`);
+    const created = w.f.mutations.length;
+    w.out.length = 0;
+    w.operator = () => writeFileSync(`${w.keysDir}/${slug}.pem`, w.f.generateKey(slug), { mode: 0o644 });
+    expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+    expect(w.f.mutations.length).toBe(created);
+    expect(w.out.some((l) => l.includes(`/settings/apps/${slug}`) && l.includes("Generate a private key"))).toBe(true);
+    expect(w.out).toContain(`        save the downloaded file as ${w.keysDir}/${slug}.pem`);
+  });
+
+  test("refuses a key that is not the App's", async () => {
+    const w = world();
+    expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+    const [a, b] = w.specs;
+    const { readFileSync, rmSync, writeFileSync } = await import("node:fs");
+    const other = readFileSync(`${w.keysDir}/${b!.slug}.pem`, "utf8");
+    rmSync(`${w.keysDir}/${a!.slug}.pem`);
+    writeFileSync(`${w.keysDir}/${a!.slug}.pem`, other, { mode: 0o600 });
+    expect(await runSetup(w.deps(), ["apps"])).toBe(1);
+    expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("is not one of its keys"))).toBe(true);
+  });
+
+  test("creating an App needs a key directory: a key command cannot keep a new key", async () => {
+    const w = world();
+    const { CommandKeyStore } = await import("../src/setup/keys");
+    expect(await runSetup(w.deps({ keys: new CommandKeyStore("false") }), ["apps"])).toBe(1);
+    expect(w.f.mutations).toEqual([]);
+    expect(w.out.some((l) => l.includes("needs --keys-dir"))).toBe(true);
+  });
+});
+
+describe("install", () => {
+  test("prints the install link and polls until the App is on its one repo", async () => {
+    const w = world();
+    await runSetup(w.deps(), ["apps"]);
+    let polls = 0;
+    w.operator = () => {
+      if (++polls === 2) installAll(w.f, w.specs);
+    };
+    expect(await runSetup(w.deps(), ["install"])).toBe(0);
+    expect(w.out.some((l) => l.includes(`/apps/${w.specs[0]!.slug}/installations/new`))).toBe(true);
+    const apps = JSON.parse(await Bun.file(`${w.keysDir}/apps.json`).text());
+    expect(typeof apps.queue.installationId).toBe("number");
+    expect(JSON.stringify(apps)).not.toContain("PRIVATE KEY");
+  });
+
+  test("an installation on every repo is not accepted", async () => {
+    const w = world();
+    await runSetup(w.deps(), ["apps"]);
+    for (const s of w.specs) w.f.install(s.slug, s.owner, [], "all");
+    expect(await runSetup(w.deps({ waitMs: 0 }), ["install"])).toBe(1);
+    expect(w.out.some((l) => l.includes("installed on all repositories"))).toBe(true);
+  });
+});
+
+describe("rulesets refuse before the App is installed", () => {
+  for (const step of ["control", "target"] as const) {
+    test(`${step}: refuses before any write`, async () => {
+      const w = world();
+      await runSetup(w.deps(), ["apps"]);
+      const before = w.f.mutations.length;
+      expect(await runSetup(w.deps(), [step])).toBe(1);
+      expect(w.f.mutations.length).toBe(before);
+      expect(w.out.some((l) => l.startsWith("FAIL  refusing the") && l.includes("run setup --step install first"))).toBe(true);
+    });
+  }
+});
+
+describe("the control main ruleset", () => {
+  test("has every protection parameter, and no bypass", async () => {
+    const { w } = await setUp();
+    const n = w.c.config.names;
+    const rs = [...w.f.repo(`${n.control.owner}/${n.control.name}`).rulesets.values()].find((r) => r.name === CONTROL_MAIN)!;
+    expect(rs.bypass_actors).toEqual([]);
+    expect(rs.conditions.ref_name.include).toEqual(["refs/heads/main"]);
+    expect(rs.rules.find((r) => r.type === "pull_request")!.parameters).toMatchObject({ required_approving_review_count: 1, dismiss_stale_reviews_on_push: true, require_last_push_approval: true });
+    expect(rs.rules.map((r) => r.type).sort()).toEqual(["deletion", "non_fast_forward", "pull_request", "required_signatures"]);
+  });
+
+  test("an existing ruleset missing a parameter or with a bypass is fixed, keeping stricter extras", async () => {
+    const { w } = await setUp();
+    const n = w.c.config.names;
+    const repo = w.f.repo(`${n.control.owner}/${n.control.name}`);
+    const rs = [...repo.rulesets.values()].find((r) => r.name === CONTROL_MAIN)!;
+    rs.rules = rs.rules.filter((r) => r.type !== "non_fast_forward");
+    rs.rules.find((r) => r.type === "pull_request")!.parameters = { required_approving_review_count: 1, dismiss_stale_reviews_on_push: false, require_last_push_approval: true, required_review_thread_resolution: true };
+    rs.bypass_actors = [{ actor_id: 1, actor_type: "OrganizationAdmin", bypass_mode: "always" }];
+    w.out.length = 0;
+    expect(await runSetup(w.deps(), ["control"])).toBe(0);
+    expect(w.out).toContain("        rule non_fast_forward is missing");
+    expect(w.out).toContain("        rule pull_request: dismiss_stale_reviews_on_push is false, needs true");
+    expect(w.out).toContain("        unexpected bypass actor: OrganizationAdmin 1");
+    const fixed = repo.rulesets.get(rs.id)!;
+    expect(fixed.bypass_actors).toEqual([]);
+    expect(fixed.rules.find((r) => r.type === "pull_request")!.parameters).toMatchObject({ dismiss_stale_reviews_on_push: true, required_review_thread_resolution: true });
+    expect(fixed.rules.some((r) => r.type === "non_fast_forward")).toBe(true);
+  });
+
+  test("the state-branch ruleset has the state App as its only bypass, and covers both state branches", async () => {
+    const { w } = await setUp();
+    const n = w.c.config.names;
+    const rs = [...w.f.repo(`${n.control.owner}/${n.control.name}`).rulesets.values()].find((r) => r.name === STATE_RULESET)!;
+    expect(rs.bypass_actors).toEqual([{ actor_id: w.f.apps.get(w.specs.find((s) => s.role === "state")!.slug)!.id, actor_type: "Integration", bypass_mode: "always" }]);
+    expect(rs.conditions.ref_name.include.sort()).toEqual([`refs/heads/${n.releaseStateBranch}`, `refs/heads/${n.stateBranch}`].sort());
+  });
+
+  test("the landing ruleset keeps a break-glass person but never another App", async () => {
+    const { w } = await setUp({ targetRulesets: true });
+    const n = w.c.config.names;
+    const repo = w.f.repo(`${n.target.owner}/${n.target.name}`);
+    const rs = [...repo.rulesets.values()].find((r) => r.name === "main-landing")!;
+    const release = w.f.apps.get(w.specs.find((s) => s.role === "release")!.slug)!;
+    rs.bypass_actors.push({ actor_id: 7, actor_type: "User", bypass_mode: "always" }, { actor_id: release.id, actor_type: "Integration", bypass_mode: "always" });
+    expect(await runSetup(w.deps({ targetRulesets: true }), ["target"])).toBe(0);
+    expect(repo.rulesets.get(rs.id)!.bypass_actors.map((a) => a.actor_type).sort()).toEqual(["Integration", "User"]);
+    expect(repo.rulesets.get(rs.id)!.bypass_actors.find((a) => a.actor_type === "Integration")!.actor_id).not.toBe(release.id);
+  });
+
+  test("classic protection on the target's main is never removed, only reported", async () => {
+    const w = world();
+    const n = w.c.config.names;
+    w.f.repo(`${n.target.owner}/${n.target.name}`).classicProtection.add(n.main);
+    w.operator = () => installAll(w.f, w.specs);
+    expect(await runSetup(w.deps({ targetRulesets: true }), ["apps", "install", "target"])).toBe(0);
+    expect(w.out).toContain(`        gh api -X DELETE repos/${n.target.owner}/${n.target.name}/branches/${n.main}/protection`);
+    expect(w.f.repo(`${n.target.owner}/${n.target.name}`).classicProtection.has(n.main)).toBe(true);
+  });
+});
+
+describe("control secrets", () => {
+  test("--rotate sets every secret again (a replaced key)", async () => {
+    const { w } = await setUp();
+    const before = w.f.mutations.length;
+    expect(await runSetup(w.deps({ rotate: true }), ["control"])).toBe(0);
+    expect(w.f.mutations.slice(before).filter((m) => m.includes("set secret"))).toHaveLength(8);
+  });
+
+  test("a deployment rule other than main is removed", async () => {
+    const { w } = await setUp();
+    const n = w.c.config.names;
+    w.f.repo(`${n.control.owner}/${n.control.name}`).envs.get("queue-write")!.policies.push({ id: 9, name: "feature/*", type: "branch" });
+    expect(await runSetup(w.deps(), ["control"])).toBe(0);
+    expect(w.f.repo(`${n.control.owner}/${n.control.name}`).envs.get("queue-write")!.policies.map((p) => p.name)).toEqual(["main"]);
+  });
+});
+
+describe("verify", () => {
+  test("mints every App's token with exactly the tick's permissions, and the state branch refuses the operator", async () => {
+    const { w } = await setUp();
+    w.out.length = 0;
+    expect(await runSetup(w.deps(), ["verify"])).toBe(0);
+    for (const s of w.specs) expect(w.out).toContain(`ok    ${s.slug}: minted a token with exactly the tick's permissions, for ${full(s.repo)} only`);
+    expect(w.out.filter((l) => l.includes("with the operator's token was refused by a ruleset"))).toHaveLength(2);
+    const minted = [...w.f.tokens.values()].map((t) => t.perms);
+    for (const s of w.specs) expect(minted).toContainEqual(s.tokenPermissions);
+  });
+
+  test("a wrong state ruleset fails verify before the negative test runs", async () => {
+    const { w } = await setUp();
+    const n = w.c.config.names;
+    const repo = w.f.repo(`${n.control.owner}/${n.control.name}`);
+    const rs = [...repo.rulesets.values()].find((r) => r.name === STATE_RULESET)!;
+    rs.rules = rs.rules.filter((r) => r.type !== "creation");
+    const before = w.f.calls.filter((c) => c.startsWith("POST") && c.endsWith("git/refs")).length;
+    expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+    expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("rule creation is missing") && l.includes("the negative test was not run"))).toBe(true);
+    expect(w.f.calls.filter((c) => c.startsWith("POST") && c.endsWith("git/refs")).length).toBe(before);
+  });
+
+  test("a state branch the operator can create anyway fails, and the branch is removed again", async () => {
+    const { w } = await setUp();
+    const n = w.c.config.names;
+    const repo = w.f.repo(`${n.control.owner}/${n.control.name}`);
+    w.f.enforceRulesets = false;
+    expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+    expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("created") && l.includes(n.stateBranch))).toBe(true);
+    expect(repo.refs.has(n.stateBranch)).toBe(false);
+  });
+
+  test("an installation that has not accepted a permission fails", async () => {
+    const { w } = await setUp();
+    const q = w.specs[0]!;
+    w.f.savePermissions(q.slug, { ...q.permissions, issues: "read" });
+    // The registration now has more than expected: verify reports the registration first.
+    expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+    expect(w.out.some((l) => l.startsWith(`FAIL  ${q.slug}: registration permissions differ`))).toBe(true);
+  });
+
+  test("works with keys from a key command", async () => {
+    const { w } = await setUp();
+    const { CommandKeyStore } = await import("../src/setup/keys");
+    const { writeFileSync } = await import("node:fs");
+    const script = `${w.keysDir}/../get-key-${process.pid}.sh`;
+    writeFileSync(script, `#!/bin/sh\ncat "${w.keysDir}/$1.pem"\n`, { mode: 0o700 });
+    w.out.length = 0;
+    expect(await runSetup(w.deps({ keys: new CommandKeyStore(script) }), ["verify"])).toBe(0);
+  });
+});
+
+describe("permissions (§5.3)", () => {
+  test("a saved but unaccepted change: registration matches, the installation is reported pending, with its link", async () => {
+    const { w } = await setUp();
+    const q = w.specs[0]!;
+    const inst = [...w.f.installations.values()].find((i) => i.appId === w.f.apps.get(q.slug)!.id)!;
+    inst.permissions = { ...inst.permissions, workflows: "read" };
+    w.out.length = 0;
+    expect(await runSetup(w.deps({ apply: false }), ["permissions"])).toBe(1);
+    expect(w.out).toContain(`ok    ${q.slug}: registration permissions match`);
+    expect(w.out).toContain(`todo  ${q.slug}: installation ${inst.id} has not accepted the permissions (workflows read→write)`);
+    expect(w.out).toContain(`        open https://github.fake.test/organizations/${q.owner}/settings/installations/${inst.id} and accept the new permissions`);
+  });
+
+  test("applying: prints the steps, polls the registration, then the installation, separately", async () => {
+    const { w } = await setUp();
+    const q = w.specs[0]!;
+    // The App lacks Workflows, on its registration and its installation (as if GitHub had dropped it on creation).
+    const { workflows: _, ...lacking } = q.permissions;
+    w.f.savePermissions(q.slug, lacking);
+    for (const i of w.f.installations.values()) w.f.accept(i.id);
+    let polls = 0;
+    w.operator = () => {
+      polls++;
+      if (polls === 2) w.f.savePermissions(q.slug, q.permissions);
+      if (polls === 4) for (const i of w.f.installations.values()) w.f.accept(i.id);
+    };
+    w.out.length = 0;
+    expect(await runSetup(w.deps(), ["permissions"])).toBe(0);
+    expect(w.out).toContain(`todo  ${q.slug}: the registration permissions differ. Open https://github.fake.test/organizations/${q.owner}/settings/apps/${q.slug}/permissions:`);
+    expect(w.out).toContain("        set Workflows to Read and write under Repository permissions (now No access)");
+    expect(w.out).toContain(`wait  ${q.slug} registration: workflows is none, needs write (not saved)`);
+    expect(w.out.some((l) => l.startsWith(`wait  ${q.slug} installation`) && l.endsWith("(saved, not accepted)"))).toBe(true);
+    expect(w.out).toContain(`ok    ${q.slug}: registration permissions saved`);
+    expect(w.out.some((l) => l.startsWith(`ok    ${q.slug}: installation`) && l.endsWith("has accepted them"))).toBe(true);
+  });
+});
+
+describe("hardening", () => {
+  test("plan mode never writes apps.json", async () => {
+    const { w } = await setUp();
+    const { rmSync, existsSync } = await import("node:fs");
+    rmSync(`${w.keysDir}/apps.json`);
+    expect(await runSetup(w.deps({ apply: false }), ["apps", "install", "verify"])).toBe(0);
+    expect(existsSync(`${w.keysDir}/apps.json`)).toBe(false);
+  });
+
+  test("a plan on a fresh org plans the installs too, then the ruleset steps refuse", async () => {
+    const w = world();
+    expect(await runSetup(w.deps({ apply: false }), ["apps", "install"])).toBe(0);
+    expect(w.out.filter((l) => l.startsWith("plan  install"))).toHaveLength(w.specs.length);
+    expect(w.f.mutations).toEqual([]);
+  });
+
+  test("verify fails an installation that also covers another repo", async () => {
+    const { w } = await setUp();
+    const q = w.specs[0]!;
+    w.f.addRepo(`${q.owner}/other`, 9999);
+    w.f.install(q.slug, q.owner, [`${q.owner}/${q.repo.name}`, `${q.owner}/other`]);
+    expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+    expect(w.out.some((l) => l.startsWith(`FAIL  ${q.slug}: installation`) && l.includes("not ["))).toBe(true);
+  });
+
+  test("a create refused for another reason than a ruleset is not a pass", async () => {
+    const { w } = await setUp();
+    const api = w.deps().api;
+    const real = api.createRef.bind(api);
+    const { GitHubError } = await import("../src/github/http");
+    api.createRef = async () => {
+      throw new GitHubError("auth", 401, "Bad credentials");
+    };
+    expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+    expect(w.out.some((l) => l.includes("failed, but not by a ruleset"))).toBe(true);
+    api.createRef = real;
+  });
+});
+
+describe("verify runs the audit last", () => {
+  test("a FAIL in the audit fails verify, after the token checks pass", async () => {
+    const { w } = await setUp();
+    w.out.length = 0;
+    expect(await runSetup(w.deps({ audit: async () => ({ lines: ["FAIL    T1   a workflow"], failed: 1 }) }), ["verify"])).toBe(1);
+    expect(w.out).toContain("        FAIL    T1   a workflow");
+    expect(w.out.some((l) => l.startsWith("FAIL  audit: 1 finding(s) failed"))).toBe(true);
+  });
+
+  test("setup's expected App permissions are the audit's", async () => {
+    const { EXPECTED_PERMISSIONS } = await import("../src/audit/apps");
+    const { appSpecs } = await import("../src/setup/expected");
+    for (const s of appSpecs(world().c, "x")) expect(s.permissions).toEqual(EXPECTED_PERMISSIONS[s.role]);
+  });
+});

@@ -1,0 +1,709 @@
+{
+  "description": "qlander.yml: the whole configuration of one deployment. It lives in the control repo, never in the target.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/brett/qlander/schema/qlander.schema.json",
+  "title": "qlander.yml",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "control", "target", "runner", "lease", "queue", "release", "watchdog"],
+  "properties": {
+    "version": { "description": "The config schema version. A version the code does not know is refused.", "const": 1 },
+    "control": {
+      "description": "The control repo: the repo that holds this file, the tick workflow, the App keys and the state branches.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "repoId"],
+      "properties": {
+        "repo": { "description": "The control repo, as owner/name.", "$ref": "#/$defs/repo" },
+        "repoId": { "description": "The control repo's numeric id, checked against GitHub on connect and rendered into the workflows' repo guard.", "$ref": "#/$defs/repoId" },
+        "mainProtection": {
+          "description": "What audit expects of the control repo's main ruleset, and what setup writes there. Absent: every key at its default. audit reports a relaxed key as a WARN that names it, and setup neither adds nor removes that protection. Always required: a pull request, blocked force pushes and deletion, and no bypass actors. Not policy.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "requiredApprovals": {
+              "description": "Approving reviews a PR to the control repo's main needs. 0 relaxes only the count: lastPushApproval, while true, can still require one.",
+              "type": "integer",
+              "minimum": 0,
+              "default": 1,
+              "examples": [0]
+            },
+            "dismissStaleReviews": { "description": "Dismiss stale approvals when new commits are pushed.", "type": "boolean", "default": true, "examples": [false] },
+            "lastPushApproval": {
+              "description": "Require the most recent push to be approved by someone other than its pusher.",
+              "type": "boolean",
+              "default": true,
+              "examples": [false]
+            },
+            "signedCommits": { "description": "Require signed commits on the control repo's main.", "type": "boolean", "default": true, "examples": [false] }
+          }
+        }
+      }
+    },
+    "target": {
+      "description": "The target: the repo whose main qlander lands PRs on.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "repoId", "main"],
+      "properties": {
+        "repo": { "description": "The target repo, as owner/name.", "$ref": "#/$defs/repo" },
+        "repoId": { "description": "The target repo's numeric id, checked against GitHub on connect.", "$ref": "#/$defs/repoId" },
+        "main": { "description": "The target branch that qlander lands on.", "$ref": "#/$defs/branch" }
+      }
+    },
+    "runner": {
+      "description": "The runner contract: where the tick jobs run, and what bounds a job that freezes. The loader checks each mode's rules after the schema. In the policy hash: jobTimeoutMinutes, takeoverGraceMinutes, and the kill bound that mode and hostKillMinutes set. The other keys are not policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "cronMinutes", "jobTimeoutMinutes", "takeoverGraceMinutes"],
+      "properties": {
+        "mode": {
+          "description": "self-hosted-kill: self-hosted runners whose host destroys each job's VM at hostKillMinutes. hosted: GitHub-hosted runners, which have no host-side kill, so epochFence must be true.",
+          "enum": ["self-hosted-kill", "hosted"]
+        },
+        "cronMinutes": { "description": "The tick workflow's schedule interval. Must be more than lease.minutes.", "$ref": "#/$defs/positive" },
+        "jobTimeoutMinutes": { "description": "Each tick job's timeout-minutes. At most lease.minutes minus lease.fenceMarginMinutes.", "$ref": "#/$defs/positive" },
+        "hostKillMinutes": {
+          "description": "self-hosted-kill only: the host destroys the job's VM at this age. At least jobTimeoutMinutes.",
+          "$ref": "#/$defs/positive",
+          "examples": [6]
+        },
+        "takeoverGraceMinutes": {
+          "description": "How long past the kill bound (in hosted mode, the job timeout) a successor waits before it takes over an expired lease. At least 1, or 15 in hosted mode.",
+          "$ref": "#/$defs/positive"
+        },
+        "epochFence": {
+          "description": "Tie every target ref write to the current lease through an epoch branch in the target. Required in hosted mode; defence in depth in self-hosted-kill mode.",
+          "type": "boolean",
+          "default": false,
+          "examples": [true]
+        },
+        "epochPrefix": {
+          "description": "The target branch prefix for the two epoch branches, <prefix>queue and <prefix>release.",
+          "$ref": "#/$defs/refPrefix",
+          "default": "qlander-epoch/",
+          "examples": ["qlander-epoch/"]
+        },
+        "runsOn": {
+          "description": "The tick jobs' runner labels, rendered into tick.yml. Required in self-hosted-kill mode. In hosted mode, absent means ubuntu-latest.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$" }
+        }
+      }
+    },
+    "lease": {
+      "description": "Each job's whole-tick lease. A job never outlives its lease: runner.jobTimeoutMinutes must be at most minutes minus fenceMarginMinutes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minutes", "fenceMarginMinutes"],
+      "properties": {
+        "minutes": { "description": "How long a lease lasts once taken. Less than runner.cronMinutes.", "$ref": "#/$defs/positive" },
+        "fenceMarginMinutes": { "description": "A target write is made only while more than this much of the lease is left.", "$ref": "#/$defs/positive" }
+      }
+    },
+    "queue": {
+      "description": "The merge queue: what admits a PR, how batches are built and tested, and the budgets that bound them.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stateBranch", "refs", "labels", "controlLabels", "admission", "policy", "preLanding", "batch", "budget", "timeouts", "verify", "historyLimit"],
+      "properties": {
+        "stateBranch": { "description": "The control-repo branch that holds the queue's state.json.", "$ref": "#/$defs/branch" },
+        "refs": {
+          "description": "Target branch prefixes. No target workflow may trigger on buildPrefix, and only the preLanding workflows trigger on queuePrefix.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["queuePrefix", "buildPrefix"],
+          "properties": {
+            "queuePrefix": { "description": "The branches CI tests: batch n is pushed as <queuePrefix><n>.", "$ref": "#/$defs/refPrefix" },
+            "buildPrefix": { "description": "The scratch branches a batch is merged on before its single push to <queuePrefix><n>.", "$ref": "#/$defs/refPrefix" }
+          }
+        },
+        "labels": {
+          "description": "Labels on target PRs. The command labels are removed once applied.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ready", "bounce", "solo", "unsolo", "go"],
+          "properties": {
+            "ready": {
+              "description": "Marks a PR ready to land. Counts only when applied by a write-access account, the review producer or a trusted automation.",
+              "$ref": "#/$defs/label"
+            },
+            "bounce": { "description": "Command: take the PR out of the queue.", "$ref": "#/$defs/label" },
+            "solo": { "description": "Command: test the PR alone, without changing its place.", "$ref": "#/$defs/label" },
+            "unsolo": { "description": "Command: undo solo.", "$ref": "#/$defs/label" },
+            "go": { "description": "Command, on any PR: build the next batch without waiting for it to fill.", "$ref": "#/$defs/label" },
+            "priority": {
+              "description": "The priority lane's label. A PR carrying it, applied by a human with write access, goes to the front of the queue and builds at once. Absent: no priority lane. Policy when set.",
+              "$ref": "#/$defs/label"
+            }
+          }
+        },
+        "priority": {
+          "description": "Priority lane settings. Only with queue.labels.priority.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "preempt": { "description": "Stop a running batch whose CI is still pending to build a prioritised PR at once. Policy when true.", "type": "boolean", "default": false }
+          }
+        },
+        "concurrency": {
+          "description": "Run more than one batch's CI at a time. A failed batch's halves run side by side, and a fresh batch can be built on top of the running one (pipelining). Absent: one batch at a time. Not policy.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxActive": { "description": "Batches whose CI may run at once, speculative ones included.", "$ref": "#/$defs/positive", "default": 2, "examples": [2] },
+            "pipelineDepth": {
+              "description": "Speculative batches stacked on the running fresh batch. 0 turns pipelining off. At most maxActive - 1.",
+              "type": "integer",
+              "minimum": 0,
+              "default": 1,
+              "examples": [1]
+            }
+          }
+        },
+        "strategy": {
+          "description": "How a red batch is isolated and how big fresh batches grow. Absent: every key is off. Not policy.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "firstAlone": {
+              "description": "Split a red fresh batch into its first PR and the rest, instead of halves. The oldest PR then gets a run of its own next.",
+              "type": "boolean",
+              "default": false,
+              "examples": [true]
+            },
+            "skipSeenRed": {
+              "description": "Split a group of PRs at once, without a run, when its tree was already seen red on the current main. A single PR is always built.",
+              "type": "boolean",
+              "default": false,
+              "examples": [true]
+            },
+            "reuseGreen": {
+              "description": "Remember a batch abandoned as the queue paused. On resume, land it without a rebuild if main has not moved and its run is now green.",
+              "type": "boolean",
+              "default": false,
+              "examples": [true]
+            },
+            "mainBaseline": {
+              "description": "Before bouncing a PR that failed alone, run the suite on main with no PR in it. A PR whose failing tests all fail there too stays admitted, is not bounced or counted, and is retried once main moves. Nothing lands on a red suite. The watchdog alerts, and breakerBounces held PRs pause the queue. See DESIGN.md §5.7.",
+              "type": "boolean",
+              "default": false,
+              "examples": [true]
+            },
+            "adaptive": {
+              "description": "Adapt the fresh batch size limit. It starts at queue.batch.max, doubles up to ceiling after greens full batches in a row land green, and halves (not below queue.batch.min) on a red fresh batch. Absent: queue.batch.max, halved per red in a row.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["greens", "ceiling"],
+              "properties": {
+                "greens": { "description": "Full fresh batches landed green in a row before the limit doubles.", "$ref": "#/$defs/positive", "examples": [2] },
+                "ceiling": { "description": "The largest the limit grows to. At least queue.batch.max.", "$ref": "#/$defs/positive", "examples": [16] }
+              }
+            }
+          }
+        },
+        "controlLabels": {
+          "description": "Labels on control-repo issues.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pause", "mirror"],
+          "properties": {
+            "pause": { "description": "An open control-repo issue with this label pauses the queue.", "$ref": "#/$defs/label" },
+            "mirror": {
+              "description": "Labels the issue that mirrors the queue's state for people. Qlander reads it only to refuse to start from empty when the state branch is missing.",
+              "$ref": "#/$defs/label"
+            }
+          }
+        },
+        "admission": {
+          "description": "What a PR needs, on its current head, before the ready label admits it.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["fastLane", "review"],
+          "properties": {
+            "fastLane": {
+              "description": "The PR check that must pass on the PR's head.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["workflow", "event", "job"],
+              "properties": {
+                "workflow": { "description": "The target workflow file that runs the fast lane.", "$ref": "#/$defs/workflowPath" },
+                "event": { "description": "The event that run must be for.", "$ref": "#/$defs/name" },
+                "job": { "description": "The job that must succeed, named exactly as GitHub shows it.", "$ref": "#/$defs/name" }
+              }
+            },
+            "review": {
+              "description": "An optional machine-checked review of the PR's head.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["required", "producerLogins", "producer"],
+              "properties": {
+                "required": {
+                  "description": "Require the review producer to vouch for the PR's head. False: a write-access account applying ready is trusted to have reviewed it.",
+                  "type": "boolean"
+                },
+                "producerLogins": { "description": "Logins whose ready label counts as the review producer's.", "type": "array", "items": { "$ref": "#/$defs/name" } },
+                "producer": {
+                  "description": "Who vouches for a reviewed head: a workflow run on main (job@main) or a dedicated App's check run (app-check).",
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["adapter", "workflow", "events", "jobTemplate", "runNameTemplate", "searchPages"],
+                      "properties": {
+                        "adapter": { "description": "job@main: a workflow run of main's revision judges the PR head.", "const": "job@main" },
+                        "workflow": { "description": "The review workflow on main.", "$ref": "#/$defs/workflowPath" },
+                        "events": {
+                          "description": "The events its run may be for: workflow_run or workflow_dispatch.",
+                          "type": "array",
+                          "minItems": 1,
+                          "items": { "$ref": "#/$defs/name" }
+                        },
+                        "jobTemplate": { "description": "The job name that vouches, with {sha} replaced by the PR head.", "$ref": "#/$defs/name" },
+                        "runNameTemplate": { "description": "The run name, with {sha} replaced by the PR head.", "$ref": "#/$defs/name" },
+                        "searchPages": { "description": "How many pages of the workflow's runs on main to search for the review run.", "$ref": "#/$defs/positive" }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["adapter", "appId", "name"],
+                      "properties": {
+                        "adapter": { "description": "app-check: a check run from a dedicated App.", "const": "app-check", "examples": ["app-check"] },
+                        "appId": { "description": "The App's id. Its check run on the PR head must succeed.", "$ref": "#/$defs/repoId", "examples": [123456] },
+                        "name": { "description": "The check run's name.", "$ref": "#/$defs/name", "examples": ["review"] }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "policy": {
+          "description": "The CI-policy boundary: which changes land alone, with an approval bound to their SHA from an account listed in approvers.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["paths", "approvers"],
+          "properties": {
+            "paths": {
+              "description": "Globs of target paths that define or implement the CI gates. A PR touching any of them is a CI-policy PR. Must cover .github/workflows, .github/actions and every gate file.",
+              "type": "array",
+              "items": { "$ref": "#/$defs/name" }
+            },
+            "shareBatch": {
+              "description": "Let consecutive approved CI-policy PRs share a batch, never with other PRs. Absent: each CI-policy PR runs alone. Policy when set.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["max"],
+              "properties": { "max": { "description": "The most CI-policy PRs in one shared batch. At most queue.batch.max.", "type": "integer", "minimum": 2, "examples": [4] } }
+            },
+            "trustedAutomations": {
+              "description": "Bot accounts whose PRs may land without a CI-policy approval when they change only their listed paths. Policy when set.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["login", "id", "paths"],
+                "properties": {
+                  "login": { "description": "The bot's login, including [bot].", "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\\[bot\\]$" },
+                  "id": { "description": "The bot's account id.", "$ref": "#/$defs/repoId" },
+                  "paths": {
+                    "description": "The paths it may change. * matches within one segment. Never **, never under .github, and never a gate file.",
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string", "pattern": "^[A-Za-z0-9._*/-]+$" }
+                  }
+                }
+              }
+            },
+            "approvers": {
+              "description": "Accounts whose /qlander approve-policy comment counts. Qlander can check the account, not who is using it, so keep these to people. Must be non-empty whenever paths is.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["login", "id"],
+                "properties": {
+                  "login": { "description": "The approver's login. Login and id must both match.", "$ref": "#/$defs/name" },
+                  "id": { "description": "The approver's account id.", "$ref": "#/$defs/repoId" }
+                }
+              }
+            }
+          }
+        },
+        "preLanding": {
+          "description": "The pre-landing manifest: the workflows a queue branch must pass before main moves to it. At least one entry must be when: always.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/workflowEntry" }
+        },
+        "batch": {
+          "description": "How fresh batches are sized, and when they are built.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["min", "max", "minFill", "maxWaitMinutes", "maxSplitDepth", "breakerBounces"],
+          "properties": {
+            "min": { "description": "The smallest a fresh batch's size limit shrinks to after reds in a row.", "$ref": "#/$defs/positive" },
+            "max": {
+              "description": "The largest fresh batch, unless queue.strategy.adaptive grows the limit. The limit halves after each red in a row.",
+              "$ref": "#/$defs/positive"
+            },
+            "minFill": { "description": "Build a fresh batch once this many PRs are admitted. At most max.", "$ref": "#/$defs/positive" },
+            "maxWaitMinutes": { "description": "Or build it once the oldest admitted PR has waited this long.", "$ref": "#/$defs/positive" },
+            "maxSplitDepth": { "description": "How many times a red batch is halved. Past it, each PR is tested alone.", "type": "integer", "minimum": 0 },
+            "breakerBounces": { "description": "Pause after this many bounces in a row without a landing.", "$ref": "#/$defs/positive" }
+          }
+        },
+        "budget": {
+          "description": "CI budgets. Every build, rebuild and rerun reserves from both before it starts.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lineage", "window", "windowHours"],
+          "properties": {
+            "lineage": { "description": "The most runs one batch and its splits may use. Past it, their PRs lose ready.", "$ref": "#/$defs/positive" },
+            "window": { "description": "The most runs in any windowHours. Reaching it pauses the queue.", "$ref": "#/$defs/positive" },
+            "windowHours": { "description": "The rolling window's length, in hours.", "$ref": "#/$defs/positive" }
+          }
+        },
+        "timeouts": {
+          "description": "Time limits on CI runs and on reconciling effects.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["noRunMinutes", "inProgressMinutes", "queuedHours", "rerunBarrierMinutes", "reconcileMinutes", "cancelWindowMinutes", "cancelGiveUpHours", "maxOpTries"],
+          "properties": {
+            "noRunMinutes": {
+              "description": "A when: always preLanding workflow with no run this long after the queue branch was pushed pauses the queue as a configuration problem. In a batch with a CI-policy PR it counts as red instead.",
+              "$ref": "#/$defs/positive"
+            },
+            "inProgressMinutes": { "description": "A job running longer than this is cancelled as a timeout.", "$ref": "#/$defs/positive" },
+            "queuedHours": { "description": "A run attempt older than this with no job running is cancelled as starved.", "$ref": "#/$defs/positive" },
+            "rerunBarrierMinutes": { "description": "How long to wait for a rerun to show its new attempt before pausing.", "$ref": "#/$defs/positive" },
+            "reconcileMinutes": {
+              "description": "How long an unconfirmed effect, such as a rerun request, is reconciled before it pauses. At least twice runner.cronMinutes.",
+              "$ref": "#/$defs/positive"
+            },
+            "cancelWindowMinutes": { "description": "After a batch is abandoned, keep looking for its runs to cancel for at least this long.", "$ref": "#/$defs/positive" },
+            "cancelGiveUpHours": { "description": "Pause if an abandoned batch's runs are still running this long after it was abandoned.", "$ref": "#/$defs/positive" },
+            "maxOpTries": { "description": "Recovery retries outstanding work at most this many times before pausing.", "$ref": "#/$defs/positive" }
+          }
+        },
+        "verify": {
+          "description": "Checking that landed PRs are marked merged.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ticks", "days"],
+          "properties": {
+            "ticks": { "description": "Ticks to wait, and at least 15 minutes, before commenting that GitHub has not marked a landed PR merged.", "$ref": "#/$defs/positive" },
+            "days": { "description": "Stop checking a landed PR after this many days.", "$ref": "#/$defs/positive" }
+          }
+        },
+        "historyLimit": { "description": "Finished batch records kept in the queue's state.", "$ref": "#/$defs/positive" }
+      }
+    },
+    "release": {
+      "description": "Release advance: fast-forward the target's release branch to qualified main commits. A separate job, with its own App, lease, state branch and pause. Not policy, except branch, stateBranch and labels.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["branch", "stateBranch", "labels", "dryRun", "maxCandidates", "historyLimit", "qualification"],
+      "properties": {
+        "branch": { "description": "The target branch that release advance fast-forwards.", "$ref": "#/$defs/branch" },
+        "stateBranch": { "description": "The control-repo branch that holds the release job's state.json.", "$ref": "#/$defs/branch" },
+        "labels": {
+          "description": "Labels on control-repo issues.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pause", "alert", "mirror"],
+          "properties": {
+            "pause": { "description": "An open issue with this label pauses the release job only.", "$ref": "#/$defs/label" },
+            "alert": {
+              "description": "Labels the release-blocked issue, opened in some cases where release cannot advance, such as a diverged release. It pauses nothing.",
+              "$ref": "#/$defs/label"
+            },
+            "mirror": {
+              "description": "Labels the issue that mirrors the release state for people. Qlander reads it only to refuse to start from empty when the release state branch is missing.",
+              "$ref": "#/$defs/label"
+            }
+          }
+        },
+        "enabled": { "description": "Run release advance. False: the release job reads and writes nothing.", "type": "boolean", "default": false },
+        "dryRun": { "description": "Read and decide, but write nothing. The release job acts only when this is false and QLANDER_MODE is live.", "type": "boolean" },
+        "maxCandidates": {
+          "description": "How many of main's newest first-parent commits are examined. If none of them qualifies and older ones remain, a release-blocked issue says so.",
+          "$ref": "#/$defs/positive"
+        },
+        "historyLimit": { "description": "Release receipts kept in the release state.", "$ref": "#/$defs/positive" },
+        "qualification": {
+          "description": "How a main commit is proved qualified. Only the selected provider's block may be present.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider"],
+          "properties": {
+            "provider": {
+              "description": "manifest: a qualification manifest that qlander re-evaluates. checks-green: the listed workflows are all green on the commit. commit-status: a status from a listed creator.",
+              "enum": ["manifest", "checks-green", "commit-status"]
+            },
+            "manifest": {
+              "description": "The manifest provider's settings.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path"],
+              "properties": {
+                "source": {
+                  "description": "Where the manifest is read: target (the target's main, through the contents API) or control (this repo's checkout).",
+                  "enum": ["target", "control"],
+                  "default": "target"
+                },
+                "path": {
+                  "description": "The manifest's path: a canonical relative path, with no empty, . or .. segments, no leading / and no %, ? or #.",
+                  "type": "string",
+                  "pattern": "^(?!.*(^|/)\\.{1,2}(/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$"
+                },
+                "proof": { "description": "Also require a proof chain: a status whose target URL is a successful proof run on main for the commit.", "$ref": "#/$defs/proof" }
+              }
+            },
+            "checksGreen": {
+              "description": "The checks-green provider's settings. Absent block: required is a copy of queue.preLanding.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["required"],
+              "properties": {
+                "required": {
+                  "description": "The workflows that must all pass on a main push run for the commit.",
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "$ref": "#/$defs/workflowEntry" }
+                }
+              }
+            },
+            "commitStatus": {
+              "description": "The commit-status provider's settings. The weakest provider, unless proof is set.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["context", "creators"],
+              "properties": {
+                "context": { "description": "The status name that must be success.", "$ref": "#/$defs/name", "examples": ["qualified"] },
+                "creators": {
+                  "description": "Account ids (users or App bots) whose status counts.",
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "$ref": "#/$defs/repoId" },
+                  "examples": [[41898282]]
+                },
+                "producerWorkflow": {
+                  "description": "The workflow that posts the status. Required when creators includes github-actions[bot].",
+                  "$ref": "#/$defs/workflowPath",
+                  "examples": [".github/workflows/release-gate.yml"]
+                },
+                "targetUrl": {
+                  "description": "actions-run: the status's target_url must be an Actions run in the target repo.",
+                  "enum": ["actions-run"],
+                  "examples": ["actions-run"]
+                },
+                "proof": { "description": "Also require a proof run, as for the manifest provider.", "$ref": "#/$defs/proofRun" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "watchdog": {
+      "description": "The watchdog's issues in the control repo.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["labels"],
+      "properties": {
+        "labels": {
+          "description": "Labels on control-repo issues.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["alert", "status"],
+          "properties": {
+            "alert": { "description": "Labels the open alert issues, one per alert kind.", "$ref": "#/$defs/label" },
+            "status": { "description": "Labels the pinned status issue.", "$ref": "#/$defs/label" }
+          }
+        }
+      }
+    },
+    "hooks": {
+      "description": "Lifecycle event hooks: notifications sent to the target as repository_dispatch events. Not policy.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/hook" },
+      "default": []
+    },
+    "tokens": {
+      "description": "The environment variables the tick workflow puts each App's installation token in. Absent: every key at its default. Wiring, not policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "queue": { "description": "The queue App's token.", "$ref": "#/$defs/envName", "default": "TARGET_TOKEN", "examples": ["TARGET_TOKEN"] },
+        "release": { "description": "The release App's token.", "$ref": "#/$defs/envName", "default": "TARGET_RELEASE_TOKEN", "examples": ["TARGET_RELEASE_TOKEN"] }
+      }
+    },
+    "bundle": {
+      "description": "Run a pinned release instead of the control repo's own source. .github/qlander-release.txt pins the release and its sha256. Absent: source mode. Wiring, not policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo"],
+      "properties": {
+        "repo": { "description": "The repo whose releases hold the bundle.", "$ref": "#/$defs/repo", "examples": ["example/qlander"] },
+        "private": {
+          "description": "Download through the API with the job's own token, which reads only the control repo, so repo must be the control repo. False: an anonymous download of a public release.",
+          "type": "boolean",
+          "default": false,
+          "examples": [false]
+        },
+        "watchdog": {
+          "description": "Run the bundle in watchdog.yml too. False keeps the watchdog on the source in its checkout, so a broken release cannot also silence the alarm.",
+          "type": "boolean",
+          "default": true,
+          "examples": [false]
+        }
+      }
+    },
+    "notify": {
+      "description": "Who to tell when the queue stops. Not policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "assignees": {
+          "description": "GitHub logins assigned to each pause issue the queue or release job opens and each watchdog alert. An assignee hears through GitHub's notifications, as their own settings allow, whether or not they watch the repo. If GitHub refuses the list, the issue still opens, with nobody assigned. Issues people open themselves, such as a quiesce's, are not assigned. Upgrade to a release that knows this key before adding it: an older release refuses the whole file.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$" },
+          "default": [],
+          "examples": [["alice"]]
+        }
+      }
+    },
+    "comments": {
+      "description": "PR comments to leave out. Not policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "omit": {
+          "description": "Progress comments to leave out: queued, landed or both. Comments that ask someone to act are always posted.",
+          "type": "array",
+          "items": { "enum": ["queued", "landed"] },
+          "default": [],
+          "examples": [["queued"]]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "envName": { "description": "An environment variable name.", "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" },
+    "name": { "description": "A non-empty string.", "type": "string", "minLength": 1 },
+    "positive": { "type": "integer", "minimum": 1 },
+    "repoId": { "type": "integer", "minimum": 1 },
+    "repo": { "description": "owner/name, as GitHub spells it.", "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$" },
+    "branch": {
+      "description": "A branch name: components of letters, digits, _ and -, joined by . or /, with no leading, trailing or doubled separator.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]*(?:[./][A-Za-z0-9_][A-Za-z0-9_-]*)*$"
+    },
+    "refPrefix": {
+      "description": "A branch-name prefix ending in /; <prefix><n> names batch n.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]*(?:[./][A-Za-z0-9_][A-Za-z0-9_-]*)*/$"
+    },
+    "label": { "description": "A GitHub label name: at most 50 characters, no spaces.", "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,49}$" },
+    "workflowEntry": {
+      "description": "One required workflow, in the format of a qualification manifest's required entries, without why.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "name", "when", "required_jobs", "allow_skipped_jobs"],
+      "properties": {
+        "path": { "description": "The workflow file.", "$ref": "#/$defs/workflowPath", "examples": [".github/workflows/ci.yml"] },
+        "name": { "description": "The workflow's name, used in messages.", "$ref": "#/$defs/name", "examples": ["CI"] },
+        "when": {
+          "description": "always: a run must exist. if_triggered: no run is fine, but a run that exists must pass.",
+          "enum": ["always", "if_triggered"],
+          "examples": ["always"]
+        },
+        "required_jobs": {
+          "description": "Job names that must appear in the run. Every job in the run must succeed, listed or not.",
+          "type": "array",
+          "items": { "$ref": "#/$defs/name" },
+          "examples": [["test"]]
+        },
+        "allow_skipped_jobs": {
+          "description": "Job names that may be skipped, each with the reason. Only these may be skipped.",
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "examples": [{ "pr-gate": "pull-request only" }]
+        }
+      }
+    },
+    "proofRun": {
+      "description": "A run of workflow on main, for one of events, whose latest attempt has a successful job named jobTemplate with {sha} set to the candidate.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflow"],
+      "properties": {
+        "workflow": { "description": "The proof workflow on main.", "$ref": "#/$defs/workflowPath", "examples": [".github/workflows/proof.yml"] },
+        "events": {
+          "description": "The events the proof run may be for. Only events that run main's own code; a pull request run is never proof.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["workflow_run", "workflow_dispatch", "push", "schedule"] },
+          "default": ["workflow_run", "workflow_dispatch"],
+          "examples": [["workflow_run"]]
+        },
+        "jobTemplate": {
+          "description": "The proof job's name, with {sha} replaced by the candidate.",
+          "$ref": "#/$defs/name",
+          "default": "Qualified {sha}",
+          "examples": ["Qualified {sha}"]
+        }
+      }
+    },
+    "proof": {
+      "description": "The proof chain: the newest status named statusContext on the candidate is success, and its target_url is a run as in proofRun.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statusContext", "workflow"],
+      "properties": {
+        "statusContext": { "description": "The status that points at the proof run.", "$ref": "#/$defs/name", "examples": ["qualified"] },
+        "workflow": { "description": "The proof workflow on main.", "$ref": "#/$defs/workflowPath", "examples": [".github/workflows/proof.yml"] },
+        "events": {
+          "description": "The events the proof run may be for. Only events that run main's own code; a pull request run is never proof.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["workflow_run", "workflow_dispatch", "push", "schedule"] },
+          "default": ["workflow_run", "workflow_dispatch"],
+          "examples": [["workflow_run"]]
+        },
+        "jobTemplate": {
+          "description": "The proof job's name, with {sha} replaced by the candidate.",
+          "$ref": "#/$defs/name",
+          "default": "Qualified {sha}",
+          "examples": ["Qualified {sha}"]
+        }
+      }
+    },
+    "workflowPath": { "description": "A workflow file under .github/workflows/.", "type": "string", "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$" },
+    "hook": {
+      "description": "One hook: the events it sends, and the event_type they are sent as. Not policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["events", "eventType"],
+      "properties": {
+        "events": {
+          "description": "The lifecycle events to send.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["admitted", "dequeued", "batch_started", "landed", "bounced", "flaky", "approval_needed", "budget_warning"] },
+          "examples": [["landed", "bounced"]]
+        },
+        "eventType": {
+          "description": "The repository_dispatch event_type: letters, digits and _ . : -, at most 100 characters.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,100}$",
+          "examples": ["qlander"]
+        }
+      }
+    }
+  }
+}

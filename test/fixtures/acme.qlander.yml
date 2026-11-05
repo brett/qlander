@@ -1,0 +1,120 @@
+# A second, neutral config (docs/deployment.md §1): every identity
+# differs from the control repo's own config (repos, ids, main, release, ref
+# prefixes, state branches, every label), so a test that passes on both
+# cannot depend on a value left in code.
+version: 1
+
+control:
+  repo: acme/widgets-control
+  repoId: 1003
+
+target:
+  repo: acme/widgets
+  repoId: 1002
+  main: trunk
+
+runner:
+  mode: self-hosted-kill
+  cronMinutes: 10
+  jobTimeoutMinutes: 5
+  hostKillMinutes: 6
+  takeoverGraceMinutes: 2
+
+lease:
+  minutes: 8
+  fenceMarginMinutes: 2
+
+queue:
+  stateBranch: mq-state
+  refs:
+    queuePrefix: mq/batch/
+    buildPrefix: mq/build/
+  labels:
+    ready: merge-queue
+    bounce: mq:bounce
+    solo: mq:solo
+    unsolo: mq:unsolo
+    go: mq:go
+  controlLabels:
+    pause: mq:pause
+    mirror: mq:state
+  admission:
+    fastLane:
+      workflow: .github/workflows/checks.yml
+      event: pull_request
+      job: quick
+    review:
+      required: false
+      producerLogins:
+        - "review-bot[bot]"
+      producer:
+        adapter: job@main
+        workflow: .github/workflows/review.yml
+        events:
+          - workflow_dispatch
+        jobTemplate: "Reviewed {sha}"
+        runNameTemplate: "Review {sha}"
+        searchPages: 3
+  policy:
+    paths:
+      - .github/**
+      - build/**
+    approvers:
+      - login: alice
+        id: 1001
+  preLanding:
+    - path: .github/workflows/build.yml
+      name: Build
+      when: always
+      required_jobs:
+        - unit
+        - lint
+      allow_skipped_jobs: {}
+  batch:
+    min: 2
+    max: 8
+    minFill: 1
+    maxWaitMinutes: 10
+    maxSplitDepth: 2
+    breakerBounces: 3
+  budget:
+    lineage: 12
+    window: 24
+    windowHours: 24
+  timeouts:
+    noRunMinutes: 15
+    inProgressMinutes: 150
+    queuedHours: 6
+    rerunBarrierMinutes: 60
+    reconcileMinutes: 30
+    cancelWindowMinutes: 30
+    cancelGiveUpHours: 6
+    maxOpTries: 3
+  verify:
+    ticks: 3
+    days: 7
+  historyLimit: 100
+
+release:
+  branch: stable
+  stateBranch: mq-release-state
+  labels:
+    pause: mq:release-pause
+    alert: mq:release-blocked
+    mirror: mq:release-state
+  dryRun: true
+  maxCandidates: 30
+  historyLimit: 100
+  qualification:
+    provider: manifest
+    manifest:
+      source: target
+      path: .github/release-manifest.json
+      proof:
+        statusContext: release-ok
+        workflow: .github/workflows/certify.yml
+
+watchdog:
+  labels:
+    alert: mq:alert
+    status: mq:status

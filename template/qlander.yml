@@ -1,0 +1,138 @@
+# qlander.yml: the whole configuration of one qlander deployment.
+# Every value below is a starting point; the ones marked CHANGE ME must be
+# set before the first tick. The full schema, with a description of every
+# key, is qlander.schema.json in each release; docs/deployment.md in
+# https://github.com/brett/qlander explains each block.
+#
+# After any change, re-render the workflows and commit them with the config:
+#
+#   bun "${bundle:?}" render --config qlander.yml
+#
+# (README.md, "1. Get the bundle"). CI fails if they differ.
+version: 1
+
+# This repo (the control repo): where the tick runs and its state lives.
+control:
+  repo: your-org/your-repo-qlander # CHANGE ME: owner/name of this repo
+  repoId: 1 # CHANGE ME: gh api repos/<owner>/<name> --jq .id
+
+# The repo whose main qlander lands PRs on.
+target:
+  repo: your-org/your-repo # CHANGE ME
+  repoId: 2 # CHANGE ME: gh api repos/<owner>/<name> --jq .id
+  main: main
+
+# GitHub-hosted runners, with the epoch fence (docs/deployment.md §3.3, §3.4).
+# A self-hosted pool whose host kills each job at a fixed age can use
+# mode: self-hosted-kill instead (§3.2).
+runner:
+  mode: hosted
+  epochFence: true
+  cronMinutes: 10
+  jobTimeoutMinutes: 5
+  takeoverGraceMinutes: 15 # at least 15 in hosted mode
+
+# jobTimeoutMinutes <= minutes - fenceMarginMinutes, and minutes < cronMinutes.
+lease:
+  minutes: 8
+  fenceMarginMinutes: 2
+
+queue:
+  stateBranch: qlander-state # in this repo
+  refs: # in the target
+    queuePrefix: queue/
+    buildPrefix: qlander-build/
+  labels: # on target PRs
+    ready: ready
+    bounce: qlander:bounce
+    solo: qlander:solo
+    unsolo: qlander:unsolo
+    go: qlander:go
+  controlLabels: # on this repo's issues
+    pause: pause
+    mirror: qlander-state
+  admission:
+    # The PR check that must be green on the PR's head before `ready` counts.
+    fastLane:
+      workflow: .github/workflows/ci.yml # CHANGE ME: in the target
+      event: pull_request
+      job: test # CHANGE ME: the job's name as GitHub shows it
+    review:
+      required: false
+      producerLogins:
+        - "github-actions[bot]"
+      producer:
+        adapter: job@main
+        workflow: .github/workflows/review.yml
+        events:
+          - workflow_dispatch
+        jobTemplate: "Reviewed {sha}"
+        runNameTemplate: "Review {sha}"
+        searchPages: 3
+  policy:
+    # A PR touching these lands alone and needs an approver's
+    # `/qlander approve-policy <head sha>` comment.
+    paths:
+      - .github/**
+    approvers: # login AND id must both match
+      - login: your-login # CHANGE ME
+        id: 1 # CHANGE ME: gh api users/<login> --jq .id
+  # The full suite a queue/<n> batch must pass before main moves to it.
+  preLanding:
+    - path: .github/workflows/ci.yml # CHANGE ME
+      name: CI # the workflow's name
+      when: always
+      required_jobs: # CHANGE ME: every job name that must pass
+        - test
+      allow_skipped_jobs: {}
+  batch:
+    min: 2
+    max: 8
+    minFill: 1
+    maxWaitMinutes: 10
+    maxSplitDepth: 2
+    breakerBounces: 3
+  budget:
+    lineage: 12
+    window: 24
+    windowHours: 24
+  timeouts:
+    noRunMinutes: 15
+    inProgressMinutes: 150
+    queuedHours: 6
+    rerunBarrierMinutes: 60
+    reconcileMinutes: 30
+    cancelWindowMinutes: 30
+    cancelGiveUpHours: 6
+    maxOpTries: 3
+  verify:
+    ticks: 3
+    days: 7
+  historyLimit: 100
+
+# Release advance: fast-forwards the target's release branch to qualified
+# main commits. Off until you enable it; checks-green qualifies a commit
+# whose preLanding jobs all passed on main.
+release:
+  enabled: false
+  dryRun: true
+  branch: release
+  stateBranch: qlander-release-state
+  labels:
+    pause: release-pause
+    alert: release-blocked
+    mirror: qlander-release-state
+  maxCandidates: 30
+  historyLimit: 100
+  qualification:
+    provider: checks-green
+
+watchdog:
+  labels:
+    alert: qlander-alert
+    status: qlander-status
+
+# The release this repo runs, pinned (with its sha256) in
+# .github/qlander-release.txt. Change the pin, never this, to upgrade.
+bundle:
+  repo: brett/qlander

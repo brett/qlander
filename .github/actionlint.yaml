@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # The self-hosted qlander runner group for tick.yml on main (DESIGN.md §11).
+  labels:
+    - qlander

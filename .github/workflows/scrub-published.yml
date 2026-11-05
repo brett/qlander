@@ -1,0 +1,101 @@
+# The scrub check on what has already been published (docs/deployment.md §7): each push to any branch (its name, tree and new commits; a squash
+# message edited at merge time is outside the PR check, and a branch with no PR
+# has no PR check), each pushed tag (its name, annotation, tagger, tree and
+# every commit it reaches) and each release, as soon as it is created and on
+# every later edit (its name and notes). This is detection, not prevention:
+# on a hit it fails and opens an issue that says where to look, never what
+# was found.
+
+name: scrub-published
+
+on: # zizmor: ignore[concurrency-limits] every event must be scanned, and a concurrency group would drop a pending one
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  release:
+    types: [created, published, edited]
+
+permissions: {}
+
+jobs:
+  scrub:
+    name: scrub what was published
+    if: ${{ github.event.deleted != true }} # a deleted branch or tag publishes nothing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write # the alert issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: main # the scrub script from main, whatever was pushed
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+          no-cache: true # this job must never write a cache another workflow could read
+
+      - name: Scrub
+        id: scrub
+        env:
+          PUBLIC_SCRUB_RULES: ${{ secrets.PUBLIC_SCRUB_RULES }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+          SERVER: ${{ github.server_url }}
+        # Release text and ref names come from the event file and GITHUB_REF, never the
+        # step's env, which is printed in its public log before any redaction.
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/scrub"
+          mkdir -p "$t"
+          REF="$GITHUB_REF"
+          # The job's token as a header in git's environment config (a private
+          # repo needs it), never on a command line or in .git/config.
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          fetch() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$SERVER/.extraheader" GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" git fetch --quiet --no-tags "$SERVER/$GH_REPO.git" "$@"; }
+          args=()
+          if [ "$EVENT" = release ]; then
+            jq -r '.release.name // ""' "$GITHUB_EVENT_PATH" > "$t/release-name"
+            jq -r '.release.tag_name // ""' "$GITHUB_EVENT_PATH" > "$t/release-tag"
+            jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" > "$t/release-notes"
+            args+=(--text "$t/release-name" --text "$t/release-tag" --text "$t/release-notes")
+          elif [[ "$REF" == refs/tags/* ]]; then
+            printf '%s\n' "${REF#refs/tags/}" > "$t/tag-name"
+            # The object this push published, never whatever the tag names now.
+            fetch "+$REF:refs/scrub/tag"
+            if [ "$(git rev-parse refs/scrub/tag)" != "$AFTER" ]; then
+              echo "::error::the tag moved after it was pushed; scrub the earlier object by hand"
+              exit 1
+            fi
+            # The tagger and annotation, the tagged tree, and every commit it brings.
+            args+=(--text "$t/tag-name" --tag refs/scrub/tag --tree "refs/scrub/tag^{commit}" --commits "refs/scrub/tag^{commit}")
+          else
+            printf '%s\n' "${REF#refs/heads/}" > "$t/branch-name"
+            args+=(--text "$t/branch-name")
+            # A later force push can have taken the commit off every branch: fetch it by name.
+            git cat-file -e "$AFTER^{commit}" 2>/dev/null || fetch "$AFTER" || true
+            git cat-file -e "$AFTER^{commit}"
+            # What this push added: to the branch, or, for a new branch, beyond main.
+            range="main..$AFTER"
+            if [ "$BEFORE" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then range="$BEFORE..$AFTER";
+            elif [ "$REF" = refs/heads/main ]; then range="$AFTER"; fi
+            args+=(--tree "$AFTER" --commits "$range" --commit-trees "$range")
+          fi
+          bun scripts/public-scrub.ts --fail --redact --summary --forbid-excluded "${args[@]}"
+
+      - name: Open an alert issue
+        if: failure() && steps.scrub.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          printf 'The scrub check found something in what was just published. The run log says where (redacted): %s\n\nCheck it with the rules locally, and remove or edit what was published.\n' "$RUN_URL" > "$RUNNER_TEMP/alert.md"
+          gh issue create --title "Scrub check failed on published content" --body-file "$RUNNER_TEMP/alert.md"

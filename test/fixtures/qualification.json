@@ -1,0 +1,31 @@
+{
+  "$comment": "An invented qualification manifest that uses every field the format has: what a commit must pass before anything ships it. A proof workflow evaluates it and sets the commit status named by status_context; status_meaning says exactly what success asserts. Evidence is a run with event push, in this repository, for the exact commit, on a branch matching evidence_branch_patterns: main, or a landing-queue branch queue/<n> whose tested commit main is then fast-forwarded to. A job passes only by succeeding: skipped passes only where listed in allow_skipped_jobs.",
+  "schema": 1,
+  "status_context": "qualified",
+  "status_meaning": "Commit status `qualified` with state success, set only by the proof workflow at main, means: this exact commit is on main, and for every workflow under `required` a push run of this exact commit in this repository, on main or on a landing-queue branch queue/<n>, completed with every job succeeded (skipped only where allow_skipped_jobs says). The status is a published signal, never a credential; qlander recomputes the verdict before it moves `release`.",
+  "branch": "main",
+  "evidence_branch_patterns": ["^main$", "^queue/[A-Za-z0-9._-]+$"],
+  "required": [
+    {
+      "path": ".github/workflows/pr.yml",
+      "name": "Build and test",
+      "when": "always",
+      "why": "An example always-required workflow.",
+      "required_jobs": ["vet", "compile (linux)", "unit (parser)", "integration (sqlite)"],
+      "allow_skipped_jobs": {
+        "pr-only": "An example of a job that runs on pull requests only."
+      }
+    },
+    {
+      "path": ".github/workflows/docs.yml",
+      "name": "Docs",
+      "when": "if_triggered",
+      "why": "An example path-filtered workflow: required when the push triggered it.",
+      "required_jobs": ["build the docs"],
+      "allow_skipped_jobs": {}
+    }
+  ],
+  "not_required": {
+    ".github/workflows/publish.yml": "An example of a workflow left out: publishing is gated by qualification, so it cannot be an input to it."
+  }
+}

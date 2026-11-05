@@ -5,7 +5,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { GitHubError } from "../src/github/http";
-import type { SetupApi } from "../src/setup/client";
+import { SetupApi } from "../src/setup/client";
 import { runSetup } from "../src/setup/command";
 import { controlRulesets, full, targetRulesets } from "../src/setup/expected";
 import { installAll, type World, world } from "./setup-world";
@@ -537,6 +537,45 @@ describe("hardening", () => {
         expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("could not read the rules") && l.includes(message))).toBe(true);
       });
     }
+
+    /** The same fake GitHub, with the rules read answered first by `otherPages` pages of 30 rules from another ruleset. */
+    const pagedRules = (w: World, otherPages: number) => {
+      const seen: string[] = [];
+      const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(String(input));
+        if (!url.pathname.includes("/rules/branches/")) return w.f.fetch(input as string, init);
+        seen.push(url.search);
+        const page = Number(url.searchParams.get("page") ?? 1);
+        if (page > otherPages) return w.f.fetch(`${url.origin}${url.pathname}`, init);
+        url.searchParams.set("page", String(page + 1));
+        const others = Array.from({ length: 30 }, () => ({ type: "creation", ruleset_id: 999_999 }));
+        return new Response(JSON.stringify(others), { status: 200, headers: { "content-type": "application/json", link: `<${url}>; rel="next"` } });
+      }) as typeof fetch;
+      return { seen, deps: w.deps({ api: new SetupApi(w.f.operator, { baseUrl: "https://api.fake.test", fetch: fetchFn, readAttempts: 1 }) }) };
+    };
+
+    test("the expected rule on a later page is found: 30 other rules and a next link", async () => {
+      const { w } = await setUp();
+      const { seen, deps } = pagedRules(w, 1);
+      w.out.length = 0;
+      expect(await runSetup(deps, ["verify"])).toBe(0);
+      expect(seen[0]).toContain("per_page=100");
+      expect(seen.some((q) => q.includes("page=2"))).toBe(true);
+      expect(w.out.filter((l) => l.includes(`the creation rule of ${STATE_RULESET} applies to it`))).toHaveLength(2);
+    });
+
+    test("a truncated listing is a failed read, and fails verification", async () => {
+      const { w } = await setUp();
+      const { deps } = pagedRules(w, Number.MAX_SAFE_INTEGER);
+      let attempts = 0;
+      deps.api.createRef = async () => {
+        attempts++;
+      };
+      w.out.length = 0;
+      expect(await runSetup(deps, ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("could not read the rules") && l.includes("truncated"))).toBe(true);
+      expect(attempts).toBe(0);
+    });
 
     for (const [kind, status, message] of [["auth", 401, "Bad credentials"], ["auth", 403, "Resource not accessible by personal access token"], ["not_found", 404, "Not Found"]] as const) {
       test(`a ${status} on the create is no pass`, async () => {

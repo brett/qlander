@@ -31,6 +31,8 @@ export class ControlWorld {
   /** What a dispatched tick reports, and how its run ends, when no pause issue is open. */
   liveOutcome = "idle";
   liveConclusion = "success";
+  /** The tick's report: live (an outcome), dry-run (what it read of the pause issues), or dry-run from a release whose report does not say. */
+  tickMode: "live" | "dry-run" | "dry-run-unsaid" = "live";
   /** Dispatched runs never start (ghosts). */
   ghostDispatch = false;
   me = { login: ME.login, id: ME.id };
@@ -77,7 +79,8 @@ export class ControlWorld {
         const conclusion = paused ? "success" : w.liveConclusion;
         const x = run({ event: "workflow_dispatch", createdAt: at(), conclusion }, { conclusion });
         r.runs.push(x);
-        r.logs.set(x.jobs![0]!.id, `2026-10-22T12:00:00.0000000Z starting\n{\n "outcome": "${paused ? "paused" : w.liveOutcome}",\n "log": []\n}\n`);
+        const report = w.tickMode === "live" ? `"outcome": "${paused ? "paused" : w.liveOutcome}",` : w.tickMode === "dry-run" ? `"mode": "dry-run",\n "paused": ${paused},` : `"mode": "dry-run",`;
+        r.logs.set(x.jobs![0]!.id, `2026-10-22T12:00:00.0000000Z starting\n{\n ${report}\n "log": []\n}\n`);
       },
       listRecentRuns: () => r.listRecentRuns(),
       listUnfinishedRuns: () => r.listUnfinishedRuns(),

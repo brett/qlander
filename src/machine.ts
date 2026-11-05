@@ -77,7 +77,7 @@ export const HOLD_MINUTES = 10;
 
 /**
  * How long a ready PR may wait, unqueued, for something only a person can
- * give (a CI-policy approval) or for GitHub's mergeability, before
+ * give (a CI-policy approval, a fix for a red fast lane) or for GitHub's mergeability, before
  * qlander says so on the PR. A timing constant, not policy: it is not in
  * Config, so the policy hash is unchanged.
  */
@@ -522,6 +522,7 @@ function admitAndRevalidate(c: Ctx): void {
     } else if (a.kind === "wait") {
       c.log.push(`#${live.number} waits: ${a.reason}`);
       if (live.mergeable === null) waitNotice(c, live, "merge", hold(c, live.number, live.head));
+      else if (live.fastLane.red) waitNotice(c, live, "fast", Date.parse(live.ready!.at), live.fastLane.why);
       if (a.reason.startsWith(NEEDS_APPROVAL)) {
         waitNotice(c, live, "approval", Date.parse(live.ready!.at), a.reason);
         const command = `/qlander approve-policy ${live.head}`;
@@ -549,7 +550,7 @@ function admitAndRevalidate(c: Ctx): void {
  * it waits; the outbox finds its marker and never posts it twice. Never
  * omittable: it asks someone to act.
  */
-function waitNotice(c: Ctx, live: LivePr, kind: "merge" | "approval", since: number, reason = ""): void {
+function waitNotice(c: Ctx, live: LivePr, kind: "merge" | "approval" | "fast", since: number, reason = ""): void {
   const waited = Math.floor((c.snap.now.getTime() - since) / 60_000);
   if (!(waited >= WAIT_NOTICE_MINUTES)) return;
   const head = live.head;
@@ -557,6 +558,8 @@ function waitNotice(c: Ctx, live: LivePr, kind: "merge" | "approval", since: num
   const body =
     kind === "merge"
       ? `Labelled \`ready\` but not queued: GitHub has not reported whether this PR merges cleanly into \`${main}\` for ${waited} minutes (head \`${head}\`). It is queued as soon as GitHub does. If this persists, push a new commit so GitHub computes it again.`
+      : kind === "fast"
+        ? `Labelled \`ready\` but not queued: the fast lane is red at head \`${head}\` (${reason}). \`ready\` stays on, so this PR is queued as soon as \`${c.cfg.fastLane.job}\` passes: rerun it if the failure is a flake, or push a fix. If this PR shouldn't land yet, remove \`ready\`.`
       : `Labelled \`ready\` but not queued: ${reason}. This PR changes CI policy, so it lands only once one of ${c.cfg.humans.map((h) => `\`${h.login}\``).join(", ") || "the configured approvers (none are configured)"} posts a comment whose whole body is:\n\n\`\`\`\n/qlander approve-policy ${head}\n\`\`\`\n\nA push moves the head and needs a new approval.`;
   c.log.push(`#${live.number}: told it waits (${kind}, ${waited}m)`);
   comment(c, live.number, `wait:${kind}:${head}`, body);

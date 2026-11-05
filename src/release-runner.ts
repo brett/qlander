@@ -375,7 +375,7 @@ export async function releaseTick(d: ReleaseDeps): Promise<ReleaseResult> {
     if (!isTransient(e)) throw e;
   }
   try {
-    const body = `Mirror of the ${d.cfg.names.releaseStateBranch} branch, for people. Qlander never reads this issue.\n\n${renderReleaseState(t.state)}`;
+    const body = `Mirror of the ${d.cfg.names.releaseStateBranch} branch, for people. Qlander reads only whether this issue is open, if that branch goes missing, to refuse to start again from empty.\n\n${renderReleaseState(t.state)}`;
     await upsertMirror(d.repo, d.cfg.names.releaseLabels.mirror, "qlander release state (mirror)", body);
   } catch (e) {
     if (!(e instanceof GitHubError)) throw e;

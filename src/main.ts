@@ -168,6 +168,8 @@ export interface DryRun {
   /** A live run would refuse to initialise (and pause) for this reason. */
   refused?: string;
   log: string[];
+  /** Whether a live tick would stop here: an open pause issue, a pending pause, a listing it could not trust, or a pause this decision would raise. Absent when it stopped before reading them (refused). */
+  paused?: boolean;
   /** The op a live tick would journal and perform next, if any. */
   wouldDo: Op | null;
   /** As TickResult.readyListed and .ignored: what the decision saw, and every ready PR it would not admit. */
@@ -190,14 +192,15 @@ export async function runDry(
   const seen = await inspectState(stateRef, repo, queueCodec(cfg.names)); // the same check a live run makes
   if (!seen.ok) return { mode: "dry-run", refused: seen.reason, log: [`a live tick would pause: ${seen.reason}`], wouldDo: null };
   const state = seen.read ? parseState(seen.read.text, cfg.names) : emptyState();
-  if (state.journal) return { mode: "dry-run", log: [`a journalled ${state.journal.op.kind} is outstanding; a live tick would recover it first`], wouldDo: state.journal.op };
   // Fails closed, as a live tick does: an unreadable or incomplete pause listing counts as paused.
   const paused = state.outbox.some((n) => n.kind === "pause") || (await pauseReason(repo, cfg.names.controlLabels.pause)) !== null;
+  if (state.journal) return { mode: "dry-run", paused, log: [`a journalled ${state.journal.op.kind} is outstanding; a live tick would recover it first`], wouldDo: state.journal.op };
   const snap = await buildSnapshot({ api: target, cfg, state, now: new Date(), paused, policyHash: policyHash(cfg) });
   const d = decide(state, snap, cfg);
   const hooks = enqueueHooks(state, d.events, defaultHooks, new Date()).log.map((l) => l.replace(/^hook: queued /, "hook (dry run): would queue "));
   return {
     mode: "dry-run",
+    paused: paused || d.state.outbox.some((n) => n.kind === "pause"),
     log: [...d.log, ...hooks],
     wouldDo: d.state.journal?.op ?? null,
     ...(snap.readyListed ? { readyListed: snap.readyListed } : {}),

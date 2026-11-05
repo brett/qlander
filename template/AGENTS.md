@@ -41,11 +41,11 @@ A key the pinned release doesn't know makes every tick fail, so upgrade before y
 
 Every upgrade goes through `quiesce`. Opening a pause issue alone isn't enough.
 
-1. Run `qlander quiesce --dry-run` and read all of it. A dry run can exit 0 and print `not idle now`, which a real run refuses.
-2. With the person's go-ahead, run `qlander quiesce`. It refuses while a batch is active or pending: try again later, and don't work around it. If it fails partway, some of its steps may have happened, so report its message, the open pause issues and the state of `tick.yml`.
+1. Run `qlander quiesce --dry-run` and read all of it. It exits 0 only if the state is idle and no tick is running now, and 1 if a real run would refuse or a tick is still running (`not idle now`).
+2. With the person's go-ahead, run `qlander quiesce`. It refuses, changing nothing, while a batch is active or pending or the state has work left: try again later, and don't work around it. If it fails partway, some of its steps may have happened, so report its message, which names the way back and any pause it left alone, the open pause issues and the state of `tick.yml`.
 3. Keep the two state commits it prints, for rollback.
 4. Follow [Upgrading](README.md#upgrading) to open the PR with the new pin. A person reviews and merges it.
-5. With the person's go-ahead, run `qlander unquiesce --dry-run`, then `qlander unquiesce`. Add `--all` only if they ask for it.
+5. With the person's go-ahead, run `qlander unquiesce --dry-run`, then `qlander unquiesce`. It refuses while a pause that `quiesce` didn't open is open. Add `--all` only if they ask for it, because that lifts such a pause.
 
 ## CI-policy approval
 

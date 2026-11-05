@@ -35,6 +35,21 @@ describe("job@subject (fast lane)", () => {
     expect(jobAtSubject(req, H, TARGET, [pr()], { "1": [job("fast", "failure")] }).ok).toBe(false);
   });
 
+  test("red marks a finished verdict against the subject, and only that", () => {
+    const red = (runs: ReturnType<typeof pr>[], jobs: Parameters<typeof jobAtSubject>[4]) => jobAtSubject(req, H, TARGET, runs, jobs).red === true;
+    expect(red([pr()], { "1": [job("fast", "failure")] })).toBe(true);
+    expect(red([pr()], { "1": [job("fast", "timed_out")] })).toBe(true);
+    expect(red([pr()], { "1": [job("fast", "cancelled")] })).toBe(true);
+    expect(red([pr()], { "1": [job("Other")] })).toBe(true); // the run finished without the job
+    expect(red([pr()], { "1": [job("fast")] })).toBe(false); // green
+    expect(jobAtSubject(req, H, TARGET, [], {}).red).toBeUndefined(); // no run yet
+    expect(red([pr({ status: "in_progress" })], { "1": [job("fast", null, "in_progress")] })).toBe(false); // running
+    expect(red([pr({ status: "in_progress" })], { "1": [job("Lint", "failure"), job("fast", null, "queued")] })).toBe(false); // not finished, though it will not pass
+    expect(red([pr({ status: "in_progress", run_attempt: 2 })], { "1": [job("fast", null, "queued")] })).toBe(false); // a rerun going
+    expect(red([pr({ id: 1 }), pr({ id: 2, status: "queued" })], { "1": [job("fast", "failure")], "2": [] })).toBe(false); // a newer run may yet pass
+    expect(red([pr()], {})).toBe(false); // jobs unreadable: not known
+  });
+
   test("a newer first-attempt run still queued or running defers to the older verdict", () => {
     const runs = [pr({ id: 1 }), pr({ id: 2, status: "queued" })];
     for (const newer of [[job("fast", null, "queued")], [job("fast", null, "in_progress"), job("Lint")], []]) {

@@ -34,14 +34,14 @@ jobs:
           # release, each checked against its committed sha256.
           read -r version asset sum < .github/bun-release.txt
           dir="$(mktemp -d)"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+          timeout 40 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --connect-timeout 5 --speed-limit 1024 --speed-time 10 \
             --output "$dir/$asset" "https://github.com/oven-sh/bun/releases/download/bun-v${version}/${asset}"
           (cd "$dir" && echo "${sum}  ${asset}" | sha256sum -c -)
           unzip -q "$dir/$asset" -d "$dir"
           bun="$dir/${asset%.zip}/bun"
           read -r relversion relasset relsum < .github/qlander-release.txt
           [[ "$relasset" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\.js$ ]]
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+          timeout 20 curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --connect-timeout 5 --speed-limit 1024 --speed-time 10 \
             --output "$dir/$relasset" "https://github.com/brett/qlander/releases/download/v${relversion}/${relasset}"
           (cd "$dir" && echo "${relsum}  ${relasset}" | sha256sum -c -)
           "$bun" "$dir/$relasset" validate --config qlander.yml

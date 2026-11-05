@@ -10,8 +10,8 @@ Only the qlander queue moves `main`. It tests ready PRs together and lands them 
 
 - **Never merge by hand.** No `gh pr merge`, no `--admin`, no push to `main`, even if every check is green and your account has bypass rights.
 - **Qualify the PR.** It targets `main` from a branch in this repo, not a fork or a draft, has no conflicts, and every commit is signed and verified. Run the tests your change touches first, because a full-suite failure delays other PRs.
-- **To land:** finish pushing, wait for `<fast check>` to pass on the current head, then add `ready`. Adding it needs write access.
-- **Don't push after `ready`.** Qlander pins the head when it admits the PR. A later push drops the PR from the queue and removes `ready`, and it has to qualify again. A push just before landing can miss: the pinned head lands without your later commits, and qlander comments to say so.
+- **To land:** finish pushing, wait for `<fast check>` to pass on the current head, then add `ready`. Adding it needs write access. If `<fast check>` is red when `ready` goes on, or goes red after, qlander leaves `ready` on and comments once per head after 30 minutes.
+- **Don't add `ready` until the head is final.** The label isn't tied to a commit. Before qlander admits the PR, a push changes what would land and `ready` stays on, so the new head is admitted as soon as `<fast check>` passes on it. After admission, qlander has pinned the head: a push takes the PR out of the queue and removes `ready`, and it has to qualify again. A push just before landing can miss: the pinned head lands without your later commits, and qlander comments to say so.
 - **Check that it landed.** Normally GitHub marks the PR merged and qlander removes `ready`, and qlander comments if the PR lands any other way. A missing `ready` alone doesn't mean it landed.
 - **After a bounce or removal,** read qlander's comment and fix the cause. A green rerun of the same head isn't a fix. Then push, wait for `<fast check>` on the new head, and add `ready` again. If a person took the PR out, ask them first.
 - **Don't remove someone else's `ready`.** That takes their PR out of the queue.

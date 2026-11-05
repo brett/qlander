@@ -11,6 +11,7 @@ import { parseQualificationManifest } from "../release";
 import type { Job, Run } from "../types";
 import { appChecks, type AppIdentity } from "./apps";
 import { t12 } from "./policy-coverage";
+import { releaseRequiredChecks } from "../setup/expected";
 import { type RepoInfo, RepoView, type Wf, why } from "./repo-view";
 import { branchRulesets, landingRequirements, noBypassRule, prefixRuleset, refsRuleset, type RulesetCtx } from "./ruleset-checks";
 import { appliesTo, hasRule, readRulesets } from "./rulesets";
@@ -141,7 +142,7 @@ async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs:
     if (!(e instanceof GitHubError && e.kind === "not_found")) throw e;
     out.push(sev("T10", `the release branch ${branch} does not exist${tag}`, `create ${branch} at a qualified commit of ${main}`));
   }
-  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev), ...landingRequirements("T10", branch, c, { contexts: [], strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
+  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, true), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
   for (const e of cfg.config.preLanding) {
     const w = wfs.find((x) => x.path === e.path);
     if (!w?.wf) continue;

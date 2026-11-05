@@ -80,9 +80,30 @@ export function watchdogInput<C extends Pick<RenderInput, "bundle">>(c: C): Pick
   return c.bundle?.watchdog === false ? { bundle: null } : c;
 }
 
+/**
+ * Every download: a failed attempt (a 504, a reset, a stall of 10 seconds) is
+ * tried again until `timeout` ends it, which curl's own --retry-max-time can't,
+ * since that doesn't stop an attempt already going. What arrives is still
+ * checked against its committed sha256; a download that runs out fails the job.
+ *
+ * The bounds, in seconds, against the template's 5-minute job (300): the queue
+ * job's chain is done at most WATCH_MINUTES + DISPATCH_SECONDS (src/wake.ts)
+ * after the process starts, 210, which leaves 90 for what comes before it. The
+ * downloads take at most 40 + 20 = 60 (40 + 10 + 20 = 70 for a private
+ * release), leaving 30 (20) for the checkout and the token steps. A job that
+ * still runs over loses only its chain link: the lease is released by then.
+ */
+export const CURL = "curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --connect-timeout 5 --speed-limit 1024 --speed-time 10";
+/** Bun, about 40 MB. */
+export const BUN_SECONDS = 40;
+/** The bundle, under 1 MB. */
+export const BUNDLE_SECONDS = 20;
+/** A private release's listing. */
+export const RELEASE_LISTING_SECONDS = 10;
+
 /** Download, verify and run the pinned bundle (bundle set). */
 function bundleLines(b: Bundle, args: string): string[] {
-  const curl = "curl --fail --silent --show-error --location --proto '=https' --tlsv1.2";
+  const curl = CURL;
   const download = b.private
     ? [
         `          # A private release of ${b.repo},`,
@@ -91,17 +112,17 @@ function bundleLines(b: Bundle, args: string): string[] {
         "          # the redirect to the asset's storage host.",
         `          releases="https://api.github.com/repos/${b.repo}/releases"`,
         "          auth() { printf 'Authorization: Bearer %s\\n' \"$GITHUB_TOKEN\"; }",
-        `          auth | ${curl} \\`,
+        `          auth | timeout ${RELEASE_LISTING_SECONDS} ${curl} \\`,
         '            --header @- --header "Accept: application/vnd.github+json" \\',
         '            --output "$dir/release.json" "$releases/tags/v${relversion}"',
         '          id="$(RELEASE="$dir/release.json" ASSET="$relasset" "$bun" -e \'const a = (await Bun.file(process.env.RELEASE).json()).assets.filter((x) => x.name === process.env.ASSET); if (a.length !== 1) throw new Error("the release has no single asset " + process.env.ASSET); console.log(a[0].id)\')"',
         '          [[ "$id" =~ ^[0-9]+$ ]]',
-        `          auth | ${curl} \\`,
+        `          auth | timeout ${BUNDLE_SECONDS} ${curl} \\`,
         '            --header @- --header "Accept: application/octet-stream" \\',
         '            --output "$dir/$relasset" "$releases/assets/${id}"',
       ]
     : [
-        `          ${curl} \\`,
+        `          timeout ${BUNDLE_SECONDS} ${curl} \\`,
         `            --output "$dir/$relasset" "https://github.com/${b.repo}/releases/download/v\${relversion}/\${relasset}"`,
       ];
   return [
@@ -125,7 +146,7 @@ function runScript(c: Pick<RenderInput, "bundle">, args: string): string[] {
     "          # directory that did not exist before this step.",
     "          read -r version asset sum < .github/bun-release.txt",
     '          dir="$(mktemp -d)"',
-    "          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \\",
+    `          timeout ${BUN_SECONDS} ${CURL} \\`,
     '            --output "$dir/$asset" "https://github.com/oven-sh/bun/releases/download/bun-v${version}/${asset}"',
     '          (cd "$dir" && echo "${sum}  ${asset}" | sha256sum -c -)',
     '          unzip -q "$dir/$asset" -d "$dir"',

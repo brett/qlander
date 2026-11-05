@@ -242,7 +242,7 @@ The tick runs on self-hosted runner pools labelled `qlander`. Put them in a runn
 
 - **One job at a time.** Each pool runs at most one job at a time.
 - **A host-side kill.** The host destroys the VM at a fixed age, `runner.hostKillMinutes`, whatever the guest is doing. That kill is part of the [lease safety argument](deployment.md#32-mode-self-hosted-kill). `hostKillMinutes` must be at least `runner.jobTimeoutMinutes`.
-- **Tools.** The runner image needs `curl`, `sha256sum` and `unzip`. Each tick downloads the Bun release named in `.github/bun-release.txt` into a fresh temp directory and refuses to run it unless the sha256 matches.
+- **Tools.** The runner image needs `curl` 7.71 or newer, `timeout`, `sha256sum` and `unzip`. Each tick downloads the Bun release named in `.github/bun-release.txt` into a fresh temp directory and refuses to run it unless the sha256 matches.
 - **Restarts.** Pause both jobs before you restart whatever enforces the host kill. VMs it adopts after a restart may be bounded only later than either job's takeover window. The [runbook](operating.md#restarting-a-runner-hosts-controller) has the procedure.
 
 With one pool, the queue and release jobs run one after the other. With several, they may run at the same time, which is safe because each job has its own lease and state branch.
@@ -373,7 +373,7 @@ The target needs the [target-side requirements](../DESIGN.md#13-target-side-requ
 GH_TOKEN=$(gh auth token) bun "${bundle:?}" audit --config qlander.yml
 ```
 
-It prints one line per check: `PASS`, `WARN`, `FAIL` or `SKIPPED`, with the requirement id and a fix. The ids are T0 to T12 for the [target](deployment.md#41-requirements) and C0 to C8 for the [control repo](deployment.md#4-target-repo-ci-requirements-and-audit). T0 and C0 report that the repo was read, that its id matches the config and whether the token is an admin; without admin, the checks that need it are `SKIPPED`. It exits 1 on a `FAIL`. It exits 3 instead if every `FAIL` came from a failed read, or a read failed and nothing else failed: those lines say `(read failed)`, so rerun it. A check that needs a permission the token lacks stays `SKIPPED` or `WARN`, and exits 0.
+It prints one line per check: `PASS`, `WARN`, `FAIL` or `SKIPPED`, with the requirement id and a fix. The ids are T0 to T12 for the [target](deployment.md#41-requirements) and C0 to C8 for the [control repo](deployment.md#4-target-repo-ci-requirements-and-audit). T0 and C0 appear only for a problem: the repo couldn't be read, its id doesn't match the config, or the token isn't an admin. Without admin, the checks that need it are `SKIPPED`. It exits 1 on a `FAIL`. It exits 3 instead if every `FAIL` came from a failed read, or a read failed and nothing else failed: those lines say `(read failed)`, so rerun it. A check that needs a permission the token lacks stays `SKIPPED` or `WARN`, and exits 0.
 
 A check that needs admin rights, such as ruleset bypass lists, branch protection or secrets, is `SKIPPED`, never guessed. [Deployment, section 4](deployment.md#4-target-repo-ci-requirements-and-audit) lists every check.
 

@@ -259,9 +259,9 @@ export async function upsertMirror(repo: StateRepoApi, label: string, title: str
   await repo.createIssue(title, body, [label]);
 }
 
-/** Best effort: the human-readable mirror on the state issue. Never read back for decisions. */
+/** Best effort: the human-readable mirror on the state issue. Read back only by refuseIfIssueHoldsState below. */
 export async function mirror(repo: StateRepoApi, names: Names, state: State): Promise<void> {
-  const body = `Mirror of the ${names.stateBranch} branch, for people. Qlander never reads this issue.\n\n${renderState(state)}`;
+  const body = `Mirror of the ${names.stateBranch} branch, for people. Qlander reads this issue only if that branch goes missing, to refuse to start again from empty.\n\n${renderState(state)}`;
   await upsertMirror(repo, names.controlLabels.mirror, "qlander state (mirror)", body);
 }
 

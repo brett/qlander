@@ -253,7 +253,7 @@ export function renderStatus(s: StatusInput): string {
   const e = s.evaluation;
   const mode =
     s.modeVar === "live"
-      ? `live${s.releaseHeldByConfig === null ? " (release advance setting unknown: qlander.yml is invalid)" : s.releaseHeldByConfig ? " (release advance held in dry run by src/release-config.ts)" : ""}`
+      ? `live${s.releaseHeldByConfig === null ? " (release advance setting unknown: qlander.yml is invalid)" : s.releaseHeldByConfig ? " (release advance held in dry run by release.dryRun in qlander.yml)" : ""}`
       : `dry-run (QLANDER_MODE is ${s.modeVar ? code(s.modeVar, 20) : "unset"})`;
   const link = (u?: string) => (u ? ` ([link](${u}))` : "");
   const runUrl = safeUrl(s.runUrl);

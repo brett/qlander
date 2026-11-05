@@ -6,11 +6,11 @@
 import { describe, expect, test } from "bun:test";
 import { decide, WAIT_NOTICE_MINUTES } from "../src/machine";
 import { GitHubError } from "../src/github/http";
-import { drain } from "../src/outbox";
+import { drain, isBestEffort } from "../src/outbox";
 import { emptyState, type State } from "../src/state";
 import { buildSnapshot } from "../src/snapshot";
 import { FakeStateRepo, FakeTarget } from "./fake-github";
-import { APPROVERS, BOT_FILE, cfg, cmd, livePr, NAMES, sha, Sim } from "./sim";
+import { APPROVERS, BOT_FILE, cfg, cmd, job, livePr, NAMES, sha, Sim } from "./sim";
 import { World } from "./world";
 
 const MIN = 60_000;
@@ -92,6 +92,73 @@ describe("a ready PR whose mergeability GitHub never computes", () => {
     expect(w.landed()).toEqual([]);
     w.target.prs.get(1)!.pr.mergeable = true;
     await w.runUntilIdle();
+    expect(w.landed()).toEqual([[1]]);
+  });
+});
+
+describe("a ready PR whose fast lane is red", () => {
+  const JOB = "fast";
+  const red = (at: string, over = {}) => livePr(1, { fastLane: { ok: false, red: true, why: `job '${JOB}' failure in run 7` }, ready: { actorLogin: APPROVERS[0]!.login, actorPermission: "admin", at }, ...over });
+
+  test("is told nothing while young, then once, naming the head, the job's verdict and what to do", () => {
+    const sim = new Sim(cfg());
+    sim.add(red(minutesAgo(sim.now, WAIT_NOTICE_MINUTES - 1)));
+    let d = decide(sim.state, sim.snapshot(), sim.config);
+    expect(d.log.some((l) => l.startsWith("#1 waits: fast lane"))).toBe(true);
+    expect(d.state.outbox.filter((o) => o.kind === "comment")).toEqual([]);
+    sim.now = new Date(sim.now.getTime() + MIN);
+    d = decide(sim.state, sim.snapshot(), sim.config);
+    const notes = d.state.outbox.filter((o) => o.kind === "comment");
+    expect(notes).toHaveLength(1);
+    const n = notes[0]!;
+    if (n.kind !== "comment") throw new Error("not a comment");
+    expect(n.id).toBe(`c:1:wait:fast:${livePr(1).head}`);
+    expect(n.body).toContain("the fast lane is red");
+    expect(n.body).toContain(livePr(1).head);
+    expect(n.body).toContain("failure in run 7");
+    expect(n.body).toContain("rerun it");
+    expect(d.state.auth["1"]).toBeUndefined();
+    expect(isBestEffort(n)).toBe(true);
+  });
+
+  test("a fast lane that is pending, unread or never ran says nothing, however long it waits", () => {
+    for (const fastLane of [
+      { ok: false, why: "job 'fast' has not succeeded in run 7" },
+      { ok: false, unknown: true as const, why: "the run list is incomplete" },
+      { ok: false, why: "no pull_request run" },
+    ]) {
+      const sim = new Sim(cfg());
+      sim.add(red(minutesAgo(sim.now, 600), { fastLane }));
+      expect(decide(sim.state, sim.snapshot(), sim.config).state.outbox.filter((o) => o.kind === "comment")).toEqual([]);
+    }
+  });
+
+  test("end to end: one comment however many ticks and reruns, a new one for a new head, and none once it passes", async () => {
+    const w = new World();
+    w.commentSettings = { omit: ["queued", "landed"] }; // never omittable: it asks someone to act
+    w.readyPr(1);
+    const ci = () => w.target.prs.get(1)!;
+    const redRun = () => {
+      const f = w.config.fastLane;
+      w.target.addRun({ head_sha: ci().pr.head.sha, path: f.workflowPath, event: f.event, head_branch: ci().pr.head.ref }, [job(f.job, "failure")]);
+    };
+    redRun();
+    const told = () => w.comments(1).filter((b) => b.includes("the fast lane is red"));
+    for (let i = 0; i < 6; i++) await w.tick();
+    expect(told()).toHaveLength(1);
+    expect(told()[0]).toContain(ci().pr.head.sha);
+    expect(w.state().auth["1"]).toBeUndefined();
+    expect(ci().pr.labels).toContain(w.config.names.labels.ready);
+
+    const next = w.target.push(1, {});
+    redRun();
+    for (let i = 0; i < 6; i++) await w.tick();
+    expect(told()).toHaveLength(2);
+    expect(told()[1]).toContain(next);
+
+    w.evidence(1);
+    await w.runUntilIdle();
+    expect(told()).toHaveLength(2);
     expect(w.landed()).toEqual([[1]]);
   });
 });

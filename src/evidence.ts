@@ -10,6 +10,8 @@ export interface Proof {
   why: string;
   /** Not proven either way (a search limit was hit); fails closed, but is not "absent". */
   unknown?: true;
+  /** A finished verdict against the subject, with no newer run still deciding it (what a person is told about). Admission never reads it. */
+  red?: true;
   run?: RunRef;
   checkId?: number;
 }
@@ -56,6 +58,8 @@ export function jobAtSubject(
     .sort((a, b) => b.id - a.id);
   if (matching.length === 0) return no(`no ${req.event} run of ${req.workflowPath} for ${subject}`);
   for (const run of matching) {
+    // An older verdict with a newer run still going can yet change.
+    const red: { red?: true } = run === matching[0] ? { red: true } : {};
     const jobs = jobsByRun[String(run.id)];
     if (!jobs) return { ok: false, unknown: true, why: `job list of run ${run.id} not readable` };
     const job = jobs.find((j) => j.name === req.job);
@@ -63,16 +67,19 @@ export function jobAtSubject(
       return { ok: true, why: `run ${run.id}`, run: { runId: run.id, attempt: run.run_attempt } };
     }
     if (job?.status === "completed" && FAILED.has(job.conclusion ?? "")) {
-      return no(`job '${req.job}' ${job.conclusion} in run ${run.id}`);
+      return { ...no(`job '${req.job}' ${job.conclusion} in run ${run.id}`), ...red };
     }
     const pending = run.status !== "completed" && job?.status !== "completed";
     const failed = jobs.find((j) => FAILED.has(j.conclusion ?? ""));
     if (!pending || run.run_attempt !== 1 || failed) {
-      return no(
-        failed
-          ? `job '${failed.name}' ${failed.conclusion} in run ${run.id}`
-          : `job '${req.job}' has not succeeded in run ${run.id}`,
-      );
+      return {
+        ...no(
+          failed
+            ? `job '${failed.name}' ${failed.conclusion} in run ${run.id}`
+            : `job '${req.job}' has not succeeded in run ${run.id}`,
+        ),
+        ...(pending ? {} : red),
+      };
     }
   }
   return no(`job '${req.job}' has not succeeded in run ${matching[0]!.id}`);

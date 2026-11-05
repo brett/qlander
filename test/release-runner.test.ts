@@ -26,6 +26,8 @@ describe("release advance: the happy path", () => {
     expect(s.history.at(-1)).toMatchObject({ outcome: "advanced", from: w.R, to: b, receipt: { policyBlob: BLOB, from: w.R, to: b } });
     expect(s.history.at(-1)!.receipt!.evidence[0]).toMatchObject({ workflow: "CI", branch: "main", run_attempt: 1 });
     expect(w.issues("qlander-release-state")).toHaveLength(1);
+    expect(w.issues("qlander-release-state")[0]!.body).toContain("Qlander reads only whether this issue is open");
+    expect(w.issues("qlander-release-state")[0]!.body).not.toContain("never reads");
     expect(w.target.calls.some((c) => c.startsWith("updateRef main"))).toBe(false);
   });
 

@@ -43,6 +43,7 @@ Treat a failed command as unknown, never as clean: a timeout, empty output or JS
 | `qlander validate` | The config is valid. | It is invalid or unreadable. | Not used |
 | `qlander render --check` | Every workflow matches. | One differs or is missing, or the config is invalid. | Not used |
 | `qlander audit --json` | No `FAIL` and no failed read. `WARN` and `SKIPPED` can remain. | A `FAIL` without `inconclusive`. Other checks may also have failed reads. | No such `FAIL`, but a finding is `inconclusive` (JSON printed); or no token, a bad config or a stopped audit (no JSON). |
+| `qlander quiesce --dry-run` | The state is idle now. | A real run would refuse, a read failed, or a tick is still running or queued (`not idle now`). | Not used |
 | `qlander status --json` | A complete view, paused or not. | Not used | A read failed or came back incomplete (view printed); or no token, a bad config or no connection (no view). |
 
 **`audit --json`** prints `{target, control, findings}`, and each finding has `id`, `status` and `message`, sometimes with `fix` and `details`. A finding with `inconclusive: true` is a failed read: a 5xx, a network failure, a rate limit or a 401. Exit 0 still doesn't mean every check ran: a check the token may not read (403) stays a plain `SKIPPED` or `WARN`, though a 403 or 404 on a repo or an App's registration is a `FAIL`. A truncated repo tree is also a plain `WARN`. Only `PASS` counts as checked, and a configured relaxation such as `control.mainProtection` is a `WARN` that exits 0.

@@ -193,7 +193,7 @@ async function describePr(i: SnapshotInput, n: number, l: Lookups): Promise<Live
   const auth = i.state.auth[String(n)];
   live.review = i.cfg.reviewRequired
     ? await reviewProof(i, head, l, auth && auth.head === head ? auth.reviewRun : null)
-    : { ok: true, why: "review evidence not required (v1: reviewed from the agents' VM; ready by a write-access user)" };
+    : { ok: true, why: "review evidence not required (queue.admission.review.required is off; ready by a write-access user)" };
   if (live.policyPr) live.policyApproval = policyApproval(await i.api.listComments(n), i.cfg.humans, head) !== undefined;
   const pl = i.cfg.names.labels.priority;
   if (pl && pr.labels.includes(pl)) {

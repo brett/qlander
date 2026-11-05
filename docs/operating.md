@@ -143,27 +143,33 @@ bun "${bundle:?}" unquiesce [--all]                 # and start them again
 
 `quiesce` stops both jobs safely, as one command. It is the [quiesce procedure](deployment.md#81-rules-for-every-upgrade) for upgrades.
 
-1. It refuses, changing nothing, while a batch is active, running or pending, or a PR waits to run alone. A paused queue never lands those.
-2. It opens a `pause` and a `release-pause` issue, and disables `tick.yml`.
+1. It refuses, changing nothing, while a batch is active, running or pending, or a PR waits to run alone. A paused queue never lands those. It also refuses, changing nothing, for anything else step 4 would refuse, except the lease and journal of a tick still running, which it waits for.
+2. It opens its own `pause` and `release-pause` issues, beside any pause already open, and disables `tick.yml`.
 3. It waits until two reads in a row find no tick run in progress or queued. A ghost run, queued with no jobs, counts as gone.
-4. It reads both state branches, and refuses, naming each, unless both exist and are idle. Idle means no journal, active or concurrent batch, pending, solo, verify, outbox, lease or pending release pause.
+4. It reads both state branches again, and refuses, naming each, unless both are idle or fine to be missing (below). Idle means no journal, active or concurrent batch, pending, solo, verify, outbox, lease or pending release pause.
 5. It ends by printing both state commits, for rollback.
 
-A missing release state branch is fine while the release job makes no writes (`release.enabled` is false or `release.dryRun` is true), unless:
+A missing queue state branch is fine: a queue no live tick has run has nothing in flight. A missing release state branch is fine while the release job makes no writes (`release.enabled` is false or `release.dryRun` is true). In either case, it isn't fine if:
 
-- the release state issue is open, or can't be listed;
+- its state issue is open, or can't be listed;
 - the branch was there when the command started.
 
-When the branch is fine to be missing, `quiesce` prints `(absent: release job has never written state)` in place of that commit.
+When a branch is fine to be missing, `quiesce` prints `(absent: no live tick has written state)` or `(absent: release job has never written state)` in place of that commit.
+
+**When it refuses for the state.** At the first step, nothing has changed and ticks keep running, so wait and run it again. Verifying a landed PR and delivering a notice take a tick or two. A batch that was abandoned or stopped leaves a `cancelRuns` entry, which stays for at least `queue.timeouts.cancelWindowMinutes` (30 in the template) to catch runs published late. The refusal prints the time, and it can't be cleared sooner. A tick has to run after that time, so dispatch one if the cron is late. If runs were never seen on that branch, it stays until the later time printed (`queue.timeouts.cancelGiveUpHours`). On a busy queue, `pause both` first stops new batches, and with them new entries, while ticks still clear the old ones. `resume both` lifts that pause. If it refuses at step 4, nothing runs to clear the state: run `unquiesce` to go back, then wait.
+
+**With `--dry-run`** it exits 0 only if the state is idle now and no tick run is in progress or queued. It exits 1 if a real run would refuse at the first step, or if it reads a running tick or anything else not idle (`not idle now`). A real run would wait for that tick.
 
 #### `unquiesce`
 
-1. It refuses, changing nothing, if a pause issue that no control opened is open. `--all` closes those too.
+1. It refuses, changing nothing, if a pause issue that `quiesce` didn't open is open, including one from `pause`, because that's someone's deliberate pause. `--all` closes those too. A control's marker identifies who opened an issue only by its text, so don't hand-write it in an issue.
 2. It re-enables `tick.yml`, waits a few seconds, dispatches a tick, and checks that it ran paused.
 3. It closes the pause issues, the release pause first.
 4. It dispatches one live tick, and checks that it succeeded.
 
-It refuses if more than one new dispatched run appears, since GitHub doesn't say which run a dispatch started. Any check that fails stops the command with the reason, and leaves things as they are.
+It refuses if more than one new dispatched run appears, since GitHub doesn't say which run a dispatch started. Any check that fails stops the command with the reason and the way out, and leaves things as they are. If a check fails before the pause issues are closed, run `unquiesce` again once you know why. The message says how to reopen the queue without the check, and it names `resume both` only if no one else's pause is open, since `resume both` would close that too.
+
+In dry-run mode (`QLANDER_MODE` unset) the two ticks are dry runs. A dry-run tick reports whether it found a pause or would raise one, and `unquiesce` reads that: `outcome: paused`, then `outcome: dry-run`.
 
 ## Inspecting state
 
@@ -219,7 +225,7 @@ Qlander's own PR CI and the watchdog run on GitHub-hosted runners, never on thes
 
 ### The status issue
 
-There is one issue titled **qlander status**, labelled `qlander-status` and pinned at the top of the Issues tab. It's the one place to look. The watchdog rewrites its body on every run and never comments, so the issue makes no notification noise.
+There is one issue titled **qlander status**, labelled `qlander-status` and pinned at the top of the Issues tab. It's the one place to look. The watchdog rewrites its body on every run and never comments, so its runs make no notification noise. Each control command that changes something logs one comment here, which notifies anyone subscribed to the issue.
 
 | Field | What it shows |
 | --- | --- |
@@ -291,7 +297,7 @@ These comments are always posted, and most ask someone to act:
 - a landed revision with later commits that are not in `main`;
 - a PR that GitHub has not marked merged;
 - the notice that a batch was stopped for a prioritised PR;
-- the notice on a ready PR that has waited 30 minutes for a CI-policy approval, or for GitHub to compute mergeability.
+- the notice on a ready PR that has waited 30 minutes for a CI-policy approval, for GitHub to compute mergeability, or with a red fast lane. It's posted once per head and reason.
 
 Two comments only report progress: **queued** ("Queued in batch N at ...") and **landed** ("Landed in main at ..."). You can leave out either with [`comments.omit`](configuration.md#comments). The schema refuses any other value.
 

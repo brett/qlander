@@ -8,7 +8,9 @@ import { applyOpResult } from "../src/ops";
 import { makeRunId } from "../src/queue";
 import { classify } from "../src/classify";
 import { decide } from "../src/machine";
-import { emptyState, parseState, renderState, type State } from "../src/state";
+import { emptyState, parseState, renderState, stateFromIssueBody, type State } from "../src/state";
+import { mirror } from "../src/store";
+import { tickOutcome } from "../src/control";
 import { TARGET, cfg, job, livePr, NAMES, run, sha, Sim } from "./sim";
 import { World } from "./world";
 import { FakeTarget, FakeStateRef, FakeStateRepo } from "./fake-github";
@@ -365,7 +367,52 @@ describe("a lease-margin fence failure at landing", () => {
   });
 });
 
+describe("the mirror issue says what it is for", () => {
+  test("it is read only to refuse to start from empty, and that guard still reads what it writes", async () => {
+    const repo = new FakeStateRepo();
+    await mirror(repo, defaultConfig.names, emptyState());
+    const body = repo.issues[0]!.body;
+    expect(body).toContain("Qlander reads this issue only if that branch goes missing");
+    expect(body).not.toContain("never reads");
+    expect(stateFromIssueBody(body, defaultConfig.names)).toEqual(emptyState());
+  });
+});
+
 describe("dry run (rollout gate G3)", () => {
+  test("a pause the decision would raise counts: an exhausted window budget reports paused", async () => {
+    const { runDry } = await import("../src/main");
+    const target = new FakeTarget("read");
+    const w = new World();
+    w.target = target as never;
+    for (const n of [1, 2, 3, 4]) w.readyPr(n);
+    w.target.advance();
+    const stateRef = new FakeStateRef();
+    const at = new Date().toISOString();
+    stateRef.current = { version: "a".repeat(40), text: JSON.stringify({ ...emptyState(), window: Array.from({ length: defaultConfig.windowBudget }, () => ({ at, cost: 1 })) }) };
+    const r = await runDry({ GITHUB_EVENT_NAME: "schedule" }, { repository: { id: defaultConfig.names.control.id } }, async () => ({ target, repo: new FakeStateRepo(), stateRef }));
+    expect(r.log.some((l) => l.startsWith("pause: window budget"))).toBe(true);
+    expect(r.wouldDo).toBeNull();
+    expect(r.paused).toBe(true);
+    expect(tickOutcome(r as unknown as Record<string, unknown>)).toBe("paused");
+  });
+
+  test("the report says whether the tick read a pause, also when a journal stops it deciding", async () => {
+    const { runDry } = await import("../src/main");
+    const report = async (open: boolean, seeded?: State) => {
+      const stateRef = new FakeStateRef();
+      if (seeded) stateRef.current = { version: "a".repeat(40), text: JSON.stringify(seeded) };
+      const repo = new FakeStateRepo();
+      if (open) await repo.createIssue("stopped", "by a person", [defaultConfig.names.controlLabels.pause]);
+      return runDry({ GITHUB_EVENT_NAME: "schedule" }, { repository: { id: defaultConfig.names.control.id } }, async () => ({ target: new FakeTarget("read"), repo, stateRef }));
+    };
+    expect((await report(true)).paused).toBe(true);
+    expect((await report(false)).paused).toBe(false);
+    const journal = { seq: 1, op: { kind: "build" as const, n: 7, base: "b".repeat(40), pins: [{ pr: 14, head: sha("h14") }], depth: 0, lineage: 1, source: { kind: "candidates" as const }, rebuild: false }, reserved: true, at: "2026-10-21T11:00:00Z", checkpoint: null, tries: 0 };
+    const held = await report(true, { ...emptyState(), journal, lineages: { "1": { runs: 0 } }, auth: { "14": { head: sha("h14"), baseRepoId: NAMES.target.id, policy: "p", policyPr: false, admittedAt: "2026-10-21T10:00:00Z", labelledAt: "2026-10-21T09:00:00Z", evidence: [], reviewRun: null } } });
+    expect(held.wouldDo).toMatchObject({ kind: "build" });
+    expect(held.paused).toBe(true);
+  });
+
   test("decides and reports, but writes nothing: no lease, no state, no target change", async () => {
     const { runDry, isLive } = await import("../src/main");
     const target = new FakeTarget("read");

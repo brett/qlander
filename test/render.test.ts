@@ -4,7 +4,7 @@
 // fixtures.
 
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Ajv2020 from "ajv/dist/2020";
@@ -13,7 +13,7 @@ import { controlConfig, type LoadedConfig, parseConfig, SCHEMA_PATH } from "../s
 import { schemaProblems } from "../src/config/schema";
 import { CONTROL_BRANCH, QUEUE_JOB_NAME, RELEASE_JOB_NAME } from "../src/job-names";
 import { policyHash } from "../src/queue";
-import { firstDifference, HOSTED_RUNS_ON, qlanderCommand, watchdogInput, RenderError, renderTick, tickCron, renderWatchdog, renderWorkflows, scalar, TICK_WORKFLOW, WATCHDOG_WORKFLOW } from "../src/render";
+import { CURL, firstDifference, HOSTED_RUNS_ON, qlanderCommand, watchdogInput, RenderError, renderTick, tickCron, renderWatchdog, renderWorkflows, scalar, TICK_WORKFLOW, WATCHDOG_WORKFLOW } from "../src/render";
 
 type Obj = Record<string, any>;
 const YAML = (Bun as unknown as { YAML: { parse(s: string): unknown } }).YAML;
@@ -323,4 +323,55 @@ describe("firstDifference", () => {
     expect(firstDifference("a\nb\n", "a\nc\n")).toEqual({ line: 2, want: "b", have: "c" });
     expect(firstDifference("a\n", "a\n\n")).toEqual({ line: 3, want: "(end of file)", have: "" });
   });
+});
+
+describe("every download in a workflow retries, and is still checked", () => {
+  const dirs = [".github/workflows", "template/.github/workflows"].map((d) => join(import.meta.dir, "..", d));
+  const files = dirs.flatMap((d) => readdirSync(d).filter((f) => f.endsWith(".yml")).map((f) => join(d, f)));
+
+  test("the flags are in every curl, hand-written or rendered, and a sha256 check follows each", () => {
+    let seen = 0;
+    const rendered = [...renderWorkflows(acme()), ...renderWorkflows({ ...acme(), bundle: { repo: "acme/qlander", private: true, watchdog: true } })].map((w) => w.text);
+    for (const text of [...files.map((f) => readFileSync(f, "utf8")), ...rendered]) {
+      const lines = text.split("\n");
+      lines.forEach((l, i) => {
+        if (!/\bcurl\b/.test(l) || l.trimStart().startsWith("#")) return;
+        if (!/curl --/.test(l)) return;
+        seen++;
+        expect(l).toContain(CURL);
+        expect(lines.slice(i).some((x) => x.includes("sha256sum -c -"))).toBe(true);
+      });
+    }
+    expect(seen).toBeGreaterThanOrEqual(15);
+  });
+
+  test("the tick downloads Bun and the bundle with the same flags, then checks the sum before running either", () => {
+    const text = renderWorkflows({ ...acme(), bundle: { repo: "acme/qlander", private: false, watchdog: true } }).find((w) => w.path.endsWith("tick.yml"))!.text;
+    const at = (s: string, from = 0) => text.indexOf(s, from);
+    const bun = at(`${CURL} \\\n            --output "$dir/$asset"`);
+    expect(bun).toBeGreaterThan(0);
+    expect(at('echo "${sum}  ${asset}" | sha256sum -c -', bun)).toBeGreaterThan(bun);
+    expect(at("unzip -q", bun)).toBeGreaterThan(at('echo "${sum}  ${asset}" | sha256sum -c -', bun));
+  });
+
+  test("real curl with those flags gets through 504s, and its bounds are set", async () => {
+    let calls = 0;
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => (++calls <= 2 ? new Response("gateway", { status: 504 }) : new Response("the bytes")) });
+    const dir = mkdtempSync(join(tmpdir(), "curl-retry-"));
+    try {
+      // Only the scheme differs from the real thing: the test server has no certificate.
+      const flags = CURL.replace("'=https'", "'=http'").replace(/^curl /, "").replace(/'/g, "").split(" ");
+      const out = join(dir, "asset");
+      const p = Bun.spawn(["curl", ...flags, "--output", out, `http://127.0.0.1:${server.port}/asset`]);
+      expect(await p.exited).toBe(0);
+      expect(calls).toBe(3);
+      expect(readFileSync(out, "utf8")).toBe("the bytes");
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(CURL).toMatch(/--retry 5\b/);
+    expect(CURL).toMatch(/--retry-max-time 60\b/);
+    expect(CURL).toMatch(/--max-time 120\b/);
+  }, 30_000);
 });

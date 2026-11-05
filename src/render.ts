@@ -80,9 +80,16 @@ export function watchdogInput<C extends Pick<RenderInput, "bundle">>(c: C): Pick
   return c.bundle?.watchdog === false ? { bundle: null } : c;
 }
 
+/**
+ * Every download: a failed attempt (a 504, a reset, a stall) is tried again a
+ * few times, and at most a minute or so, against a job that has its CI watch
+ * still to run. What arrives is still checked against its committed sha256.
+ */
+export const CURL = "curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors --retry-max-time 60 --connect-timeout 10 --max-time 120";
+
 /** Download, verify and run the pinned bundle (bundle set). */
 function bundleLines(b: Bundle, args: string): string[] {
-  const curl = "curl --fail --silent --show-error --location --proto '=https' --tlsv1.2";
+  const curl = CURL;
   const download = b.private
     ? [
         `          # A private release of ${b.repo},`,
@@ -125,7 +132,7 @@ function runScript(c: Pick<RenderInput, "bundle">, args: string): string[] {
     "          # directory that did not exist before this step.",
     "          read -r version asset sum < .github/bun-release.txt",
     '          dir="$(mktemp -d)"',
-    "          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \\",
+    `          ${CURL} \\`,
     '            --output "$dir/$asset" "https://github.com/oven-sh/bun/releases/download/bun-v${version}/${asset}"',
     '          (cd "$dir" && echo "${sum}  ${asset}" | sha256sum -c -)',
     '          unzip -q "$dir/$asset" -d "$dir"',

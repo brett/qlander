@@ -144,7 +144,7 @@ bun "${bundle:?}" unquiesce [--all]                 # and start them again
 `quiesce` stops both jobs safely, as one command. It is the [quiesce procedure](deployment.md#81-rules-for-every-upgrade) for upgrades.
 
 1. It refuses, changing nothing, while a batch is active, running or pending, or a PR waits to run alone. A paused queue never lands those. It also refuses, changing nothing, for anything else step 4 would refuse, except the lease and journal of a tick still running, which it waits for.
-2. It opens a `pause` and a `release-pause` issue, and disables `tick.yml`.
+2. It opens its own `pause` and `release-pause` issues, beside any pause already open, and disables `tick.yml`.
 3. It waits until two reads in a row find no tick run in progress or queued. A ghost run, queued with no jobs, counts as gone.
 4. It reads both state branches again, and refuses, naming each, unless both are idle or fine to be missing (below). Idle means no journal, active or concurrent batch, pending, solo, verify, outbox, lease or pending release pause.
 5. It ends by printing both state commits, for rollback.
@@ -158,18 +158,18 @@ When a branch is fine to be missing, `quiesce` prints `(absent: no live tick has
 
 **When it refuses for the state.** At the first step, nothing has changed and ticks keep running, so wait and run it again. Verifying a landed PR and delivering a notice take a tick or two. A batch that was abandoned or stopped leaves a `cancelRuns` entry, which stays for at least `queue.timeouts.cancelWindowMinutes` (30 in the template) to catch runs published late. The refusal prints the time, and it can't be cleared sooner. A tick has to run after that time, so dispatch one if the cron is late. If runs were never seen on that branch, it stays until the later time printed (`queue.timeouts.cancelGiveUpHours`). On a busy queue, `pause both` first stops new batches, and with them new entries, while ticks still clear the old ones. `resume both` lifts that pause. If it refuses at step 4, nothing runs to clear the state: run `unquiesce` to go back, then wait.
 
-**With `--dry-run`** it exits 0 only if the state is idle now. It exits 1 if a real run would refuse at the first step, or if step 4 reads anything not idle (`not idle now`). That can be a tick still running, which a real run waits for.
+**With `--dry-run`** it exits 0 only if the state is idle now and no tick run is in progress or queued. It exits 1 if a real run would refuse at the first step, or if it reads a running tick or anything else not idle (`not idle now`). A real run would wait for that tick.
 
 #### `unquiesce`
 
-1. It refuses, changing nothing, if a pause issue that no control opened is open. `--all` closes those too.
+1. It refuses, changing nothing, if a pause issue that `quiesce` didn't open is open, including one from `pause`, because that's someone's deliberate pause. `--all` closes those too.
 2. It re-enables `tick.yml`, waits a few seconds, dispatches a tick, and checks that it ran paused.
 3. It closes the pause issues, the release pause first.
 4. It dispatches one live tick, and checks that it succeeded.
 
-It refuses if more than one new dispatched run appears, since GitHub doesn't say which run a dispatch started. Any check that fails stops the command with the reason and the way out, and leaves things as they are. If a check fails before the pause issues are closed, run `unquiesce` again once you know why, or `resume both` to reopen the queue without the check.
+It refuses if more than one new dispatched run appears, since GitHub doesn't say which run a dispatch started. Any check that fails stops the command with the reason and the way out, and leaves things as they are. If a check fails before the pause issues are closed, run `unquiesce` again once you know why. The message says how to reopen the queue without the check, and it names `resume both` only if no one else's pause is open, since `resume both` would close that too.
 
-In dry-run mode (`QLANDER_MODE` unset) the two ticks are dry runs. A dry-run tick reports whether it found a pause, and `unquiesce` reads that: `outcome: paused`, then `outcome: dry-run`.
+In dry-run mode (`QLANDER_MODE` unset) the two ticks are dry runs. A dry-run tick reports whether it found a pause or would raise one, and `unquiesce` reads that: `outcome: paused`, then `outcome: dry-run`.
 
 ## Inspecting state
 

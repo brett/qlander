@@ -242,7 +242,7 @@ The tick runs on self-hosted runner pools labelled `qlander`. Put them in a runn
 
 - **One job at a time.** Each pool runs at most one job at a time.
 - **A host-side kill.** The host destroys the VM at a fixed age, `runner.hostKillMinutes`, whatever the guest is doing. That kill is part of the [lease safety argument](deployment.md#32-mode-self-hosted-kill). `hostKillMinutes` must be at least `runner.jobTimeoutMinutes`.
-- **Tools.** The runner image needs `curl` 7.71 or newer, `sha256sum` and `unzip`. Each tick downloads the Bun release named in `.github/bun-release.txt` into a fresh temp directory and refuses to run it unless the sha256 matches.
+- **Tools.** The runner image needs `curl` 7.71 or newer, `timeout`, `sha256sum` and `unzip`. Each tick downloads the Bun release named in `.github/bun-release.txt` into a fresh temp directory and refuses to run it unless the sha256 matches.
 - **Restarts.** Pause both jobs before you restart whatever enforces the host kill. VMs it adopts after a restart may be bounded only later than either job's takeover window. The [runbook](operating.md#restarting-a-runner-hosts-controller) has the procedure.
 
 With one pool, the queue and release jobs run one after the other. With several, they may run at the same time, which is safe because each job has its own lease and state branch.

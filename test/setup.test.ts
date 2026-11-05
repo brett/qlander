@@ -4,9 +4,11 @@
 // verify, and permission changes reported per registration and installation.
 
 import { describe, expect, test } from "bun:test";
+import { GitHubError } from "../src/github/http";
+import { SetupApi } from "../src/setup/client";
 import { runSetup } from "../src/setup/command";
 import { controlRulesets, full, targetRulesets } from "../src/setup/expected";
-import { installAll, world } from "./setup-world";
+import { installAll, type World, world } from "./setup-world";
 
 const CONTROL_MAIN = "qlander-control-main";
 const STATE_RULESET = "qlander-state-branches";
@@ -92,7 +94,7 @@ describe("apps", () => {
     w.operator = () => writeFileSync(`${w.keysDir}/${slug}.pem`, w.f.generateKey(slug), { mode: 0o644 });
     expect(await runSetup(w.deps(), ["apps"])).toBe(0);
     expect(w.f.mutations.length).toBe(created);
-    expect(w.out.some((l) => l.includes(`/settings/apps/${slug}`) && l.includes("Generate a private key"))).toBe(true);
+    expect(w.out.some((l) => l.includes(`/settings/apps/${slug}`) && l.includes("Credentials") && l.includes("Key pairs") && l.includes("New key"))).toBe(true);
     expect(w.out).toContain(`        save the downloaded file as ${w.keysDir}/${slug}.pem`);
   });
 
@@ -106,6 +108,118 @@ describe("apps", () => {
     writeFileSync(`${w.keysDir}/${a!.slug}.pem`, other, { mode: 0o600 });
     expect(await runSetup(w.deps(), ["apps"])).toBe(1);
     expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("is not one of its keys"))).toBe(true);
+  });
+
+  describe("when a person makes the App from the printed link", () => {
+    /** A manifest flow nobody completes: it ends only when setup stops it. */
+    const noCode = (stop: AbortSignal) => new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }));
+    const save = async (w: ReturnType<typeof world>, slug: string) => (await import("node:fs")).writeFileSync(`${w.keysDir}/${slug}.pem`, w.f.generateKey(slug), { mode: 0o644 });
+
+    test("setup at the prompt notices the App and its key, and carries on", async () => {
+      const w = world();
+      const pending = new Map(w.specs.map((s) => [s.slug, s]));
+      w.operator = () => {
+        const s = [...pending.values()][0];
+        if (!s) return;
+        pending.delete(s.slug);
+        w.f.createByHand(s.owner, s.name, s.permissions);
+        void save(w, s.slug);
+      };
+      expect(await runSetup(w.deps({ manifestCode: (_s, _m, stop) => noCode(stop) }), ["apps"])).toBe(0);
+      for (const s of w.specs) {
+        expect(w.out.some((l) => l.includes(`/organizations/${s.owner}/settings/apps/new?`) && l.includes(`name=${encodeURIComponent(s.name)}`) && l.includes("webhook_active=false") && l.includes("public=false") && l.includes("contents=write"))).toBe(true);
+        expect(w.out.some((l) => l.includes("check them") && l.includes("Contents: Read and write"))).toBe(true);
+        expect(w.out.some((l) => l.includes("Key pairs") && l.includes(`${w.keysDir}/${s.slug}.pem`))).toBe(true);
+        expect(w.out.some((l) => l.startsWith("done  found the") && l.includes(s.slug))).toBe(true);
+        expect(w.out).toContain(`ok    ${s.slug} has exactly its permissions`);
+      }
+      expect(JSON.parse(await Bun.file(`${w.keysDir}/apps.json`).text()).state.slug).toBe(w.specs.find((s) => s.role === "state")!.slug);
+    });
+
+    test("the App without its key does not end the prompt: the manifest flow makes one too, before its code arrives", async () => {
+      const w = world();
+      const s = w.specs[0]!;
+      let stopped = false;
+      let polls = 0;
+      w.operator = () => {
+        if (++polls === 1) w.f.createByHand(s.owner, s.name, s.permissions);
+        if (polls === 3) expect(stopped).toBe(false);
+        if (polls === 3) void save(w, s.slug);
+      };
+      // Only the first App matters here; the next prompt ends the step.
+      const deps = w.deps({ manifestCode: (spec, _m, stop) => (spec === s || spec.slug === s.slug ? noCode(stop).then((c) => ((stopped = true), c)) : Promise.reject(new Error("next App"))) });
+      await runSetup(deps, ["apps"]);
+      expect(stopped).toBe(true);
+      expect(w.out.some((l) => l.startsWith("wait") && l.includes("waiting for its code, or its key"))).toBe(true);
+      expect(w.out.some((l) => l.startsWith("done  found the") && l.includes(s.slug))).toBe(true);
+    });
+
+    test("a code that arrives first still wins, and the watch stops", async () => {
+      const w = world();
+      expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+      expect(w.out.some((l) => l.startsWith("done  created the"))).toBe(true);
+      expect(w.out.some((l) => l.startsWith("done  found the"))).toBe(false);
+    });
+
+    test("a rerun finds an App and key made while setup was not running", async () => {
+      const w = world();
+      for (const s of w.specs) {
+        w.f.createByHand(s.owner, s.name, s.permissions);
+        await save(w, s.slug);
+      }
+      expect(await runSetup(w.deps({ manifestCode: () => Promise.reject(new Error("no prompt expected")) }), ["apps"])).toBe(0);
+    });
+
+    test("a permission GitHub dropped from the link fails the step and names it", async () => {
+      const w = world();
+      const s = w.specs.find((x) => x.permissions.statuses)!;
+      for (const x of w.specs) {
+        const { statuses: _dropped, ...rest } = x.permissions;
+        w.f.createByHand(x.owner, x.name, x === s ? rest : x.permissions);
+        await save(w, x.slug);
+      }
+      expect(await runSetup(w.deps(), ["apps"])).toBe(1);
+      expect(w.out).toContain("        Commit statuses: has none, needs read");
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("run setup --step permissions"))).toBe(true);
+      w.f.savePermissions(s.slug, s.permissions);
+      expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+    });
+  });
+
+  describe("when the code arrives and a key is already saved for that slug", () => {
+    const withSavedKey = async (own: boolean) => {
+      const w = world();
+      const slug = w.specs[0]!.slug;
+      const api = w.deps().api;
+      const real = api.convertManifest.bind(api);
+      const { readFileSync, writeFileSync } = await import("node:fs");
+      const foreign = (await import("./fake-github-setup")).keyPair().pem;
+      let saved = "";
+      api.convertManifest = async (code) => {
+        const conv = await real(code);
+        if (conv.slug === slug) {
+          saved = own ? w.f.generateKey(slug) : foreign;
+          writeFileSync(`${w.keysDir}/${slug}.pem`, saved, { mode: 0o600 });
+        }
+        return conv;
+      };
+      const exit = await runSetup(w.deps({ api }), ["apps"]);
+      return { w, slug, exit, saved, onDisk: readFileSync(`${w.keysDir}/${slug}.pem`, "utf8") };
+    };
+
+    test("this App's key is kept, not overwritten, and setup carries on", async () => {
+      const { w, slug, exit, saved, onDisk } = await withSavedKey(true);
+      expect(exit).toBe(0);
+      expect(onDisk).toBe(saved);
+      expect(w.out.some((l) => l.startsWith("done") && l.includes(slug) && l.includes("kept the key already"))).toBe(true);
+    });
+
+    test("another App's key is kept too, and the key check refuses it", async () => {
+      const { w, exit, saved, onDisk } = await withSavedKey(false);
+      expect(exit).toBe(1);
+      expect(onDisk).toBe(saved);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("is not one of its keys"))).toBe(true);
+    });
   });
 
   test("creating an App needs a key directory: a key command cannot keep a new key", async () => {
@@ -238,7 +352,7 @@ describe("verify", () => {
     w.out.length = 0;
     expect(await runSetup(w.deps(), ["verify"])).toBe(0);
     for (const s of w.specs) expect(w.out).toContain(`ok    ${s.slug}: minted a token with exactly the tick's permissions, for ${full(s.repo)} only`);
-    expect(w.out.filter((l) => l.includes("with the operator's token was refused by a ruleset"))).toHaveLength(2);
+    expect(w.out.filter((l) => l.includes("with the operator's token was refused") && l.includes("the creation rule of") && l.includes("applies to it"))).toHaveLength(2);
     const minted = [...w.f.tokens.values()].map((t) => t.perms);
     for (const s of w.specs) expect(minted).toContainEqual(s.tokenPermissions);
   });
@@ -359,9 +473,169 @@ describe("hardening", () => {
     expect(w.out.some((l) => l.includes("failed, but not by a ruleset"))).toBe(true);
     api.createRef = real;
   });
+
+  describe("what counts as refused", () => {
+    const controlRepo = (w: World) => w.f.repos.get(`${w.c.config.names.control.owner}/${w.c.config.names.control.name}`.toLowerCase())!;
+    /** Verify, with GitHub answering `answer` when the state branches are created. */
+    const refusing = async (answer: (branch: string, w: World) => Promise<void>) => {
+      const { w } = await setUp();
+      const api = w.deps().api;
+      api.createRef = (_r, branch) => answer(branch, w);
+      w.out.length = 0;
+      const before = w.f.mutations.length;
+      const code = await runSetup(w.deps({ api }), ["verify"]);
+      return { w, code, writes: w.f.mutations.slice(before) };
+    };
+
+    for (const message of ["Reference update failed", "Repository rule violations found\n\nCannot create ref due to creations being restricted."]) {
+      test(`a 422 saying "${message.split("\n")[0]}" passes, and verify writes nothing`, async () => {
+        const { w, code, writes } = await refusing(async () => {
+          throw new GitHubError("validation", 422, message);
+        });
+        expect(code).toBe(0);
+        expect(w.out.filter((l) => l.startsWith("ok") && l.includes("was refused") && l.includes(message.split("\n")[0]!) && l.includes(`the creation rule of ${STATE_RULESET} applies`))).toHaveLength(2);
+        expect(writes).toEqual([]);
+      });
+    }
+
+    test("a 422 of any wording does not pass unless the ruleset's creation rule is reported on that name", async () => {
+      const { w } = await setUp();
+      const api = w.deps().api;
+      let attempts = 0;
+      api.createRef = async () => {
+        attempts++;
+        throw new GitHubError("validation", 422, "Repository rule violations found");
+      };
+      api.branchRules = async () => [];
+      w.out.length = 0;
+      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("does not report") && l.includes("creation rule"))).toBe(true);
+      expect(attempts).toBe(0);
+    });
+
+    test("the rule must come from the expected ruleset: another ruleset's does not count", async () => {
+      const { w } = await setUp();
+      const api = w.deps().api;
+      api.createRef = async () => {
+        throw new GitHubError("validation", 422, "Reference update failed");
+      };
+      api.branchRules = async () => [{ type: "creation", rulesetId: 999_999 }];
+      w.out.length = 0;
+      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("does not report"))).toBe(true);
+    });
+
+    for (const [kind, status, message] of [["auth", 403, "Forbidden"], ["server", 502, "Bad gateway"], ["network", null, "connection reset"]] as const) {
+      test(`a rules read that fails (${status ?? kind}) fails verification`, async () => {
+        const { w } = await setUp();
+        const api = w.deps().api;
+        api.branchRules = async () => {
+          throw new GitHubError(kind, status, message);
+        };
+        w.out.length = 0;
+        expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+        expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("could not read the rules") && l.includes(message))).toBe(true);
+      });
+    }
+
+    /** The same fake GitHub, with the rules read answered first by `otherPages` pages of 30 rules from another ruleset. */
+    const pagedRules = (w: World, otherPages: number) => {
+      const seen: string[] = [];
+      const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(String(input));
+        if (!url.pathname.includes("/rules/branches/")) return w.f.fetch(input as string, init);
+        seen.push(url.search);
+        const page = Number(url.searchParams.get("page") ?? 1);
+        if (page > otherPages) return w.f.fetch(`${url.origin}${url.pathname}`, init);
+        url.searchParams.set("page", String(page + 1));
+        const others = Array.from({ length: 30 }, () => ({ type: "creation", ruleset_id: 999_999 }));
+        return new Response(JSON.stringify(others), { status: 200, headers: { "content-type": "application/json", link: `<${url}>; rel="next"` } });
+      }) as typeof fetch;
+      return { seen, deps: w.deps({ api: new SetupApi(w.f.operator, { baseUrl: "https://api.fake.test", fetch: fetchFn, readAttempts: 1 }) }) };
+    };
+
+    test("the expected rule on a later page is found: 30 other rules and a next link", async () => {
+      const { w } = await setUp();
+      const { seen, deps } = pagedRules(w, 1);
+      w.out.length = 0;
+      expect(await runSetup(deps, ["verify"])).toBe(0);
+      expect(seen[0]).toContain("per_page=100");
+      expect(seen.some((q) => q.includes("page=2"))).toBe(true);
+      expect(w.out.filter((l) => l.includes(`the creation rule of ${STATE_RULESET} applies to it`))).toHaveLength(2);
+    });
+
+    test("a truncated listing is a failed read, and fails verification", async () => {
+      const { w } = await setUp();
+      const { deps } = pagedRules(w, Number.MAX_SAFE_INTEGER);
+      let attempts = 0;
+      deps.api.createRef = async () => {
+        attempts++;
+      };
+      w.out.length = 0;
+      expect(await runSetup(deps, ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("could not read the rules") && l.includes("truncated"))).toBe(true);
+      expect(attempts).toBe(0);
+    });
+
+    for (const [kind, status, message] of [["auth", 401, "Bad credentials"], ["auth", 403, "Resource not accessible by personal access token"], ["not_found", 404, "Not Found"]] as const) {
+      test(`a ${status} on the create is no pass`, async () => {
+        const { w, code } = await refusing(async () => {
+          throw new GitHubError(kind, status, message);
+        });
+        expect(code).toBe(1);
+        expect(w.out.some((l) => l.includes("failed, but not by a ruleset") && l.includes(message))).toBe(true);
+      });
+    }
+
+    test("a 422 that left the branch there is no pass", async () => {
+      const { w, code } = await refusing(async (branch, world) => {
+        controlRepo(world).refs.set(branch, "a".repeat(40));
+        throw new GitHubError("validation", 422, "Reference update failed");
+      });
+      expect(code).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("but the branch exists"))).toBe(true);
+    });
+
+    test("an operator on the bypass list does not pass, and the negative test is not run", async () => {
+      const { w } = await setUp();
+      const rs = [...controlRepo(w).rulesets.values()].find((r) => r.name === STATE_RULESET)!;
+      rs.bypass_actors = [...rs.bypass_actors, { actor_id: 42, actor_type: "User", bypass_mode: "always" }];
+      const before = w.f.mutations.length;
+      w.out.length = 0;
+      expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("unexpected bypass actor: User 42") && l.includes("the negative test was not run"))).toBe(true);
+      expect(w.f.mutations.slice(before)).toEqual([]);
+    });
+
+    test("the stated gap: while the rule is reported active, a 422 from another cause reads as a refusal", async () => {
+      const { w, code } = await refusing(async () => {
+        throw new GitHubError("validation", 422, "Object does not exist");
+      });
+      expect(code).toBe(0);
+      expect(w.out.some((l) => l.includes("was refused (validation (422): Object does not exist)"))).toBe(true);
+    });
+
+    test("a ruleset that doesn't refuse: the branch is removed again and verify fails", async () => {
+      const { w } = await setUp();
+      w.f.enforceRulesets = false;
+      const before = w.f.mutations.length;
+      w.out.length = 0;
+      expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("does not restrict creation"))).toBe(true);
+      expect(JSON.stringify(w.f.mutations.slice(before))).toContain("delete ref");
+    });
+  });
 });
 
 describe("verify runs the audit last", () => {
+  test("--skip-audit says no audit ran, and does not report one as clean", async () => {
+    const { w } = await setUp();
+    w.out.length = 0;
+    expect(await runSetup(w.deps({ audit: async () => null }), ["verify"])).toBe(0);
+    expect(w.out).toContain("skip  audit (--skip-audit): none ran, so run the audit command before going live");
+    expect(w.out.some((l) => l.includes("no FAIL, no failed read") || l.includes("src/cli.ts"))).toBe(false);
+  });
+
   test("a FAIL in the audit fails verify, after the token checks pass", async () => {
     const { w } = await setUp();
     w.out.length = 0;

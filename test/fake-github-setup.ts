@@ -69,7 +69,7 @@ export interface FakeRepo {
 const pool: { pem: string; pub: KeyObject }[] = [];
 let poolNext = 0;
 /** RSA keys are slow to make, so every fake shares a small pool. */
-function keyPair(): { pem: string; pub: KeyObject } {
+export function keyPair(): { pem: string; pub: KeyObject } {
   if (pool.length < 6) {
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
@@ -137,7 +137,16 @@ export class FakeSetupGitHub {
     return code;
   }
 
-  /** "Generate a private key" on the App's page. */
+  /** A person fills in GitHub's form by hand or from a link, and clicks "Create GitHub App". No key yet. */
+  createByHand(org: string, name: string, permissions: Perms): FakeApp {
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    const app: FakeApp = { id: ++this.seq, slug, name, clientId: `Iv1.${slug}.${this.seq}`, owner: org, permissions: { ...permissions }, keys: [] };
+    this.apps.set(slug, app);
+    this.mutated(`create app ${slug}`);
+    return app;
+  }
+
+  /** "New key" under Credentials, Key pairs on the App's page. */
   generateKey(slug: string): string {
     const k = keyPair();
     this.apps.get(slug)!.keys.push(k.pub);

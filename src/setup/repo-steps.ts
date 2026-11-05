@@ -155,23 +155,36 @@ export async function verifyStep(c: Ctx): Promise<void> {
   if (rsProblems.length) bad(`${full(control)}: ruleset ${stateRuleset.name} is not right (${rsProblems.join("; ")}): run setup --step control; the negative test was not run`);
   else
     for (const b of stateBranches) {
-      const problem = await stateBranchRefused(c, control, b);
+      const problem = await stateBranchRefused(c, control, b, stateRuleset.name, found[0]!.id);
       if (problem) bad(problem);
     }
   if (failed) c.fail(`${failed} verification(s) failed`);
   // Last, the whole audit: the target's CI requirements and the control repo's protection.
   const audit = await c.d.audit();
+  if (audit === null) {
+    c.d.out("skip  audit (--skip-audit): none ran, so run the audit command before going live");
+    return;
+  }
   for (const l of audit.lines) c.d.out(`        ${l}`);
   if (audit.failed) c.fail(`audit: ${audit.failed} finding(s) failed or could not be read (above)`);
   c.ok("audit: no FAIL, no failed read");
 }
 
-/** The negative test: the operator's own token must not create a state branch. Null when it is refused, as it must be. */
-async function stateBranchRefused(c: Ctx, control: Repo, branch: string): Promise<string | null> {
+/**
+ * The negative test: the operator's own token must not create a state branch.
+ * Null when it is refused, as it must be. GitHub's words for a refusal vary, so
+ * they aren't the test: it needs a 422, the branch still absent, and GitHub
+ * saying that this ruleset's creation rule applies to this exact name (it
+ * answers for a branch that doesn't exist too). The caller has already checked
+ * the ruleset, its bypass list included. A 422 for some other reason passes only
+ * while GitHub reports that rule as active: docs/deployment.md §5.2.
+ */
+async function stateBranchRefused(c: Ctx, control: Repo, branch: string, rulesetName: string, rulesetId: number): Promise<string | null> {
+  const fromRuleset = async () => new Set((await c.d.api.branchRules(control, branch)).filter((r) => r.rulesetId === rulesetId).map((r) => r.type));
   if ((await c.d.api.branchSha(control, branch)) !== null) {
-    const rules = new Set(await c.d.api.branchRules(control, branch));
+    const rules = await fromRuleset();
     const missing = ["creation", "update", "deletion", "non_fast_forward"].filter((r) => !rules.has(r));
-    if (missing.length) return `${branch} exists, and these rules do not apply to it: ${missing.join(", ")}`;
+    if (missing.length) return `${branch} exists, and these rules of ${rulesetName} do not apply to it: ${missing.join(", ")}`;
     c.ok(`${branch} exists and its ruleset applies (the create attempt is skipped)`);
     return null;
   }
@@ -181,15 +194,21 @@ async function stateBranchRefused(c: Ctx, control: Repo, branch: string): Promis
   }
   const head = await c.d.api.branchSha(control, DEPLOY_BRANCH);
   if (!head) return `${full(control)} has no ${DEPLOY_BRANCH} branch to point a test branch at`;
+  let rules: Set<string>;
+  try {
+    rules = await fromRuleset();
+  } catch (e) {
+    return `could not read the rules that apply to ${branch}, so it is not known to be protected: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  if (!rules.has("creation")) return `GitHub does not report the creation rule of ${rulesetName} on ${branch}; the negative test was not run`;
   try {
     await c.d.api.createRef(control, branch, head);
   } catch (e) {
-    // Only a ruleset's refusal counts; a token or permission error proves nothing.
-    if (e instanceof GitHubError && e.kind === "validation" && /rule/i.test(e.message)) {
-      c.ok(`creating ${branch} with the operator's token was refused by a ruleset (${e.message.split("\n")[0]})`);
-      return null;
-    }
-    return `creating ${branch} with the operator's token failed, but not by a ruleset: ${e instanceof Error ? e.message : String(e)}`;
+    if (!(e instanceof GitHubError && e.kind === "validation" && e.status === 422)) return `creating ${branch} with the operator's token failed, but not by a ruleset: ${e instanceof Error ? e.message : String(e)}`;
+    const why = e.message.split("\n")[0];
+    if ((await c.d.api.branchSha(control, branch)) !== null) return `creating ${branch} with the operator's token answered "${why}", but the branch exists`;
+    c.ok(`creating ${branch} with the operator's token was refused (${why}), and the creation rule of ${rulesetName} applies to it`);
+    return null;
   }
   // It landed, so the ruleset does not protect the branch. Remove it at once: the first live tick creates it.
   await c.d.api.deleteRef(control, branch);

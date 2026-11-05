@@ -77,6 +77,7 @@ bun "${bundle:?}" setup --keys-dir ~/app-keys --config qlander.yml --apply --ste
 - **Steps.** Pick one with `--step apps|install|control|target|verify|permissions`. Each step rereads the config, GitHub and the key directory and changes only what differs, so you can rerun any step, and a second run changes nothing.
 - **App names.** The Apps are `<prefix>-queue`, `<prefix>-state` and, with release advance, `<prefix>-release`. `--name` sets the prefix, which defaults to the control repo's name. GitHub limits an App's name to 34 characters, and setup refuses a longer one before it changes anything. Names must also be unique across GitHub, which setup can't check in advance. So the default prefix `<target>-qlander` fits only for a target name of up to 18 characters with release advance, or 20 without. For a longer or taken name, pass a shorter `--name` (at most 26 characters) on every `setup` run, and the matching `--queue-app`, `--release-app` and `--state-app` to a standalone `audit`.
 - **Creating the Apps.** The `apps` step uses GitHub's manifest flow: it serves a local page and you click **Create GitHub App**. It then checks each App's permissions exactly against [the table in step 1](#1-create-the-github-apps).
+- **If GitHub's form comes up empty.** Setup also prints a pre-filled link for each App. Open it, keep the name, check the permissions against the table in step 1 (GitHub can drop one from a link) and click **Create GitHub App**. Then, in the App's settings, click **Credentials**, then **Key pairs**, then **New key**, and save the download as `<keys-dir>/<slug>.pem`. A waiting setup notices the App and its key and carries on, or you can rerun it. If a permission is wrong, `apps` says which and sends you to `--step permissions`.
 - **Keys.** `apps` writes each new App's key to `<keys-dir>/<slug>.pem`, with mode 0600, and never overwrites a key. It refuses a directory inside a git work tree, or one that group or others can read.
 - **Your secret store.** Pass `--key-cmd '<command>'` to make later steps read keys from your secret store. It runs as `<command> <slug>`. Once `verify` passes, move the keys into that store and delete the directory.
 - **A lost key** can't be recovered. `apps` prints where to generate a new one. Then run `--step control --rotate`.
@@ -99,7 +100,7 @@ Setup creates the release App, and the `release-write` environment in step 2, on
 
 1. Install the queue and release Apps on the target only.
 2. Install the state App on **the control repo only**. It is the only identity that can move the two state branches.
-3. Generate a private key for each App, and note each App's client ID.
+3. Generate a private key for each App (in its settings, **Credentials**, then **Key pairs**, then **New key**), and note each App's client ID.
 
 The state App can write nothing in the target, and the queue and release keys gain nothing in the control repo. The tick mints a short-lived installation token per job, with exactly these permissions, for the target only.
 

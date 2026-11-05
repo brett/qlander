@@ -191,9 +191,11 @@ export class SetupApi {
     }
   }
 
-  async branchRules(r: Repo, branch: string): Promise<string[]> {
-    const x = await this.http.request<{ type: string }[]>("GET", `${repoPath(r)}/rules/branches/${branch}`);
-    return x.json.map((y) => y.type);
+  /** The active rules GitHub says apply to this name, which need not exist yet, and the ruleset each comes from. */
+  async branchRules(r: Repo, branch: string): Promise<{ type: string; rulesetId: number }[]> {
+    const { items, truncated } = await this.http.paginate(`${repoPath(r)}/rules/branches/${branch}`, {}, (p) => (p as { type: string; ruleset_id: number }[]).map((y) => ({ type: y.type, rulesetId: y.ruleset_id })));
+    if (truncated) throw new GitHubError("server", null, `the rules that apply to ${branch} came back truncated`);
+    return items;
   }
 
   async classicProtection(r: Repo, branch: string): Promise<boolean> {

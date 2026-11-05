@@ -39,14 +39,14 @@ export interface SetupDeps {
   out(line: string): void;
   /** Store an environment secret (sealed-box encrypted, as `gh secret set` does). */
   setSecret(repo: Repo, env: string, name: string, value: string): Promise<void>;
-  /** The App manifest flow up to the code GitHub redirects back with. */
-  manifestCode(spec: AppSpec, manifest: Manifest): Promise<string>;
+  /** The App manifest flow up to the code GitHub redirects back with; null if `stop` ends it first. */
+  manifestCode(spec: AppSpec, manifest: Manifest, stop: AbortSignal): Promise<string | null>;
   sleep(ms: number): Promise<void>;
   now(): number;
   pollMs: number;
   waitMs: number;
-  /** `audit` (docs/deployment.md §4.2), which verify runs last: its report lines, and how many findings failed or could not be read. */
-  audit(): Promise<{ lines: string[]; failed: number }>;
+  /** `audit` (docs/deployment.md §4.2), which verify runs last: its report lines, and how many findings failed or could not be read. Null when --skip-audit left it out. */
+  audit(): Promise<{ lines: string[]; failed: number } | null>;
 }
 
 export class StepFailed extends Error {}

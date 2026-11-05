@@ -77,6 +77,12 @@ export class Refused extends Error {}
 /** One control run: prints each step, acts unless dry, and records what it changed for the status-issue log. */
 export class Run {
   readonly acted: string[] = [];
+  /** Pause issues this command opened. */
+  readonly opened: IssueInfo[] = [];
+  /** Pause issues already open when it went to open its own: never its to close. */
+  readonly alreadyOpen: IssueInfo[] = [];
+  /** A pause listing failed or was cut short, so another pause may be open that it can't name. */
+  pausesUnknown = false;
   constructor(
     readonly api: ControlApi,
     readonly cfg: ControlConfig,
@@ -128,30 +134,36 @@ export interface ControlDeps {
 // ---- pause issues ---------------------------------------------------------
 
 export const isOurs = (i: IssueInfo) => i.body.includes(OPERATOR_MARKER);
+/** A pause `quiesce` opened, which `unquiesce` undoes. One from `pause` is someone's decision, and `unquiesce` leaves it. The words are also in issues older releases opened. */
+export const fromQuiesce = (i: IssueInfo) => isOurs(i) && i.body.includes("Opened by `qlander quiesce`");
 
-/** Open a `label` issue unless one a control opened is already open. A failed listing opens one anyway: a second pause is harmless. */
+/** Open a `label` issue unless `cmd` has its own open already (quiesce's is separate from a deliberate `pause`). A failed listing opens one anyway: a second pause is harmless. */
 export async function openPause(r: Run, label: string, login: string, cmd: string): Promise<void> {
-  let listed: { issues: IssueInfo[] } | null = null;
+  let listed: { issues: IssueInfo[]; complete: boolean } | null = null;
   try {
     listed = await r.api.listOpenIssues(label);
   } catch (e) {
+    r.pausesUnknown = true;
     r.say(`(could not list the open ${label} issues: ${why(e)}; opening one anyway)`);
   }
-  const mine = listed?.issues.find(isOurs);
+  if (listed && !listed.complete) r.pausesUnknown = true;
+  r.alreadyOpen.push(...(listed?.issues ?? []));
+  const mine = listed?.issues.find(cmd === "quiesce" ? fromQuiesce : isOurs);
   if (mine) return r.say(`a ${label} issue a control opened is already open: #${mine.number} ${mine.url}`);
   const title = `qlander ${label}: opened by ${login} (${cmd})`;
-  const body = `${OPERATOR_MARKER}\nOpened by \`qlander ${cmd}\` as ${login} at ${r.now().toISOString()}.\n\nWhile this issue is open, the job it pauses lands or advances nothing. Close it, or run \`qlander resume\` or \`qlander unquiesce\`, to resume.`;
+  const body = `${OPERATOR_MARKER}\nOpened by \`qlander ${cmd}\` as ${login} at ${r.now().toISOString()}.\n\nWhile this issue is open, the job it pauses lands or advances nothing. Close it, or run \`qlander resume\`${cmd === "quiesce" ? " or \`qlander unquiesce\`" : ""}, to resume.`;
   await r.step(`open a ${label} issue`, async () => {
     const i = await r.api.createIssue(title, body, [label]);
+    r.opened.push(i);
     r.say(`  opened #${i.number} ${i.url}`);
   });
 }
 
-/** Close the label's open issues a control opened (every one with `all`); returns those left open. Refuses on an incomplete listing. */
-export async function closePauses(r: Run, label: string, all: boolean): Promise<IssueInfo[]> {
+/** Close the label's open issues `mine` picks (every one with `all`); returns those left open. Refuses on an incomplete listing. */
+export async function closePauses(r: Run, label: string, all: boolean, mine: (i: IssueInfo) => boolean = isOurs): Promise<IssueInfo[]> {
   const listed = await r.api.listOpenIssues(label);
   if (!listed.complete) r.refuse(`the open ${label} issues could not all be listed; nothing closed`);
-  const close = listed.issues.filter((i) => all || isOurs(i));
+  const close = listed.issues.filter((i) => all || mine(i));
   if (!close.length) r.say(`no open ${label} issue${all ? "" : " opened by a control"} to close`);
   for (const i of close) await r.step(`close ${label} issue #${i.number} (${i.title})`, () => r.api.closeIssue(i.number));
   return listed.issues.filter((i) => !close.includes(i));
@@ -297,8 +309,9 @@ export interface Dispatched {
 
 /**
  * What a queue job's report (src/main.ts) says the tick did. A live report
- * states an outcome. A dry run has none, so its own reading of the pause
- * issues decides: "paused", or "dry-run" when it found none. A report with
+ * states an outcome. A dry run has none, so its `paused` decides (the pause
+ * issues it read and any pause it decided on): "paused", or "dry-run" when
+ * neither. A report with
  * neither (a dry run that stopped first, or an older release's) says nothing.
  */
 export function tickOutcome(report: Record<string, unknown> | null | undefined): string | null {

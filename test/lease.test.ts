@@ -10,6 +10,7 @@ import { classify } from "../src/classify";
 import { decide } from "../src/machine";
 import { emptyState, parseState, renderState, stateFromIssueBody, type State } from "../src/state";
 import { mirror } from "../src/store";
+import { tickOutcome } from "../src/control";
 import { TARGET, cfg, job, livePr, NAMES, run, sha, Sim } from "./sim";
 import { World } from "./world";
 import { FakeTarget, FakeStateRef, FakeStateRepo } from "./fake-github";
@@ -378,6 +379,23 @@ describe("the mirror issue says what it is for", () => {
 });
 
 describe("dry run (rollout gate G3)", () => {
+  test("a pause the decision would raise counts: an exhausted window budget reports paused", async () => {
+    const { runDry } = await import("../src/main");
+    const target = new FakeTarget("read");
+    const w = new World();
+    w.target = target as never;
+    for (const n of [1, 2, 3, 4]) w.readyPr(n);
+    w.target.advance();
+    const stateRef = new FakeStateRef();
+    const at = new Date().toISOString();
+    stateRef.current = { version: "a".repeat(40), text: JSON.stringify({ ...emptyState(), window: Array.from({ length: defaultConfig.windowBudget }, () => ({ at, cost: 1 })) }) };
+    const r = await runDry({ GITHUB_EVENT_NAME: "schedule" }, { repository: { id: defaultConfig.names.control.id } }, async () => ({ target, repo: new FakeStateRepo(), stateRef }));
+    expect(r.log.some((l) => l.startsWith("pause: window budget"))).toBe(true);
+    expect(r.wouldDo).toBeNull();
+    expect(r.paused).toBe(true);
+    expect(tickOutcome(r as unknown as Record<string, unknown>)).toBe("paused");
+  });
+
   test("the report says whether the tick read a pause, also when a journal stops it deciding", async () => {
     const { runDry } = await import("../src/main");
     const report = async (open: boolean, seeded?: State) => {

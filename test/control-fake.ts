@@ -33,6 +33,8 @@ export class ControlWorld {
   liveConclusion = "success";
   /** The tick's report: live (an outcome), dry-run (what it read of the pause issues), or dry-run from a release whose report does not say. */
   tickMode: "live" | "dry-run" | "dry-run-unsaid" = "live";
+  /** A live tick that decides to pause: its issue, opened by the tick, with an outcome that doesn't say so. */
+  tickOpensPause = false;
   /** Dispatched runs never start (ghosts). */
   ghostDispatch = false;
   me = { login: ME.login, id: ME.id };
@@ -76,6 +78,7 @@ export class ControlWorld {
           return;
         }
         const paused = w.open(PAUSE).length > 0;
+        if (!paused && w.tickOpensPause) r.seed("qlander paused: window budget used", [PAUSE], 0);
         const conclusion = paused ? "success" : w.liveConclusion;
         const x = run({ event: "workflow_dispatch", createdAt: at(), conclusion }, { conclusion });
         r.runs.push(x);

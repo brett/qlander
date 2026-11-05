@@ -9,7 +9,7 @@ import { CONFIG_PATH } from "../src/config/load";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ENABLE_SETTLE_MS, OPERATOR_MARKER, QUEUE_NEVER_WROTE, RELEASE_NEVER_WROTE, tickOutcome } from "../src/control";
+import { ENABLE_SETTLE_MS, fromQuiesce, OPERATOR_MARKER, QUEUE_NEVER_WROTE, RELEASE_NEVER_WROTE, tickOutcome } from "../src/control";
 import { controlCommand, parseControlArgs } from "../src/control-cli";
 import type { ControlCommand } from "../src/control-usage";
 import { connectControl } from "../src/github/control-client";
@@ -280,15 +280,88 @@ describe("quiesce (docs/deployment.md §8.1)", () => {
     }
   });
 
-  test("a failure before tick.yml is disabled names `resume both`, and one after it `unquiesce`", async () => {
-    const w = new World();
+  /** The disable request fails, with what GitHub then says of tick.yml. */
+  const failedDisable = (w: World, after: "disabled" | "enabled" | "unreadable") => {
     const connect = w.api.bind(w);
-    w.api = () => ({ ...connect(), setTickEnabled: async () => { throw new Error("no access"); } });
+    w.api = () => {
+      const a = connect();
+      return {
+        ...a,
+        setTickEnabled: async () => {
+          if (after === "disabled") await a.setTickEnabled(false);
+          throw new Error("no answer");
+        },
+        workflowState: async () => {
+          if (after === "unreadable" && w.open(PAUSE).length) throw new Error("no read");
+          return a.workflowState();
+        },
+      };
+    };
+  };
+
+  test("a disable that failed: the way back goes by what GitHub says of tick.yml now", async () => {
+    const enabled = new World();
+    failedDisable(enabled, "enabled");
+    const e = await enabled.run("quiesce");
+    expect(e.code).toBe(1);
+    expect(e.err).toContain("no answer");
+    expect(e.err).toContain("run `resume both` to go back; tick.yml is still enabled");
+    expect(e.err).not.toContain("unquiesce");
+
+    const lost = new World(); // disabled, and the response was lost
+    failedDisable(lost, "disabled");
+    const l = await lost.run("quiesce");
+    expect(lost.repo.state).toBe("disabled_manually");
+    expect(l.err).toContain("run `unquiesce` to go back");
+    expect(l.err).not.toContain("resume both");
+
+    const unread = new World();
+    failedDisable(unread, "unreadable");
+    const u = await unread.run("quiesce");
+    expect(u.err).toContain("may or may not be disabled");
+    expect(u.err).toContain("if it is disabled, run `unquiesce`");
+    expect(u.err).toContain("if it is enabled, run `resume both`");
+  });
+
+  test("a pause that was already there is named, left alone, and no message says to lift it", async () => {
+    const w = new World();
+    expect((await w.run("pause", ["both"])).code).toBe(0);
+    const mine = [...w.open(PAUSE), ...w.open(RPAUSE)].map((i) => i.number);
+    failedDisable(w, "enabled");
     const r = await w.run("quiesce");
     expect(r.code).toBe(1);
-    expect(r.err).toContain("no access");
-    expect(r.err).toContain("run `resume both` to go back");
-    expect(r.err).not.toContain("unquiesce");
+    for (const n of mine) expect(r.err).toContain(`#${n}`);
+    expect(r.err).toContain("Already open, and left alone");
+    expect(r.err).not.toContain("resume both");
+    expect(r.err).not.toContain("`unquiesce`");
+    const opened = [...w.open(PAUSE), ...w.open(RPAUSE)].filter(fromQuiesce);
+    expect(opened).toHaveLength(2);
+    expect(r.err).toContain(`close only ${opened.map((i) => `#${i.number}`).join(", ")}, which this run opened`);
+  });
+
+  test("after tick.yml is disabled, a pause already there still rules out `unquiesce` in the message", async () => {
+    const w = new World();
+    await w.run("pause", ["queue"]);
+    const read = w.queueRef.read.bind(w.queueRef);
+    let reads = 0;
+    w.queueRef.read = async () => (++reads === 2 ? { version: sha("queue-v2"), text: JSON.stringify(withState({ verify: VERIFY })), serverTime: NOW } : read());
+    const r = await w.run("quiesce");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("Already open, and left alone");
+    expect(r.err).toContain("`gh workflow enable tick.yml`");
+    expect(r.err).not.toContain("resume both");
+    expect(r.err).not.toContain("`unquiesce`");
+  });
+
+  test("a pause listing that failed says others may be open, and doesn't name a command that closes them", async () => {
+    const w = new World();
+    const connect = w.api.bind(w);
+    w.api = () => ({ ...connect(), listOpenIssues: (l) => (l === PAUSE ? Promise.reject(new Error("no list")) : connect().listOpenIssues(l)) });
+    const a = w.api.bind(w);
+    w.api = () => ({ ...a(), setTickEnabled: async () => { throw new Error("no answer"); } });
+    const r = await w.run("quiesce");
+    expect(r.err).toContain("other pause issues may be open");
+    expect(r.err).not.toContain("resume both");
   });
 
   test("an absent release state branch is idle while the release job is off or held in dry run, and refuses once it is live", async () => {
@@ -414,6 +487,13 @@ describe("quiesce (docs/deployment.md §8.1)", () => {
     expect(busy.code).toBe(1);
     expect(busy.err).toContain("Nothing was changed");
     expect(running.log).toEqual([]);
+    const ticking = new World();
+    ticking.repo.runs.push(run({ status: "in_progress", conclusion: null }, { conclusion: null, status: "in_progress" }));
+    const t = await ticking.run("quiesce", ["--dry-run"]);
+    expect(t.code).toBe(1);
+    expect(t.out).toContain("not idle now: tick run");
+    expect(t.out).not.toContain("\nidle\n");
+    expect(ticking.log).toEqual([]);
     expect((await new World(withState({ active: ACTIVE })).run("quiesce", ["--dry-run"])).code).toBe(1);
   });
 });
@@ -425,6 +505,53 @@ describe("unquiesce", () => {
     w.log = [];
     return w;
   };
+
+  test("a deliberate pause is never closed: it refuses, and closes it only with --all", async () => {
+    const w = new World();
+    await w.run("pause", ["queue"]);
+    const deliberate = w.open(PAUSE)[0]!;
+    expect(fromQuiesce(deliberate)).toBe(false);
+    expect((await w.run("quiesce")).code).toBe(0);
+    expect(w.open(PAUSE)).toHaveLength(2); // quiesce's own beside it
+    const r = await w.run("unquiesce");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(`not opened by quiesce: #${deliberate.number}`);
+    expect(r.err).toContain("leaves a deliberate pause alone");
+    expect(deliberate.open).toBe(true);
+    expect(w.repo.state).toBe("disabled_manually");
+    expect((await w.run("unquiesce", ["--all"])).code).toBe(0);
+    expect(w.open(PAUSE)).toEqual([]);
+  });
+
+  test("an issue a release before this one opened in quiesce still counts as quiesce's", () => {
+    const old = { number: 9, title: "t", url: "u", labels: [], body: `${OPERATOR_MARKER}\nOpened by \`qlander quiesce\` as x at t.\n\nClose it, or run \`qlander resume\` or \`qlander unquiesce\`, to resume.` };
+    expect(fromQuiesce(old as never)).toBe(true);
+    expect(fromQuiesce({ ...old, body: old.body.replace("qlander quiesce", "qlander pause") } as never)).toBe(false);
+  });
+
+  test("a stuck unquiesce names `resume both` only if no one else's pause has appeared", async () => {
+    const w = await quiesced();
+    w.tickMode = "dry-run-unsaid";
+    const connect = w.api.bind(w);
+    let dispatched = false;
+    w.api = () => {
+      const a = connect();
+      return { ...a, dispatchTick: async () => { await a.dispatchTick(); if (!dispatched) { dispatched = true; w.repo.seed("mine", [PAUSE], 0, OPERATOR_MARKER); } } };
+    };
+    const r = await w.run("unquiesce");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("Someone's own pause, left alone");
+    expect(r.err).toContain("close only");
+  });
+
+  test("a live tick that reopened a pause is not a success, whatever its outcome says", async () => {
+    const w = await quiesced();
+    w.tickOpensPause = true;
+    const r = await w.run("unquiesce");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("a pause issue is open again");
+    expect(r.out).not.toContain("unquiesced");
+  });
 
   test("in dry-run mode it reads what the tick read of the pause issues, and succeeds", async () => {
     const w = await quiesced();
@@ -481,7 +608,7 @@ describe("unquiesce", () => {
   test("with no pause issue open it names what is left to do", async () => {
     const r = await new World().run("unquiesce");
     expect(r.code).toBe(1);
-    expect(r.err).toContain("`resume both`");
+    expect(r.err).not.toContain("resume both"); // a release pause still open may be someone's
     expect(r.err).toContain("gh workflow enable tick.yml");
   });
 

@@ -168,7 +168,7 @@ export interface DryRun {
   /** A live run would refuse to initialise (and pause) for this reason. */
   refused?: string;
   log: string[];
-  /** What the tick read: an open pause issue, a pending pause, or a listing it could not trust. Absent when it stopped before reading them (refused). */
+  /** Whether a live tick would stop here: an open pause issue, a pending pause, a listing it could not trust, or a pause this decision would raise. Absent when it stopped before reading them (refused). */
   paused?: boolean;
   /** The op a live tick would journal and perform next, if any. */
   wouldDo: Op | null;
@@ -200,7 +200,7 @@ export async function runDry(
   const hooks = enqueueHooks(state, d.events, defaultHooks, new Date()).log.map((l) => l.replace(/^hook: queued /, "hook (dry run): would queue "));
   return {
     mode: "dry-run",
-    paused,
+    paused: paused || d.state.outbox.some((n) => n.kind === "pause"),
     log: [...d.log, ...hooks],
     wouldDo: d.state.journal?.op ?? null,
     ...(snap.readyListed ? { readyListed: snap.readyListed } : {}),

@@ -47,8 +47,7 @@ describe("a full run", () => {
     const snap = JSON.stringify(w.f.snapshot());
     w.out.length = 0;
     expect(await runSetup(w.deps({ targetRulesets: true }), ["apps", "install", "control", "target", "verify"])).toBe(0);
-    // Only verify's probe, created and deleted beside each absent state branch.
-    expect(w.f.mutations.slice(before).filter((m) => !m.includes("-setup-probe"))).toEqual([]);
+    expect(w.f.mutations.length).toBe(before);
     expect(JSON.stringify(w.f.snapshot())).toBe(snap);
     expect(w.out.filter((l) => /^(done|plan|todo|wait|FAIL)/.test(l))).toEqual([]);
   });
@@ -69,8 +68,8 @@ describe("a full run", () => {
     expect(w.f.mutations.length).toBe(before);
     // Only verify's negative test is left to plan: it is an attempted write.
     expect(w.out.filter((l) => /^(done|plan|wait|FAIL)/.test(l))).toEqual([
-      `plan  try to create ${w.c.config.names.stateBranch} with the operator's token, expecting the ruleset to refuse it, then create and delete ${w.c.config.names.stateBranch}-setup-probe beside it`,
-      `plan  try to create ${w.c.config.names.releaseStateBranch} with the operator's token, expecting the ruleset to refuse it, then create and delete ${w.c.config.names.releaseStateBranch}-setup-probe beside it`,
+      `plan  try to create ${w.c.config.names.stateBranch} with the operator's token, expecting the ruleset to refuse it`,
+      `plan  try to create ${w.c.config.names.releaseStateBranch} with the operator's token, expecting the ruleset to refuse it`,
     ]);
   });
 });
@@ -184,6 +183,42 @@ describe("apps", () => {
       expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("run setup --step permissions"))).toBe(true);
       w.f.savePermissions(s.slug, s.permissions);
       expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+    });
+  });
+
+  describe("when the code arrives and a key is already saved for that slug", () => {
+    const withSavedKey = async (own: boolean) => {
+      const w = world();
+      const slug = w.specs[0]!.slug;
+      const api = w.deps().api;
+      const real = api.convertManifest.bind(api);
+      const { readFileSync, writeFileSync } = await import("node:fs");
+      const foreign = (await import("./fake-github-setup")).keyPair().pem;
+      let saved = "";
+      api.convertManifest = async (code) => {
+        const conv = await real(code);
+        if (conv.slug === slug) {
+          saved = own ? w.f.generateKey(slug) : foreign;
+          writeFileSync(`${w.keysDir}/${slug}.pem`, saved, { mode: 0o600 });
+        }
+        return conv;
+      };
+      const exit = await runSetup(w.deps({ api }), ["apps"]);
+      return { w, slug, exit, saved, onDisk: readFileSync(`${w.keysDir}/${slug}.pem`, "utf8") };
+    };
+
+    test("this App's key is kept, not overwritten, and setup carries on", async () => {
+      const { w, slug, exit, saved, onDisk } = await withSavedKey(true);
+      expect(exit).toBe(0);
+      expect(onDisk).toBe(saved);
+      expect(w.out.some((l) => l.startsWith("done") && l.includes(slug) && l.includes("kept the key already"))).toBe(true);
+    });
+
+    test("another App's key is kept too, and the key check refuses it", async () => {
+      const { w, exit, saved, onDisk } = await withSavedKey(false);
+      expect(exit).toBe(1);
+      expect(onDisk).toBe(saved);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("is not one of its keys"))).toBe(true);
     });
   });
 
@@ -317,7 +352,7 @@ describe("verify", () => {
     w.out.length = 0;
     expect(await runSetup(w.deps(), ["verify"])).toBe(0);
     for (const s of w.specs) expect(w.out).toContain(`ok    ${s.slug}: minted a token with exactly the tick's permissions, for ${full(s.repo)} only`);
-    expect(w.out.filter((l) => l.includes("with the operator's token was refused by a ruleset"))).toHaveLength(2);
+    expect(w.out.filter((l) => l.includes("with the operator's token was refused") && l.includes("creation rule applies"))).toHaveLength(2);
     const minted = [...w.f.tokens.values()].map((t) => t.perms);
     for (const s of w.specs) expect(minted).toContainEqual(s.tokenPermissions);
   });
@@ -440,53 +475,71 @@ describe("hardening", () => {
   });
 
   describe("what counts as refused", () => {
-    /** Verify, with GitHub answering `answer` for the state branches and acting normally for any other. */
+    const controlRepo = (w: World) => w.f.repos.get(`${w.c.config.names.control.owner}/${w.c.config.names.control.name}`.toLowerCase())!;
+    /** Verify, with GitHub answering `answer` when the state branches are created. */
     const refusing = async (answer: (branch: string, w: World) => Promise<void>) => {
       const { w } = await setUp();
       const api = w.deps().api;
-      const real = api.createRef.bind(api) as SetupApi["createRef"];
-      api.createRef = (r, branch, sha, http) => (isState(w, branch) ? answer(branch, w) : real(r, branch, sha, http));
+      api.createRef = (_r, branch) => answer(branch, w);
       w.out.length = 0;
-      return { w, code: await runSetup(w.deps({ api }), ["verify"]) };
+      const before = w.f.mutations.length;
+      const code = await runSetup(w.deps({ api }), ["verify"]);
+      return { w, code, writes: w.f.mutations.slice(before) };
     };
-    const isState = (w: World, b: string) => b === w.c.config.names.stateBranch || b === w.c.config.names.releaseStateBranch;
 
     for (const message of ["Reference update failed", "Repository rule violations found\n\nCannot create ref due to creations being restricted."]) {
-      test(`a 422 saying "${message.split("\n")[0]}" passes, when the same token can create a branch beside it`, async () => {
-        const { w, code } = await refusing(async () => {
+      test(`a 422 saying "${message.split("\n")[0]}" passes, and verify writes nothing`, async () => {
+        const { w, code, writes } = await refusing(async () => {
           throw new GitHubError("validation", 422, message);
         });
         expect(code).toBe(0);
-        expect(w.out.filter((l) => l.startsWith("ok") && l.includes("was refused by a ruleset") && l.includes(message.split("\n")[0]!))).toHaveLength(2);
-        const n = w.c.config.names;
-        expect([...w.f.repos.get(`${n.control.owner}/${n.control.name}`.toLowerCase())!.refs.keys()].filter((b) => b.includes("probe"))).toEqual([]);
+        expect(w.out.filter((l) => l.startsWith("ok") && l.includes("was refused") && l.includes(message.split("\n")[0]!) && l.includes(`${STATE_RULESET}'s creation rule applies`))).toHaveLength(2);
+        expect(writes).toEqual([]);
       });
     }
 
-    test("a bad sha is no pass: the same sha fails beside it", async () => {
+    test("a 422 of any wording does not pass unless the ruleset's creation rule is reported on that name", async () => {
       const { w } = await setUp();
       const api = w.deps().api;
+      let attempts = 0;
       api.createRef = async () => {
-        throw new GitHubError("validation", 422, "Object does not exist");
-      };
-      w.out.length = 0;
-      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
-      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("proves nothing") && l.includes("Object does not exist"))).toBe(true);
-      expect(w.out.some((l) => l.includes("was refused by a ruleset"))).toBe(false);
-    });
-
-    test("a wording that mentions rules passes no better, when nothing can be created", async () => {
-      const { w } = await setUp();
-      const api = w.deps().api;
-      api.createRef = async () => {
+        attempts++;
         throw new GitHubError("validation", 422, "Repository rule violations found");
       };
+      api.branchRules = async () => [];
+      w.out.length = 0;
       expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
-      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("proves nothing"))).toBe(true);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("does not report") && l.includes("creation rule"))).toBe(true);
+      expect(attempts).toBe(0);
     });
 
+    test("the rule must come from the expected ruleset: another ruleset's does not count", async () => {
+      const { w } = await setUp();
+      const api = w.deps().api;
+      api.createRef = async () => {
+        throw new GitHubError("validation", 422, "Reference update failed");
+      };
+      api.branchRules = async () => [{ type: "creation", rulesetId: 999_999 }];
+      w.out.length = 0;
+      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("does not report"))).toBe(true);
+    });
+
+    for (const [kind, status, message] of [["auth", 403, "Forbidden"], ["server", 502, "Bad gateway"], ["network", null, "connection reset"]] as const) {
+      test(`a rules read that fails (${status ?? kind}) fails verification`, async () => {
+        const { w } = await setUp();
+        const api = w.deps().api;
+        api.branchRules = async () => {
+          throw new GitHubError(kind, status, message);
+        };
+        w.out.length = 0;
+        expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+        expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("could not read the rules") && l.includes(message))).toBe(true);
+      });
+    }
+
     for (const [kind, status, message] of [["auth", 401, "Bad credentials"], ["auth", 403, "Resource not accessible by personal access token"], ["not_found", 404, "Not Found"]] as const) {
-      test(`${status} is no pass, and the probe is not tried`, async () => {
+      test(`a ${status} on the create is no pass`, async () => {
         const { w, code } = await refusing(async () => {
           throw new GitHubError(kind, status, message);
         });
@@ -497,35 +550,53 @@ describe("hardening", () => {
 
     test("a 422 that left the branch there is no pass", async () => {
       const { w, code } = await refusing(async (branch, world) => {
-        const n = world.c.config.names;
-        world.f.repos.get(`${n.control.owner}/${n.control.name}`.toLowerCase())!.refs.set(branch, "a".repeat(40));
+        controlRepo(world).refs.set(branch, "a".repeat(40));
         throw new GitHubError("validation", 422, "Reference update failed");
       });
       expect(code).toBe(1);
       expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("but the branch exists"))).toBe(true);
     });
 
-    test("a probe left by a killed run is replaced, and one that cannot be deleted is reported", async () => {
+    test("an operator on the bypass list does not pass, and the negative test is not run", async () => {
       const { w } = await setUp();
-      const n = w.c.config.names;
-      const control = w.f.repos.get(`${n.control.owner}/${n.control.name}`.toLowerCase())!;
-      control.refs.set(`${n.stateBranch}-setup-probe`, "a".repeat(40));
+      const rs = [...controlRepo(w).rulesets.values()].find((r) => r.name === STATE_RULESET)!;
+      rs.bypass_actors = [...rs.bypass_actors, { actor_id: 42, actor_type: "User", bypass_mode: "always" }];
+      const before = w.f.mutations.length;
       w.out.length = 0;
-      expect(await runSetup(w.deps(), ["verify"])).toBe(0);
-      expect(control.refs.has(`${n.stateBranch}-setup-probe`)).toBe(false);
+      expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("unexpected bypass actor: User 42") && l.includes("the negative test was not run"))).toBe(true);
+      expect(w.f.mutations.slice(before)).toEqual([]);
+    });
 
-      const api = w.deps().api;
-      api.deleteRef = async () => {
-        throw new GitHubError("auth", 403, "Forbidden");
-      };
+    test("the stated gap: while the rule is reported active, a 422 from another cause reads as a refusal", async () => {
+      const { w, code } = await refusing(async () => {
+        throw new GitHubError("validation", 422, "Object does not exist");
+      });
+      expect(code).toBe(0);
+      expect(w.out.some((l) => l.includes("was refused (validation (422): Object does not exist)"))).toBe(true);
+    });
+
+    test("a ruleset that doesn't refuse: the branch is removed again and verify fails", async () => {
+      const { w } = await setUp();
+      w.f.enforceRulesets = false;
+      const before = w.f.mutations.length;
       w.out.length = 0;
-      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
-      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("delete it yourself"))).toBe(true);
+      expect(await runSetup(w.deps(), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("does not restrict creation"))).toBe(true);
+      expect(JSON.stringify(w.f.mutations.slice(before))).toContain("delete ref");
     });
   });
 });
 
 describe("verify runs the audit last", () => {
+  test("--skip-audit says no audit ran, and does not report one as clean", async () => {
+    const { w } = await setUp();
+    w.out.length = 0;
+    expect(await runSetup(w.deps({ audit: async () => null }), ["verify"])).toBe(0);
+    expect(w.out).toContain("skip  audit (--skip-audit): none ran, so run the audit command before going live");
+    expect(w.out.some((l) => l.includes("no FAIL, no failed read") || l.includes("src/cli.ts"))).toBe(false);
+  });
+
   test("a FAIL in the audit fails verify, after the token checks pass", async () => {
     const { w } = await setUp();
     w.out.length = 0;

@@ -35,7 +35,7 @@ export function repoApi(f: FakeSetupGitHub, method: string, r: FakeRepo, rest: s
     f.mutated(`${full}: delete ref ${m[1]}`);
     return json(204, undefined);
   }
-  if ((m = /^rules\/branches\/(.+)$/.exec(rest)) && method === "GET") return json(200, f.activeRulesets(r, `refs/heads/${m[1]}`).flatMap((s) => s.rules.map((x) => ({ type: x.type }))));
+  if ((m = /^rules\/branches\/(.+)$/.exec(rest)) && method === "GET") return json(200, f.activeRulesets(r, `refs/heads/${m[1]}`).flatMap((s) => s.rules.map((x) => ({ type: x.type, ruleset_source_type: "Repository", ruleset_source: full, ruleset_id: s.id }))));
   if ((m = /^branches\/(.+)\/protection$/.exec(rest)) && method === "GET") {
     if (!r.classicProtection.has(m[1]!)) throw new HttpError(404, "Branch not protected");
     return json(200, {});

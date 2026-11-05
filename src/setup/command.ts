@@ -243,7 +243,7 @@ export async function setupCommand(args: string[], io: SetupIo, env: Env = proce
     pollMs: a.pollMs,
     waitMs: a.waitMs,
     audit: a.skipAudit
-      ? async () => ({ lines: ["audit skipped (--skip-audit): run `bun src/cli.ts audit` before going live"], failed: 0 })
+      ? async () => null
       : overrides.audit ??
       (async () => {
         const { renderFindings, runAudit } = await import("../audit/command");

@@ -7,8 +7,7 @@
 // must reach the reference end state: no duplicate App, environment,
 // ruleset or label, and no request for a key that is already in the key
 // directory (only a kill straight after an App was created loses its key,
-// which GitHub shows only once). A last full run then writes nothing, apart
-// from the probe branch verify creates and deletes.
+// which GitHub shows only once). A last full run then writes nothing.
 //
 // A test-side "operator" reads each child's output and does what a person
 // would: completes the manifest flow in the "browser", installs Apps, and
@@ -140,11 +139,10 @@ describe("kill and resume across processes", () => {
           // Only a kill right after GitHub made an App loses that App's key (shown once); nothing else asks for one.
           expect({ k, keyPrompts: run.r.keyPrompts }).toEqual({ k, keyPrompts: writes[k - 1]!.startsWith("create app") ? 1 : 0 });
           if (k === writes.length || k === 1 || writes[k - 1]!.startsWith("create app")) {
-            // And once resumed, a full rerun writes nothing but verify's probe, which it deletes again.
-            const lasting = () => run.r.f.mutations.filter((m) => !m.includes("-setup-probe"));
-            const before = lasting().length;
+            // And once resumed, a full rerun writes nothing.
+            const before = run.r.f.mutations.length;
             for (const s of STEPS) expect((await step(run.r, s)).code).toBe(0);
-            expect(lasting().length).toBe(before);
+            expect(run.r.f.mutations.length).toBe(before);
           }
         } finally {
           run.stop();

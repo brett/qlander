@@ -44,10 +44,11 @@ export async function appsStep(c: Ctx): Promise<void> {
         c.d.out(`done  found the ${spec.role} App ${app.slug} (id ${app.id}), made from the link, and its key`);
       } else {
         const conv = await c.d.api.convertManifest(code);
-        // The key first, before anything else can fail: GitHub shows it only once.
-        keys.store(conv.slug, conv.pem);
+        // The key first, before anything else can fail: GitHub shows it only once. A key already there stays, and the check below decides if it is this App's.
+        const kept = keys.read(conv.slug) !== null;
+        if (!kept) keys.store(conv.slug, conv.pem);
         c.record(spec.role, { slug: conv.slug, id: conv.id, clientId: conv.clientId });
-        c.d.out(`done  created the ${spec.role} App ${conv.slug} (id ${conv.id}); its key is in ${keys.describe}`);
+        c.d.out(kept ? `done  created the ${spec.role} App ${conv.slug} (id ${conv.id}); kept the key already in ${keys.describe}, and did not store the new one` : `done  created the ${spec.role} App ${conv.slug} (id ${conv.id}); its key is in ${keys.describe}`);
         if (conv.slug !== spec.slug) c.fail(`GitHub named the App ${conv.slug}, not ${spec.slug}: choose another --name, or rename it to ${spec.name}`);
         app = conv;
       }

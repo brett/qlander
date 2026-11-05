@@ -191,9 +191,10 @@ export class SetupApi {
     }
   }
 
-  async branchRules(r: Repo, branch: string): Promise<string[]> {
-    const x = await this.http.request<{ type: string }[]>("GET", `${repoPath(r)}/rules/branches/${branch}`);
-    return x.json.map((y) => y.type);
+  /** The active rules GitHub says apply to this name, which need not exist yet, and the ruleset each comes from. */
+  async branchRules(r: Repo, branch: string): Promise<{ type: string; rulesetId: number }[]> {
+    const x = await this.http.request<{ type: string; ruleset_id: number }[]>("GET", `${repoPath(r)}/rules/branches/${branch}`);
+    return x.json.map((y) => ({ type: y.type, rulesetId: y.ruleset_id }));
   }
 
   async classicProtection(r: Repo, branch: string): Promise<boolean> {

@@ -69,7 +69,7 @@ export interface FakeRepo {
 const pool: { pem: string; pub: KeyObject }[] = [];
 let poolNext = 0;
 /** RSA keys are slow to make, so every fake shares a small pool. */
-function keyPair(): { pem: string; pub: KeyObject } {
+export function keyPair(): { pem: string; pub: KeyObject } {
   if (pool.length < 6) {
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();

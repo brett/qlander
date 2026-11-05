@@ -45,8 +45,8 @@ export interface SetupDeps {
   now(): number;
   pollMs: number;
   waitMs: number;
-  /** `audit` (docs/deployment.md §4.2), which verify runs last: its report lines, and how many findings failed or could not be read. */
-  audit(): Promise<{ lines: string[]; failed: number }>;
+  /** `audit` (docs/deployment.md §4.2), which verify runs last: its report lines, and how many findings failed or could not be read. Null when --skip-audit left it out. */
+  audit(): Promise<{ lines: string[]; failed: number } | null>;
 }
 
 export class StepFailed extends Error {}

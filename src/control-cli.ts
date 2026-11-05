@@ -101,16 +101,28 @@ const listIssues = (xs: IssueInfo[]) => xs.map((i) => `#${i.number} ${i.title}`)
 const numbers = (xs: IssueInfo[]) => xs.map((i) => `#${i.number}`).join(", ");
 
 /**
- * How to undo what this quiesce did, from what is known: which pauses it
- * opened, which were already open, and whether tick.yml is disabled (null if
- * it could not be read). `resume both` and `unquiesce` close pauses other
- * than this run's, so they are named only when every open pause is its own.
+ * How to undo what this quiesce did, from what is known now: which pauses it
+ * opened, which others are open (listed here, so one opened since it started
+ * counts), and whether tick.yml is disabled (null if it could not be read).
+ * `resume both` and `unquiesce` close pauses other than this run's, so they
+ * are named only when every open pause is known to be its own.
  */
-function wayBack(r: Run, disabled: boolean | null): string {
+async function wayBack(r: Run, disabled: boolean | null): Promise<string> {
   const enable = "`gh workflow enable tick.yml`";
-  const there = [...new Map(r.alreadyOpen.map((i) => [i.number, i])).values()];
-  if (r.pausesUnknown || there.length) {
-    const left = [...(there.length ? [`Already open, and left alone: ${numbers(there)}`] : []), ...(r.pausesUnknown ? ["other pause issues may be open, since a listing failed; leave any you find"] : [])].join("; ");
+  const N = r.cfg.names;
+  const there: IssueInfo[] = [];
+  let unknown = false;
+  for (const label of [N.controlLabels.pause, N.releaseLabels.pause]) {
+    try {
+      const listed = await r.api.listOpenIssues(label);
+      if (!listed.complete) unknown = true;
+      there.push(...listed.issues.filter((i) => !r.opened.some((o) => o.number === i.number)));
+    } catch {
+      unknown = true;
+    }
+  }
+  if (unknown || there.length) {
+    const left = [...(there.length ? [`Already open, and left alone: ${numbers(there)}`] : []), ...(unknown ? ["other pause issues may be open, since a listing failed; leave any you find"] : [])].join("; ");
     const close = r.opened.length ? `close only ${numbers(r.opened)}, which this run opened` : "this run opened no pause issue, so there is none to close";
     const tick = disabled === true ? `run ${enable}, and ` : disabled === false ? "" : `if tick.yml is disabled (it could not be read), run ${enable}, and `;
     return `${left}. To go back without lifting it, ${tick}${close}`;
@@ -172,7 +184,7 @@ async function quiesce(r: Run, login: string): Promise<void> {
       (s) => s !== "active",
       () => null,
     );
-    throw new Refused(`${why(e)}. Any pause issue opened so far stays open. ${wayBack(r, now)}.`);
+    throw new Refused(`${why(e)}. Any pause issue opened so far stays open. ${await wayBack(r, now)}.`);
   }
   r.say("3. wait until no tick run is in progress or queued");
   const going: string[] = [];
@@ -193,7 +205,7 @@ async function quiesce(r: Run, login: string): Promise<void> {
       });
     } catch (e) {
       const still = last as TickRun[] | null;
-      if (e instanceof Refused) throw new Refused(`${e.message} (${still ? `still running: ${still.map((x) => `${x.id} ${x.status} ${x.url}`).join(", ")}` : "the runs could not all be listed"}). Both jobs stay paused and tick.yml stays disabled. ${wayBack(r, true)}.`);
+      if (e instanceof Refused) throw new Refused(`${e.message} (${still ? `still running: ${still.map((x) => `${x.id} ${x.status} ${x.url}`).join(", ")}` : "the runs could not all be listed"}). Both jobs stay paused and tick.yml stays disabled. ${await wayBack(r, true)}.`);
       throw e;
     }
     r.say("no tick run is in progress or queued");
@@ -201,7 +213,7 @@ async function quiesce(r: Run, login: string): Promise<void> {
   r.say("4. check that the state is idle");
   const docs = await readStateDocs(r.api, N);
   const bad = await stateProblems(r, docs, pre);
-  if (bad.length && !r.dry) r.refuse(`the state is not idle:\n  ${bad.join("\n  ")}\nBoth jobs stay paused and tick.yml stays disabled. ${wayBack(r, true)}.`);
+  if (bad.length && !r.dry) r.refuse(`the state is not idle:\n  ${bad.join("\n  ")}\nBoth jobs stay paused and tick.yml stays disabled. ${await wayBack(r, true)}.`);
   const notNow = [...going, ...bad];
   for (const b of notNow) r.say(`  not idle now: ${b}`);
   if (!notNow.length) r.say("idle");
@@ -256,16 +268,20 @@ async function unquiesce(r: Run, all: boolean): Promise<void> {
   // The release pause first, so a failure part-way leaves the queue's pause open and unquiesce can run again.
   for (const label of [N.releaseLabels.pause, N.controlLabels.pause]) await closePauses(r, label, all, fromQuiesce);
   r.say("4. one live tick");
-  const unpaused = "The pause issues are closed, so the queue is running. Read the run; `pause both` stops the queue again.";
+  const unpaused = "The pause issues it was to close are closed and tick.yml is enabled, but this does not show the queue working. Read the run; `pause both` stops the queue if you need to.";
   const live = await dispatchAndWait(r, "it must succeed, unpaused").catch((e) => {
     throw e instanceof Refused ? new Refused(`${e.message}. ${unpaused}`) : e;
   });
   if (live && (live.run.conclusion !== "success" || live.job?.conclusion !== "success" || live.outcome === null || live.outcome === "paused"))
     r.refuse(`the live tick did not succeed (run ${live.run.conclusion ?? "?"}, outcome ${live.outcome ?? "unknown"}): ${live.run.url}. ${unpaused}`);
   if (live) {
-    // A live tick that decides to pause opens the issue and can still report `idle` or `acted`.
+    // A live tick that decides to pause opens the issue, or leaves the pause in its outbox if that fails, and can still report `idle` or `acted`.
     const reopened = await r.api.listOpenIssues(N.controlLabels.pause);
     if (reopened.issues.length) r.refuse(`the live tick finished, but a pause issue is open again: ${listIssues(reopened.issues)}. Read it, and ${live.run.url}.`);
+    if (!reopened.complete) r.refuse(`the live tick finished, but the open ${N.controlLabels.pause} issues could not all be listed, so whether the queue is paused is unknown: ${live.run.url}. Check them before you rely on it.`);
+    const queue = (await readStateDocs(r.api, N)).queue;
+    if (queue.kind === "error" || queue.kind === "corrupt") r.refuse(`the live tick finished, but ${N.stateBranch} could not be read (${queue.reason}), so whether the queue is paused is unknown: ${live.run.url}.`);
+    if (queue.kind === "ok" && queue.state.outbox.some((n) => n.kind === "pause")) r.refuse(`the live tick finished, but it left a pause pending in ${N.stateBranch}, which counts as paused: ${live.run.url}. Read the run.`);
     r.acted.push(`live tick ${live.run.id}: ${live.outcome}`);
     r.say("unquiesced");
   }

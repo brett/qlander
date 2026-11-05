@@ -162,7 +162,7 @@ When a branch is fine to be missing, `quiesce` prints `(absent: no live tick has
 
 #### `unquiesce`
 
-1. It refuses, changing nothing, if a pause issue that `quiesce` didn't open is open, including one from `pause`, because that's someone's deliberate pause. `--all` closes those too.
+1. It refuses, changing nothing, if a pause issue that `quiesce` didn't open is open, including one from `pause`, because that's someone's deliberate pause. `--all` closes those too. A control's marker identifies who opened an issue only by its text, so don't hand-write it in an issue.
 2. It re-enables `tick.yml`, waits a few seconds, dispatches a tick, and checks that it ran paused.
 3. It closes the pause issues, the release pause first.
 4. It dispatches one live tick, and checks that it succeeded.

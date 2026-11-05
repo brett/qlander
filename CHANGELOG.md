@@ -5,8 +5,8 @@
 Fixes from the first full end-to-end run of the queue, in a scratch organisation. State is unchanged, so this release reads what 0.2.1 and 0.1.0 wrote, and the policy hash is unchanged, so no admitted PR loses its place.
 
 - `quiesce` works on a queue no live tick has run. A missing queue state branch has nothing in flight, so it quiesces cleanly, unless the queue's state issue is open or can't be listed, or the branch was there when the command started. Those still refuse.
-- `unquiesce` works in dry-run mode. A dry-run tick's report now says whether it found a pause or would raise one, and `unquiesce` checks that. A live tick must still report success, and `unquiesce` now also refuses if that tick reopened a pause.
-- `unquiesce` closes only the pauses `quiesce` opened. A pause from `pause` or by hand makes it refuse unless you close that pause or pass `--all`, and `quiesce` opens its own issue beside one.
+- `unquiesce` works in dry-run mode. A dry-run tick's report now says whether it found a pause or would raise one, and `unquiesce` checks that. A live tick must still report success, and `unquiesce` now also refuses if that tick reopened a pause, left one pending in its state, or the check can't tell.
+- `unquiesce` closes only the pauses `quiesce` opened. A pause from `pause` or by hand makes it refuse unless you close that pause or pass `--all`, and `quiesce` and `pause` each open their own issue beside the other's.
 - `quiesce` refuses before it changes anything for whatever would stop it later, including a landed PR being verified and an undelivered notice, so a queue isn't stopped when it can't finish. The check after the wait is unchanged.
 - Refusals from `quiesce` and `unquiesce` name the way out, going by what is true then: `resume both` or `unquiesce` only when every open pause is that run's own. A pause that was already there is named and left alone, and the message gives the issues to close instead. A waiting `cancelRuns` entry shows when it can clear.
 - `quiesce --dry-run` also reads the tick runs, and exits 1 when it prints `not idle now`, as it does for a tick still running.

@@ -353,6 +353,35 @@ describe("quiesce (docs/deployment.md §8.1)", () => {
     expect(r.err).not.toContain("`unquiesce`");
   });
 
+  test("the advice lists pauses when it is built: one opened since the command started is left alone, and a failed read rules out resume", async () => {
+    const late = new World();
+    const connect = late.api.bind(late);
+    let seeded = 0;
+    late.api = () => ({
+      ...connect(),
+      setTickEnabled: async () => {
+        seeded = late.repo.seed("someone's", [RPAUSE], 0, OPERATOR_MARKER).number;
+        throw new Error("no answer");
+      },
+    });
+    const r = await late.run("quiesce");
+    expect(r.err).toContain(`Already open, and left alone: #${seeded}`);
+    expect(r.err).not.toContain("resume both");
+
+    const cut = new World();
+    const c2 = cut.api.bind(cut);
+    cut.api = () => ({
+      ...c2(),
+      setTickEnabled: async () => {
+        cut.repo.incomplete.add(RPAUSE);
+        throw new Error("no answer");
+      },
+    });
+    const u = await cut.run("quiesce");
+    expect(u.err).toContain("other pause issues may be open");
+    expect(u.err).not.toContain("resume both");
+  });
+
   test("a pause listing that failed says others may be open, and doesn't name a command that closes them", async () => {
     const w = new World();
     const connect = w.api.bind(w);
@@ -544,6 +573,65 @@ describe("unquiesce", () => {
     expect(r.err).toContain("close only");
   });
 
+  test("quiesce, then a deliberate `pause both`: the pause gets its own issues, and unquiesce won't lift them", async () => {
+    const w = await quiesced();
+    const r = await w.run("pause", ["both"]);
+    expect(r.code).toBe(0);
+    expect(w.open(PAUSE)).toHaveLength(2);
+    expect(w.open(RPAUSE)).toHaveLength(2);
+    const deliberate = [...w.open(PAUSE), ...w.open(RPAUSE)].filter((i) => !fromQuiesce(i));
+    expect(deliberate).toHaveLength(2);
+    expect((await w.run("pause", ["both"])).out).toContain("already open"); // once
+    expect(w.open(PAUSE)).toHaveLength(2);
+    const u = await w.run("unquiesce");
+    expect(u.code).toBe(1);
+    expect(u.err).toContain("not opened by quiesce");
+    for (const i of deliberate) expect(i.open).toBe(true);
+  });
+
+  /** After the pause issues close, the dispatched tick also does this. */
+  const onLiveTick = (w: World, f: () => void) => {
+    const connect = w.api.bind(w);
+    w.api = () => {
+      const a = connect();
+      return {
+        ...a,
+        dispatchTick: async () => {
+          await a.dispatchTick();
+          if (w.open(PAUSE).length === 0) f();
+        },
+      };
+    };
+  };
+
+  test("a pause pending in the state after the live tick counts as paused", async () => {
+    const w = await quiesced();
+    onLiveTick(w, () => {
+      w.queueRef.current = { version: sha("queue-v2"), text: JSON.stringify(withState({ outbox: [{ id: "p:1", kind: "pause", reason: "window budget used" }] })) };
+    });
+    const r = await w.run("unquiesce");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("left a pause pending");
+    expect(r.out).not.toContain("unquiesced");
+  });
+
+  test("a final pause listing cut short, or a state it can't read, refuses instead of passing", async () => {
+    const w = await quiesced();
+    onLiveTick(w, () => w.repo.incomplete.add(PAUSE));
+    const r = await w.run("unquiesce");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("could not all be listed");
+    expect(r.out).not.toContain("unquiesced");
+
+    const c = await quiesced();
+    onLiveTick(c, () => {
+      c.queueRef.current = { version: sha("queue-v2"), text: "{" };
+    });
+    const k = await c.run("unquiesce");
+    expect(k.code).toBe(1);
+    expect(k.err).toContain("could not be read");
+  });
+
   test("a live tick that reopened a pause is not a success, whatever its outcome says", async () => {
     const w = await quiesced();
     w.tickOpensPause = true;
@@ -612,12 +700,13 @@ describe("unquiesce", () => {
     expect(r.err).toContain("gh workflow enable tick.yml");
   });
 
-  test("a live tick that fails says the queue is running and how to stop it", async () => {
+  test("a live tick that fails claims only what is known, and says how to stop the queue", async () => {
     const w = await quiesced();
     w.liveConclusion = "failure";
     const r = await w.run("unquiesce");
     expect(r.code).toBe(1);
-    expect(r.err).toContain("the queue is running");
+    expect(r.err).not.toContain("the queue is running");
+    expect(r.err).toContain("does not show the queue working");
     expect(r.err).toContain("`pause both`");
   });
 

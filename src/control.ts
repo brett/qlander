@@ -79,10 +79,6 @@ export class Run {
   readonly acted: string[] = [];
   /** Pause issues this command opened. */
   readonly opened: IssueInfo[] = [];
-  /** Pause issues already open when it went to open its own: never its to close. */
-  readonly alreadyOpen: IssueInfo[] = [];
-  /** A pause listing failed or was cut short, so another pause may be open that it can't name. */
-  pausesUnknown = false;
   constructor(
     readonly api: ControlApi,
     readonly cfg: ControlConfig,
@@ -137,19 +133,16 @@ export const isOurs = (i: IssueInfo) => i.body.includes(OPERATOR_MARKER);
 /** A pause `quiesce` opened, which `unquiesce` undoes. One from `pause` is someone's decision, and `unquiesce` leaves it. The words are also in issues older releases opened. */
 export const fromQuiesce = (i: IssueInfo) => isOurs(i) && i.body.includes("Opened by `qlander quiesce`");
 
-/** Open a `label` issue unless `cmd` has its own open already (quiesce's is separate from a deliberate `pause`). A failed listing opens one anyway: a second pause is harmless. */
+/** Open a `label` issue unless `cmd`'s kind is open already: quiesce's and a deliberate `pause` are never each other's. A failed listing opens one anyway: a second pause is harmless. */
 export async function openPause(r: Run, label: string, login: string, cmd: string): Promise<void> {
-  let listed: { issues: IssueInfo[]; complete: boolean } | null = null;
+  let listed: { issues: IssueInfo[] } | null = null;
   try {
     listed = await r.api.listOpenIssues(label);
   } catch (e) {
-    r.pausesUnknown = true;
     r.say(`(could not list the open ${label} issues: ${why(e)}; opening one anyway)`);
   }
-  if (listed && !listed.complete) r.pausesUnknown = true;
-  r.alreadyOpen.push(...(listed?.issues ?? []));
-  const mine = listed?.issues.find(cmd === "quiesce" ? fromQuiesce : isOurs);
-  if (mine) return r.say(`a ${label} issue a control opened is already open: #${mine.number} ${mine.url}`);
+  const mine = listed?.issues.find((i) => isOurs(i) && fromQuiesce(i) === (cmd === "quiesce"));
+  if (mine) return r.say(`a ${label} issue ${cmd} opened is already open: #${mine.number} ${mine.url}`);
   const title = `qlander ${label}: opened by ${login} (${cmd})`;
   const body = `${OPERATOR_MARKER}\nOpened by \`qlander ${cmd}\` as ${login} at ${r.now().toISOString()}.\n\nWhile this issue is open, the job it pauses lands or advances nothing. Close it, or run \`qlander resume\`${cmd === "quiesce" ? " or \`qlander unquiesce\`" : ""}, to resume.`;
   await r.step(`open a ${label} issue`, async () => {

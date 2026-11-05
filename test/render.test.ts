@@ -13,7 +13,8 @@ import { controlConfig, type LoadedConfig, parseConfig, SCHEMA_PATH } from "../s
 import { schemaProblems } from "../src/config/schema";
 import { CONTROL_BRANCH, QUEUE_JOB_NAME, RELEASE_JOB_NAME } from "../src/job-names";
 import { policyHash } from "../src/queue";
-import { CURL, firstDifference, HOSTED_RUNS_ON, qlanderCommand, watchdogInput, RenderError, renderTick, tickCron, renderWatchdog, renderWorkflows, scalar, TICK_WORKFLOW, WATCHDOG_WORKFLOW } from "../src/render";
+import { DISPATCH_SECONDS, WATCH_MINUTES } from "../src/wake";
+import { BUN_SECONDS, BUNDLE_SECONDS, CURL, firstDifference, HOSTED_RUNS_ON, qlanderCommand, watchdogInput, RenderError, renderTick, tickCron, renderWatchdog, renderWorkflows, scalar, TICK_WORKFLOW, WATCHDOG_WORKFLOW } from "../src/render";
 
 type Obj = Record<string, any>;
 const YAML = (Bun as unknown as { YAML: { parse(s: string): unknown } }).YAML;
@@ -339,6 +340,7 @@ describe("every download in a workflow retries, and is still checked", () => {
         if (!/curl --/.test(l)) return;
         seen++;
         expect(l).toContain(CURL);
+        expect(l).toMatch(/\btimeout \d+ curl /); // curl's own limits don't stop an attempt already going
         expect(lines.slice(i).some((x) => x.includes("sha256sum -c -"))).toBe(true);
       });
     }
@@ -354,7 +356,38 @@ describe("every download in a workflow retries, and is still checked", () => {
     expect(at("unzip -q", bun)).toBeGreaterThan(at('echo "${sum}  ${asset}" | sha256sum -c -', bun));
   });
 
-  test("real curl with those flags gets through 504s, and its bounds are set", async () => {
+  test("in the template, the downloads and the chain fit the job limit, with time left for the steps before them", () => {
+    const template = readFileSync(join(import.meta.dir, "../template/.github/workflows/tick.yml"), "utf8");
+    const job = template.slice(template.indexOf("  queue:"), template.indexOf("  release:"));
+    const limit = Number(/timeout-minutes: (\d+)/.exec(job)![1]) * 60;
+    const downloads = [...job.matchAll(/\btimeout (\d+) curl /g)].map((m) => Number(m[1]));
+    expect(downloads).toEqual([BUN_SECONDS, BUNDLE_SECONDS]);
+    const before = downloads.reduce((a, b) => a + b, 0);
+    const chain = WATCH_MINUTES * 60 + DISPATCH_SECONDS;
+    expect(limit).toBe(300);
+    expect(chain).toBe(210);
+    expect(limit - chain - before).toBeGreaterThanOrEqual(30); // the checkout and the token steps
+    const priv = renderWorkflows({ ...acme(HOSTED), bundle: { repo: "acme/qlander", private: true, watchdog: true } }).find((w) => w.path.endsWith("tick.yml"))!.text;
+    const queue = priv.slice(priv.indexOf("  queue:"), priv.indexOf("  release:"));
+    expect([...queue.matchAll(/\btimeout (\d+) curl /g)].map((m) => Number(m[1])).reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(70);
+  });
+
+  test("a download that stalls fails at the wrapper's limit, though curl alone would still be going", async () => {
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", idleTimeout: 0, fetch: () => new Promise<Response>(() => {}) });
+    const dir = mkdtempSync(join(tmpdir(), "curl-stall-"));
+    try {
+      const flags = CURL.replace("'=https'", "'=http'").replace(/^curl /, "").replace(/'/g, "").split(" ");
+      const started = Date.now();
+      const p = Bun.spawn(["timeout", "2", "curl", ...flags, "--output", join(dir, "asset"), `http://127.0.0.1:${server.port}/asset`], { stderr: "ignore" });
+      expect(await p.exited).toBe(124);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test("real curl with those flags gets through 504s", async () => {
     let calls = 0;
     const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => (++calls <= 2 ? new Response("gateway", { status: 504 }) : new Response("the bytes")) });
     const dir = mkdtempSync(join(tmpdir(), "curl-retry-"));
@@ -371,7 +404,5 @@ describe("every download in a workflow retries, and is still checked", () => {
       rmSync(dir, { recursive: true, force: true });
     }
     expect(CURL).toMatch(/--retry 5\b/);
-    expect(CURL).toMatch(/--retry-max-time 60\b/);
-    expect(CURL).toMatch(/--max-time 120\b/);
   }, 30_000);
 });

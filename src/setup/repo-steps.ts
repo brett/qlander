@@ -166,6 +166,8 @@ export async function verifyStep(c: Ctx): Promise<void> {
   c.ok("audit: no FAIL, no failed read");
 }
 
+const siblingOf = (branch: string) => `${branch}-setup-probe`;
+
 /** The negative test: the operator's own token must not create a state branch. Null when it is refused, as it must be. */
 async function stateBranchRefused(c: Ctx, control: Repo, branch: string): Promise<string | null> {
   if ((await c.d.api.branchSha(control, branch)) !== null) {
@@ -176,7 +178,7 @@ async function stateBranchRefused(c: Ctx, control: Repo, branch: string): Promis
     return null;
   }
   if (!c.d.apply) {
-    c.d.out(`plan  try to create ${branch} with the operator's token, expecting the ruleset to refuse it`);
+    c.d.out(`plan  try to create ${branch} with the operator's token, expecting the ruleset to refuse it, then create and delete ${siblingOf(branch)} beside it`);
     return null;
   }
   const head = await c.d.api.branchSha(control, DEPLOY_BRANCH);
@@ -184,14 +186,39 @@ async function stateBranchRefused(c: Ctx, control: Repo, branch: string): Promis
   try {
     await c.d.api.createRef(control, branch, head);
   } catch (e) {
-    // Only a ruleset's refusal counts; a token or permission error proves nothing.
-    if (e instanceof GitHubError && e.kind === "validation" && /rule/i.test(e.message)) {
-      c.ok(`creating ${branch} with the operator's token was refused by a ruleset (${e.message.split("\n")[0]})`);
-      return null;
-    }
-    return `creating ${branch} with the operator's token failed, but not by a ruleset: ${e instanceof Error ? e.message : String(e)}`;
+    // A token or permission error proves nothing. GitHub's words for a refusal vary, so they aren't the test.
+    if (!(e instanceof GitHubError && e.kind === "validation" && e.status === 422)) return `creating ${branch} with the operator's token failed, but not by a ruleset: ${e instanceof Error ? e.message : String(e)}`;
+    const why = e.message.split("\n")[0];
+    if ((await c.d.api.branchSha(control, branch)) !== null) return `creating ${branch} with the operator's token answered "${why}", but the branch exists`;
+    const problem = await siblingCreated(c, control, branch, head);
+    if (problem) return `creating ${branch} with the operator's token answered "${why}", which proves nothing: ${problem}`;
+    c.ok(`creating ${branch} with the operator's token was refused by a ruleset (${why}): the same token created ${siblingOf(branch)} on the same commit`);
+    return null;
   }
   // It landed, so the ruleset does not protect the branch. Remove it at once: the first live tick creates it.
   await c.d.api.deleteRef(control, branch);
   return `the operator's token created ${branch} (deleted again): its ruleset does not restrict creation to the state App`;
+}
+
+/**
+ * The control for that refusal: the same token and commit, and a name beside
+ * the branch that no ruleset of ours covers. If this works too, the token, the
+ * commit and the path were fine, so what refused the other was its name. Null
+ * when it worked. The ruleset was checked to be exactly right before this. One
+ * left by a run that died before deleting it is replaced, so a rerun ends clean.
+ */
+async function siblingCreated(c: Ctx, control: Repo, branch: string, sha: string): Promise<string | null> {
+  const sibling = siblingOf(branch);
+  try {
+    if ((await c.d.api.branchSha(control, sibling)) !== null) await c.d.api.deleteRef(control, sibling);
+    await c.d.api.createRef(control, sibling, sha);
+  } catch (e) {
+    return `${sibling}, which no ruleset here covers, failed too: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  try {
+    await c.d.api.deleteRef(control, sibling);
+  } catch (e) {
+    return `${sibling} was created but could not be deleted, so delete it yourself: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  return null;
 }

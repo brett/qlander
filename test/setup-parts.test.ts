@@ -13,7 +13,7 @@ import { MAX_APP_NAME, tooLongAppNames } from "../src/setup/expected";
 import { appSpecs } from "../src/setup/expected";
 import { appJwt } from "../src/setup/jwt";
 import { CommandKeyStore, DirKeyStore, KeyError } from "../src/setup/keys";
-import { browserManifestCode, codeFromLine } from "../src/setup/manifest-flow";
+import { browserManifestCode, codeFromLine, newAppLink } from "../src/setup/manifest-flow";
 import { EXAMPLE, exampleConfig, freshKeysDir } from "./setup-world";
 import { FakeSetupGitHub } from "./fake-github-setup";
 
@@ -139,7 +139,7 @@ describe("the manifest flow", () => {
       const back = await fetch(redirect.headers.get("location")!);
       expect(back.status).toBe(200);
       const code = await pending;
-      expect(f.codes.has(code)).toBe(true);
+      expect(f.codes.has(code!)).toBe(true);
     } finally {
       server.stop();
     }
@@ -155,6 +155,19 @@ describe("the manifest flow", () => {
     input.write("garbage line\n");
     input.write("https://x.test/?code=pasted123\n");
     expect(await pending).toBe("pasted123");
+  });
+
+  test("a stop ends the wait with no code", async () => {
+    const stop = new AbortController();
+    const pending = browserManifestCode(spec, manifest, { web: "https://github.example", out: () => {}, timeoutMs: 10_000, input: null, stop: stop.signal });
+    stop.abort();
+    expect(await pending).toBeNull();
+  });
+
+  test("the fallback link carries the name, the home page and every permission, and no webhook", () => {
+    const u = new URL(newAppLink("https://github.example", "acme co", { ...manifest, default_permissions: { contents: "write", statuses: "read" } }));
+    expect(u.origin + u.pathname).toBe("https://github.example/organizations/acme%20co/settings/apps/new");
+    expect(Object.fromEntries(u.searchParams)).toEqual({ name: manifest.name, url: manifest.url, webhook_active: "false", public: "false", contents: "write", statuses: "read" });
   });
 
   test("gives up after the timeout", async () => {

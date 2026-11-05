@@ -39,8 +39,8 @@ export interface SetupDeps {
   out(line: string): void;
   /** Store an environment secret (sealed-box encrypted, as `gh secret set` does). */
   setSecret(repo: Repo, env: string, name: string, value: string): Promise<void>;
-  /** The App manifest flow up to the code GitHub redirects back with. */
-  manifestCode(spec: AppSpec, manifest: Manifest): Promise<string>;
+  /** The App manifest flow up to the code GitHub redirects back with; null if `stop` ends it first. */
+  manifestCode(spec: AppSpec, manifest: Manifest, stop: AbortSignal): Promise<string | null>;
   sleep(ms: number): Promise<void>;
   now(): number;
   pollMs: number;

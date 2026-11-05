@@ -4,7 +4,8 @@
 // local page with a one-hour `code`. If the browser cannot reach this machine
 // (a remote VM), the person pastes the `code` (or the whole address) from the
 // address bar into the terminal instead. The page is also written to a file,
-// so it can be opened on another machine.
+// so it can be opened on another machine. If GitHub's form comes up empty,
+// newAppLink is the way round it.
 
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -43,9 +44,21 @@ export interface FlowOptions {
   timeoutMs: number;
   /** Lines the person may paste a code into; null to listen only for the redirect. */
   input: NodeJS.ReadableStream | null;
+  /** Ends the wait with null: the App was made another way. */
+  stop?: AbortSignal;
 }
 
-export async function browserManifestCode(spec: AppSpec, manifest: Manifest, o: FlowOptions): Promise<string> {
+/**
+ * The other way to make the App, for when GitHub's form comes up empty: a link
+ * to the same form with the values in its query string (GitHub's "registering
+ * a GitHub App using URL parameters"). GitHub can drop a permission from it.
+ */
+export function newAppLink(web: string, owner: string, manifest: Manifest): string {
+  const q = new URLSearchParams({ name: manifest.name, url: manifest.url, webhook_active: "false", public: "false", ...manifest.default_permissions });
+  return `${web}/organizations/${encodeURIComponent(owner)}/settings/apps/new?${q}`;
+}
+
+export async function browserManifestCode(spec: AppSpec, manifest: Manifest, o: FlowOptions): Promise<string | null> {
   const state = randomBytes(16).toString("hex");
   const action = `${o.web}/organizations/${encodeURIComponent(spec.owner)}/settings/apps/new?state=${state}`;
   let resolve!: (code: string) => void;
@@ -79,8 +92,12 @@ export async function browserManifestCode(spec: AppSpec, manifest: Manifest, o: 
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`no App was created for ${spec.name} within ${Math.round(o.timeoutMs / 60000)} minutes`)), o.timeoutMs);
   });
+  const stopped = new Promise<null>((r) => {
+    if (o.stop?.aborted) r(null);
+    o.stop?.addEventListener("abort", () => r(null), { once: true });
+  });
   try {
-    return await Promise.race([got, timeout]);
+    return await Promise.race([got, timeout, stopped]);
   } finally {
     clearTimeout(timer);
     rl?.close();

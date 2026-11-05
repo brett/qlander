@@ -4,9 +4,11 @@
 // verify, and permission changes reported per registration and installation.
 
 import { describe, expect, test } from "bun:test";
+import { GitHubError } from "../src/github/http";
+import type { SetupApi } from "../src/setup/client";
 import { runSetup } from "../src/setup/command";
 import { controlRulesets, full, targetRulesets } from "../src/setup/expected";
-import { installAll, world } from "./setup-world";
+import { installAll, type World, world } from "./setup-world";
 
 const CONTROL_MAIN = "qlander-control-main";
 const STATE_RULESET = "qlander-state-branches";
@@ -45,7 +47,8 @@ describe("a full run", () => {
     const snap = JSON.stringify(w.f.snapshot());
     w.out.length = 0;
     expect(await runSetup(w.deps({ targetRulesets: true }), ["apps", "install", "control", "target", "verify"])).toBe(0);
-    expect(w.f.mutations.length).toBe(before);
+    // Only verify's probe, created and deleted beside each absent state branch.
+    expect(w.f.mutations.slice(before).filter((m) => !m.includes("-setup-probe"))).toEqual([]);
     expect(JSON.stringify(w.f.snapshot())).toBe(snap);
     expect(w.out.filter((l) => /^(done|plan|todo|wait|FAIL)/.test(l))).toEqual([]);
   });
@@ -66,8 +69,8 @@ describe("a full run", () => {
     expect(w.f.mutations.length).toBe(before);
     // Only verify's negative test is left to plan: it is an attempted write.
     expect(w.out.filter((l) => /^(done|plan|wait|FAIL)/.test(l))).toEqual([
-      `plan  try to create ${w.c.config.names.stateBranch} with the operator's token, expecting the ruleset to refuse it`,
-      `plan  try to create ${w.c.config.names.releaseStateBranch} with the operator's token, expecting the ruleset to refuse it`,
+      `plan  try to create ${w.c.config.names.stateBranch} with the operator's token, expecting the ruleset to refuse it, then create and delete ${w.c.config.names.stateBranch}-setup-probe beside it`,
+      `plan  try to create ${w.c.config.names.releaseStateBranch} with the operator's token, expecting the ruleset to refuse it, then create and delete ${w.c.config.names.releaseStateBranch}-setup-probe beside it`,
     ]);
   });
 });
@@ -92,7 +95,7 @@ describe("apps", () => {
     w.operator = () => writeFileSync(`${w.keysDir}/${slug}.pem`, w.f.generateKey(slug), { mode: 0o644 });
     expect(await runSetup(w.deps(), ["apps"])).toBe(0);
     expect(w.f.mutations.length).toBe(created);
-    expect(w.out.some((l) => l.includes(`/settings/apps/${slug}`) && l.includes("Generate a private key"))).toBe(true);
+    expect(w.out.some((l) => l.includes(`/settings/apps/${slug}`) && l.includes("Credentials") && l.includes("Key pairs") && l.includes("New key"))).toBe(true);
     expect(w.out).toContain(`        save the downloaded file as ${w.keysDir}/${slug}.pem`);
   });
 
@@ -106,6 +109,82 @@ describe("apps", () => {
     writeFileSync(`${w.keysDir}/${a!.slug}.pem`, other, { mode: 0o600 });
     expect(await runSetup(w.deps(), ["apps"])).toBe(1);
     expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("is not one of its keys"))).toBe(true);
+  });
+
+  describe("when a person makes the App from the printed link", () => {
+    /** A manifest flow nobody completes: it ends only when setup stops it. */
+    const noCode = (stop: AbortSignal) => new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }));
+    const save = async (w: ReturnType<typeof world>, slug: string) => (await import("node:fs")).writeFileSync(`${w.keysDir}/${slug}.pem`, w.f.generateKey(slug), { mode: 0o644 });
+
+    test("setup at the prompt notices the App and its key, and carries on", async () => {
+      const w = world();
+      const pending = new Map(w.specs.map((s) => [s.slug, s]));
+      w.operator = () => {
+        const s = [...pending.values()][0];
+        if (!s) return;
+        pending.delete(s.slug);
+        w.f.createByHand(s.owner, s.name, s.permissions);
+        void save(w, s.slug);
+      };
+      expect(await runSetup(w.deps({ manifestCode: (_s, _m, stop) => noCode(stop) }), ["apps"])).toBe(0);
+      for (const s of w.specs) {
+        expect(w.out.some((l) => l.includes(`/organizations/${s.owner}/settings/apps/new?`) && l.includes(`name=${encodeURIComponent(s.name)}`) && l.includes("webhook_active=false") && l.includes("public=false") && l.includes("contents=write"))).toBe(true);
+        expect(w.out.some((l) => l.includes("check them") && l.includes("Contents: Read and write"))).toBe(true);
+        expect(w.out.some((l) => l.includes("Key pairs") && l.includes(`${w.keysDir}/${s.slug}.pem`))).toBe(true);
+        expect(w.out.some((l) => l.startsWith("done  found the") && l.includes(s.slug))).toBe(true);
+        expect(w.out).toContain(`ok    ${s.slug} has exactly its permissions`);
+      }
+      expect(JSON.parse(await Bun.file(`${w.keysDir}/apps.json`).text()).state.slug).toBe(w.specs.find((s) => s.role === "state")!.slug);
+    });
+
+    test("the App without its key does not end the prompt: the manifest flow makes one too, before its code arrives", async () => {
+      const w = world();
+      const s = w.specs[0]!;
+      let stopped = false;
+      let polls = 0;
+      w.operator = () => {
+        if (++polls === 1) w.f.createByHand(s.owner, s.name, s.permissions);
+        if (polls === 3) expect(stopped).toBe(false);
+        if (polls === 3) void save(w, s.slug);
+      };
+      // Only the first App matters here; the next prompt ends the step.
+      const deps = w.deps({ manifestCode: (spec, _m, stop) => (spec === s || spec.slug === s.slug ? noCode(stop).then((c) => ((stopped = true), c)) : Promise.reject(new Error("next App"))) });
+      await runSetup(deps, ["apps"]);
+      expect(stopped).toBe(true);
+      expect(w.out.some((l) => l.startsWith("wait") && l.includes("waiting for its code, or its key"))).toBe(true);
+      expect(w.out.some((l) => l.startsWith("done  found the") && l.includes(s.slug))).toBe(true);
+    });
+
+    test("a code that arrives first still wins, and the watch stops", async () => {
+      const w = world();
+      expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+      expect(w.out.some((l) => l.startsWith("done  created the"))).toBe(true);
+      expect(w.out.some((l) => l.startsWith("done  found the"))).toBe(false);
+    });
+
+    test("a rerun finds an App and key made while setup was not running", async () => {
+      const w = world();
+      for (const s of w.specs) {
+        w.f.createByHand(s.owner, s.name, s.permissions);
+        await save(w, s.slug);
+      }
+      expect(await runSetup(w.deps({ manifestCode: () => Promise.reject(new Error("no prompt expected")) }), ["apps"])).toBe(0);
+    });
+
+    test("a permission GitHub dropped from the link fails the step and names it", async () => {
+      const w = world();
+      const s = w.specs.find((x) => x.permissions.statuses)!;
+      for (const x of w.specs) {
+        const { statuses: _dropped, ...rest } = x.permissions;
+        w.f.createByHand(x.owner, x.name, x === s ? rest : x.permissions);
+        await save(w, x.slug);
+      }
+      expect(await runSetup(w.deps(), ["apps"])).toBe(1);
+      expect(w.out).toContain("        Commit statuses: has none, needs read");
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("run setup --step permissions"))).toBe(true);
+      w.f.savePermissions(s.slug, s.permissions);
+      expect(await runSetup(w.deps(), ["apps"])).toBe(0);
+    });
   });
 
   test("creating an App needs a key directory: a key command cannot keep a new key", async () => {
@@ -358,6 +437,91 @@ describe("hardening", () => {
     expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
     expect(w.out.some((l) => l.includes("failed, but not by a ruleset"))).toBe(true);
     api.createRef = real;
+  });
+
+  describe("what counts as refused", () => {
+    /** Verify, with GitHub answering `answer` for the state branches and acting normally for any other. */
+    const refusing = async (answer: (branch: string, w: World) => Promise<void>) => {
+      const { w } = await setUp();
+      const api = w.deps().api;
+      const real = api.createRef.bind(api) as SetupApi["createRef"];
+      api.createRef = (r, branch, sha, http) => (isState(w, branch) ? answer(branch, w) : real(r, branch, sha, http));
+      w.out.length = 0;
+      return { w, code: await runSetup(w.deps({ api }), ["verify"]) };
+    };
+    const isState = (w: World, b: string) => b === w.c.config.names.stateBranch || b === w.c.config.names.releaseStateBranch;
+
+    for (const message of ["Reference update failed", "Repository rule violations found\n\nCannot create ref due to creations being restricted."]) {
+      test(`a 422 saying "${message.split("\n")[0]}" passes, when the same token can create a branch beside it`, async () => {
+        const { w, code } = await refusing(async () => {
+          throw new GitHubError("validation", 422, message);
+        });
+        expect(code).toBe(0);
+        expect(w.out.filter((l) => l.startsWith("ok") && l.includes("was refused by a ruleset") && l.includes(message.split("\n")[0]!))).toHaveLength(2);
+        const n = w.c.config.names;
+        expect([...w.f.repos.get(`${n.control.owner}/${n.control.name}`.toLowerCase())!.refs.keys()].filter((b) => b.includes("probe"))).toEqual([]);
+      });
+    }
+
+    test("a bad sha is no pass: the same sha fails beside it", async () => {
+      const { w } = await setUp();
+      const api = w.deps().api;
+      api.createRef = async () => {
+        throw new GitHubError("validation", 422, "Object does not exist");
+      };
+      w.out.length = 0;
+      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("proves nothing") && l.includes("Object does not exist"))).toBe(true);
+      expect(w.out.some((l) => l.includes("was refused by a ruleset"))).toBe(false);
+    });
+
+    test("a wording that mentions rules passes no better, when nothing can be created", async () => {
+      const { w } = await setUp();
+      const api = w.deps().api;
+      api.createRef = async () => {
+        throw new GitHubError("validation", 422, "Repository rule violations found");
+      };
+      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("proves nothing"))).toBe(true);
+    });
+
+    for (const [kind, status, message] of [["auth", 401, "Bad credentials"], ["auth", 403, "Resource not accessible by personal access token"], ["not_found", 404, "Not Found"]] as const) {
+      test(`${status} is no pass, and the probe is not tried`, async () => {
+        const { w, code } = await refusing(async () => {
+          throw new GitHubError(kind, status, message);
+        });
+        expect(code).toBe(1);
+        expect(w.out.some((l) => l.includes("failed, but not by a ruleset") && l.includes(message))).toBe(true);
+      });
+    }
+
+    test("a 422 that left the branch there is no pass", async () => {
+      const { w, code } = await refusing(async (branch, world) => {
+        const n = world.c.config.names;
+        world.f.repos.get(`${n.control.owner}/${n.control.name}`.toLowerCase())!.refs.set(branch, "a".repeat(40));
+        throw new GitHubError("validation", 422, "Reference update failed");
+      });
+      expect(code).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("but the branch exists"))).toBe(true);
+    });
+
+    test("a probe left by a killed run is replaced, and one that cannot be deleted is reported", async () => {
+      const { w } = await setUp();
+      const n = w.c.config.names;
+      const control = w.f.repos.get(`${n.control.owner}/${n.control.name}`.toLowerCase())!;
+      control.refs.set(`${n.stateBranch}-setup-probe`, "a".repeat(40));
+      w.out.length = 0;
+      expect(await runSetup(w.deps(), ["verify"])).toBe(0);
+      expect(control.refs.has(`${n.stateBranch}-setup-probe`)).toBe(false);
+
+      const api = w.deps().api;
+      api.deleteRef = async () => {
+        throw new GitHubError("auth", 403, "Forbidden");
+      };
+      w.out.length = 0;
+      expect(await runSetup(w.deps({ api }), ["verify"])).toBe(1);
+      expect(w.out.some((l) => l.startsWith("FAIL") && l.includes("delete it yourself"))).toBe(true);
+    });
   });
 });
 

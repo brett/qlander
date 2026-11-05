@@ -137,7 +137,16 @@ export class FakeSetupGitHub {
     return code;
   }
 
-  /** "Generate a private key" on the App's page. */
+  /** A person fills in GitHub's form by hand or from a link, and clicks "Create GitHub App". No key yet. */
+  createByHand(org: string, name: string, permissions: Perms): FakeApp {
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+    const app: FakeApp = { id: ++this.seq, slug, name, clientId: `Iv1.${slug}.${this.seq}`, owner: org, permissions: { ...permissions }, keys: [] };
+    this.apps.set(slug, app);
+    this.mutated(`create app ${slug}`);
+    return app;
+  }
+
+  /** "New key" under Credentials, Key pairs on the App's page. */
   generateKey(slug: string): string {
     const k = keyPair();
     this.apps.get(slug)!.keys.push(k.pub);

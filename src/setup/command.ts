@@ -237,7 +237,7 @@ export async function setupCommand(args: string[], io: SetupIo, env: Env = proce
     setSecret: overrides.setSecret ?? ghSecretSet(env),
     manifestCode:
       overrides.manifestCode ??
-      ((spec, manifest) => browserManifestCode(spec, manifest, { web, out: io.out, timeoutMs: Math.min(a.waitMs, 60 * 60_000), input: overrides.input === undefined ? process.stdin : overrides.input })),
+      ((spec, manifest, stop) => browserManifestCode(spec, manifest, { web, out: io.out, timeoutMs: Math.min(a.waitMs, 60 * 60_000), input: overrides.input === undefined ? process.stdin : overrides.input, stop })),
     sleep: overrides.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
     now: overrides.now ?? Date.now,
     pollMs: a.pollMs,

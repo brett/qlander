@@ -38,12 +38,19 @@ export function noBypassRule(id: string, label: string, ref: string, rule: strin
   return clean ? pass(id, `${label}: ${rule} in "${clean.name}", which nobody can bypass`) : sev(id, `${label}: ${rule} is only in rulesets with bypass actors (${carrying.map((r) => r.name).join(", ")})`, `move ${rule} to a ruleset with no bypass actors`);
 }
 
-/** A landing ruleset (restrict updates + PR; bypass: the App and humans) and an integrity ruleset (signatures, no force push, no deletion; no bypass). */
-export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail): Finding[] {
+/**
+ * A landing ruleset (PR, plus restrict updates where only the App may move the
+ * branch: `personMerges` is false; bypass: the App and humans) and an integrity
+ * ruleset (signatures, no force push, no deletion; no bypass). With `personMerges`
+ * (`release`, DESIGN.md §9) a person merges a green PR there, which restrict
+ * updates would stop.
+ */
+export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail, personMerges = false): Finding[] {
   const out: Finding[] = [];
   const role = app?.role ?? "queue";
-  const landing = c.rulesets.filter((r) => appliesTo(r, branch, c.defaultBranch) && hasRule(r, "update") && hasRule(r, "pull_request"));
-  if (!landing.length) out.push(sev(id, `${branch}: no active ruleset both restricts updates and requires a PR`, `add a landing ruleset on ${branch} ("Restrict updates" and "Require a pull request"), bypass: the ${role} App and break-glass humans`));
+  const landing = c.rulesets.filter((r) => appliesTo(r, branch, c.defaultBranch) && (personMerges || hasRule(r, "update")) && hasRule(r, "pull_request"));
+  const does = personMerges ? "requires a PR" : "restricts updates and requires a PR";
+  if (!landing.length) out.push(sev(id, personMerges ? `${branch}: no active ruleset requires a PR` : `${branch}: no active ruleset both restricts updates and requires a PR`, `add a landing ruleset on ${branch} (${personMerges ? "" : '"Restrict updates" and '}"Require a pull request"), bypass: the ${role} App and break-glass humans`));
   else if (!c.admin) out.push(skipped(id, `${branch}: landing ruleset ${landing.map((r) => `"${r.name}"`).join(", ")} exists; its bypass list needs an admin token`, "rerun with an admin token"));
   else
     for (const r of landing) {
@@ -52,7 +59,7 @@ export function branchRulesets(id: string, branch: string, app: AppIdentity | un
       const hasApp = bypass.some((a) => isApp(a, app));
       if (!hasApp) out.push(aboutApp(sev(id, `${branch}: landing ruleset "${r.name}" does not list the ${role} App (${app?.slug ?? "unknown"}) as a bypass actor`, `add the ${role} App as a bypass actor`), app));
       if (others.length) out.push(aboutActors(sev(id, `${branch}: landing ruleset "${r.name}" has bypass actors other than the ${role} App and named users`, "remove them", others.map((a) => actorLabel(a, c.appNames))), app, others));
-      if (hasApp && !others.length) out.push(pass(id, `${branch}: landing ruleset "${r.name}" restricts updates and requires a PR; bypass: the ${role} App and ${bypass.filter((a) => a.actor_type === "User").length} named user(s)`));
+      if (hasApp && !others.length) out.push(pass(id, `${branch}: landing ruleset "${r.name}" ${does}; bypass: the ${role} App and ${bypass.filter((a) => a.actor_type === "User").length} named user(s)`));
     }
   for (const rule of ["required_signatures", "non_fast_forward", "deletion"]) out.push(noBypassRule(id, branch, branch, rule, c, sev));
   return out;

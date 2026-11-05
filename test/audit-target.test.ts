@@ -4,6 +4,8 @@
 import { describe, expect, test } from "bun:test";
 import type { LoadedConfig } from "../src/config/load";
 import { runAudit } from "../src/audit/command";
+import { targetRulesets } from "../src/setup/expected";
+import { rulesetBody } from "../src/setup/rulesets";
 import { acmeConfig, app, BUILD_YML, CHECKS_YML, fakeGh, file, forbidden, lines, notFound, QUEUE_APP, RELEASE_APP, type Routes, statuses, T_REPO, user, world } from "./audit-fake";
 
 const T = T_REPO;
@@ -212,6 +214,31 @@ describe("T10: release", () => {
   };
   test("everything in place passes", async () => {
     expect(statuses(await audit(releaseWorld(), releaseOn(false)), "T10")).toEqual(["PASS"]);
+  });
+  test.each([[false], [true]])("what setup writes passes (release.dryRun %p): release-landing has no update rule, for the hotfix path", async (dryRun) => {
+    const cfg = releaseOn(dryRun);
+    const specs = targetRulesets(cfg, true).filter((s) => s.name.startsWith("release-"));
+    expect(specs.map((s) => s.name)).toEqual(["release-landing", "release-integrity"]);
+    expect(specs[0]!.rules.map((x) => x.type)).not.toContain("update");
+    const r = releaseWorld();
+    specs.forEach((s, i) => (r[`${T}/rulesets/${6 + i}`] = { id: 6 + i, ...rulesetBody(s, null, { release: RELEASE_APP, queue: QUEUE_APP }) }));
+    const f = await audit(r, cfg);
+    expect(f.filter((x) => x.status === "FAIL" || x.status === "WARN")).toEqual([]);
+    expect(lines(f, "T10")).toContain('PASS stable: landing ruleset "release-landing" requires a PR; bypass: the release App and 0 named user(s)');
+  });
+  test("on release, only a ruleset that requires a PR counts: without one it fails when live and warns in dry run", async () => {
+    const r = releaseWorld();
+    (r[`${T}/rulesets/6`] as { rules: { type: string }[] }).rules = [{ type: "update" }];
+    const fix = 'add a landing ruleset on stable ("Require a pull request"), bypass: the release App and break-glass humans';
+    const live = (await audit(r, releaseOn(false))).filter((x) => x.id === "T10" && x.message === "stable: no active ruleset requires a PR");
+    expect(live.map((x) => [x.status, x.fix])).toEqual([["FAIL", fix]]);
+    const dry = (await audit(r, releaseOn(true))).filter((x) => x.id === "T10" && x.message.startsWith("stable: no active ruleset requires a PR"));
+    expect(dry.map((x) => x.status)).toEqual(["WARN"]);
+  });
+  test("main's landing ruleset still has to restrict updates", async () => {
+    const r = world();
+    (r[`${T}/rulesets/1`] as { rules: { type: string }[] }).rules = [{ type: "pull_request" }];
+    expect(lines(await audit(r), "T8")).toContain("FAIL trunk: no active ruleset both restricts updates and requires a PR");
   });
   test("gaps FAIL when live and WARN in dry run", async () => {
     const r = releaseWorld();

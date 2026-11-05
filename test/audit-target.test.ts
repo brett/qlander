@@ -205,7 +205,7 @@ describe("T10: release", () => {
     r[`${T}/contents/.github/release-manifest.json`] = file(JSON.stringify({ schema: 1, required: [{ path: ".github/workflows/build.yml", name: "Build", when: "always", required_jobs: ["unit"], allow_skipped_jobs: {} }] }));
     r[`${T}/contents/.github/workflows/certify.yml`] = file("on: workflow_dispatch\njobs: {}\n");
     r[`${T}/rulesets`] = [...(r[`${T}/rulesets`] as unknown[]), { id: 6 }, { id: 7 }];
-    r[`${T}/rulesets/6`] = { id: 6, name: "release-landing", target: "branch", enforcement: "active", conditions: { ref_name: { include: ["refs/heads/stable"], exclude: [] } }, bypass_actors: [app(RELEASE_APP)], rules: [{ type: "update" }, { type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } }, { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "Build" }] } }] };
+    r[`${T}/rulesets/6`] = { id: 6, name: "release-landing", target: "branch", enforcement: "active", conditions: { ref_name: { include: ["refs/heads/stable"], exclude: [] } }, bypass_actors: [app(RELEASE_APP)], rules: [{ type: "update" }, { type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } }, { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "unit" }, { context: "lint" }] } }] };
     r[`${T}/actions/workflows/certify.yml/runs`] = { total_count: 3 };
     r[`${T}/commits`] = [{ sha: "a".repeat(40) }];
     r[`${T}/commits/${"a".repeat(40)}/status`] = { statuses: [{ context: "release-ok" }] };
@@ -234,6 +234,15 @@ describe("T10: release", () => {
     expect(live.map((x) => [x.status, x.fix])).toEqual([["FAIL", fix]]);
     const dry = (await audit(r, releaseOn(true))).filter((x) => x.id === "T10" && x.message.startsWith("stable: no active ruleset requires a PR"));
     expect(dry.map((x) => x.status)).toEqual(["WARN"]);
+  });
+  test.each([[false, "FAIL"], [true, "WARN"]])("a required check missing from release fails when live and warns in dry run (release.dryRun %p)", async (dryRun, status) => {
+    const r = releaseWorld();
+    (r[`${T}/rulesets/6`] as { rules: { type: string; parameters?: Record<string, unknown> }[] }).rules = [
+      { type: "pull_request", parameters: { allowed_merge_methods: ["merge"] } },
+      { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "unrelated-lint" }, { context: "unit" }] } },
+    ];
+    const missing = (await audit(r, releaseOn(dryRun))).filter((x) => x.id === "T10" && x.message.startsWith('stable: required status checks lack "lint"'));
+    expect(missing.map((x) => x.status)).toEqual([status as "FAIL" | "WARN"]);
   });
   test("main's landing ruleset still has to restrict updates", async () => {
     const r = world();

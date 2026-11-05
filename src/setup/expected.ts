@@ -209,6 +209,9 @@ export function controlRulesets(c: LoadedConfig): RulesetSpec[] {
  * always; the landing and integrity rulesets only when `withLanding`
  * (`--apply-target-rulesets`), because they change who may move `main`.
  */
+/** The full suite's checks, which release-landing requires (the hotfix path, DESIGN.md §9); audit T10 checks for the same list. */
+export const releaseRequiredChecks = (c: Pick<LoadedConfig, "config">): string[] => [...new Set(c.config.preLanding.flatMap((w) => w.required_jobs))];
+
 export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSpec[] {
   const n = c.config.names;
   const repo = { owner: n.target.owner, name: n.target.name };
@@ -241,7 +244,7 @@ export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSp
     { repo, name: "main-integrity", include: [heads(n.main)], rules: INTEGRITY, bypass: [], extraBypass: "none", needsInstalled: [] },
   );
   if (c.release.enabled) {
-    const full = [...new Set(c.config.preLanding.flatMap((w) => w.required_jobs))].map((context) => ({ context }));
+    const full = releaseRequiredChecks(c).map((context) => ({ context }));
     out.push(
       {
         repo,

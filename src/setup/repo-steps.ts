@@ -200,14 +200,14 @@ async function stateBranchRefused(c: Ctx, control: Repo, branch: string, ruleset
   } catch (e) {
     return `could not read the rules that apply to ${branch}, so it is not known to be protected: ${e instanceof Error ? e.message : String(e)}`;
   }
-  if (!rules.has("creation")) return `GitHub does not report ${rulesetName}'s creation rule on ${branch}; the negative test was not run`;
+  if (!rules.has("creation")) return `GitHub does not report the creation rule of ${rulesetName} on ${branch}; the negative test was not run`;
   try {
     await c.d.api.createRef(control, branch, head);
   } catch (e) {
     if (!(e instanceof GitHubError && e.kind === "validation" && e.status === 422)) return `creating ${branch} with the operator's token failed, but not by a ruleset: ${e instanceof Error ? e.message : String(e)}`;
     const why = e.message.split("\n")[0];
     if ((await c.d.api.branchSha(control, branch)) !== null) return `creating ${branch} with the operator's token answered "${why}", but the branch exists`;
-    c.ok(`creating ${branch} with the operator's token was refused (${why}), and ${rulesetName}'s creation rule applies to it`);
+    c.ok(`creating ${branch} with the operator's token was refused (${why}), and the creation rule of ${rulesetName} applies to it`);
     return null;
   }
   // It landed, so the ruleset does not protect the branch. Remove it at once: the first live tick creates it.

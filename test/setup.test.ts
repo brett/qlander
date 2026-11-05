@@ -352,7 +352,7 @@ describe("verify", () => {
     w.out.length = 0;
     expect(await runSetup(w.deps(), ["verify"])).toBe(0);
     for (const s of w.specs) expect(w.out).toContain(`ok    ${s.slug}: minted a token with exactly the tick's permissions, for ${full(s.repo)} only`);
-    expect(w.out.filter((l) => l.includes("with the operator's token was refused") && l.includes("creation rule applies"))).toHaveLength(2);
+    expect(w.out.filter((l) => l.includes("with the operator's token was refused") && l.includes("the creation rule of") && l.includes("applies to it"))).toHaveLength(2);
     const minted = [...w.f.tokens.values()].map((t) => t.perms);
     for (const s of w.specs) expect(minted).toContainEqual(s.tokenPermissions);
   });
@@ -493,7 +493,7 @@ describe("hardening", () => {
           throw new GitHubError("validation", 422, message);
         });
         expect(code).toBe(0);
-        expect(w.out.filter((l) => l.startsWith("ok") && l.includes("was refused") && l.includes(message.split("\n")[0]!) && l.includes(`${STATE_RULESET}'s creation rule applies`))).toHaveLength(2);
+        expect(w.out.filter((l) => l.startsWith("ok") && l.includes("was refused") && l.includes(message.split("\n")[0]!) && l.includes(`the creation rule of ${STATE_RULESET} applies`))).toHaveLength(2);
         expect(writes).toEqual([]);
       });
     }

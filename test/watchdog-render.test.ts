@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { QUEUE_JOB_NAME, RELEASE_JOB_NAME } from "../src/main";
 import { emptyReleaseState, renderReleaseState } from "../src/release-state";
 import { emptyState, renderState, type State } from "../src/state";
-import { code, esc, evaluate, fenced, safeUrl } from "../src/watchdog-core";
+import { ALERT_HELP, code, esc, evaluate, fenced, safeUrl } from "../src/watchdog-core";
 import { extractTickReport, renderStatus, type StatusInput, summariseQueueState, summariseReleaseState } from "../src/watchdog-render";
 import { ago, issue, NOW, obs, run } from "./watchdog-fake";
 import { ISSUE_LABELS, CONTROL_SLUG } from "./sim";
@@ -77,7 +77,7 @@ describe("status body", () => {
       "## OK · 2026-10-22 12:00 UTC",
       `[watchdog run](https://github.com/${CONTROL_SLUG}/actions/runs/1) · mode: dry-run (QLANDER_MODE is unset)`,
     ]);
-    expect(renderStatus(base({ modeVar: "live" }))).toContain("mode: live (release advance held in dry run by src/release-config.ts)");
+    expect(renderStatus(base({ modeVar: "live" }))).toContain("mode: live (release advance held in dry run by release.dryRun in qlander.yml)");
     expect(renderStatus(base({ evaluation: { alerts: [], warnings: [{ detail: "w" }], unknown: [], notes: [] } }))).toContain("\n## WARN · ");
     expect(renderStatus(base({ evaluation: { alerts: [], warnings: [], unknown: [{ kind: "ticks-failing", reason: "r" }], notes: [] } }))).toContain("**Could not check**");
     expect(renderStatus(base({ evaluation: { alerts: [{ kind: "paused", key: "1", detail: "paused for 3h: x" }], warnings: [], unknown: [], notes: [] } }))).toContain("\n## ALERT · ");
@@ -162,5 +162,13 @@ describe("untrusted text is escaped everywhere", () => {
     const fence = /^````text\n([\s\S]*?)\n````$/m.exec(b)![1]!.split("\n");
     expect(fence).toHaveLength(5);
     expect(fence.some((l) => l.includes("`"))).toBe(false);
+  });
+});
+
+describe("alert help names only what every runner mode has", () => {
+  test("the runner advice is for those who run their own", () => {
+    expect(ALERT_HELP["ticks-stopped"].action).not.toContain("on the CI hosts");
+    expect(ALERT_HELP["ticks-stopped"].action).toContain("if you run your own runners");
+    expect(ALERT_HELP["runner-stuck"].action).not.toContain("on the CI hosts");
   });
 });

@@ -32,6 +32,7 @@ describe("v1 admission: ready from a write-access user, fast lane green, no revi
     pr(f, 1);
     const s = await snap(f);
     expect(s.prs["1"]!.review.ok).toBe(true);
+    expect(s.prs["1"]!.review.why).toBe("review evidence not required (queue.admission.review.required is off; ready by a write-access user)");
     expect(admit(s.prs["1"]!, cfg())).toEqual({ ok: true });
   });
 

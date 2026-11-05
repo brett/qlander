@@ -43,7 +43,7 @@ A ruleset on each branch restricts creation, update and deletion, and blocks for
 - **Credentials:** both jobs write their state branch only with `STATE_TOKEN`, an installation token of the state App minted in the job. One `StateRefClient`, parameterised by branch name, is the only code that writes either branch, and it refuses any other branch. Nothing writes state with `GITHUB_TOKEN`, which has `contents: read` (§12.2).
 - **Lease:** each state document also carries its job's **whole-tick lease** (`lease: {owner, until, acquiredAt, executor}`, §15).
 - **Initialisation:** if the queue's state branch is missing while a mirror issue (below) still holds a non-empty (or unreadable) state, qlander refuses to initialise and pauses. It starts from empty only when there is truly nothing there.
-- **Mirror:** the issue labelled with the mirror label (`queue.controlLabels.mirror`) is for people. It is rewritten after each tick and never read for decisions. An issue cannot be the store, because issue edits have no conditional write and a stale writer could erase a landing. Check runs on queue SHAs cannot either: they cannot journal intent before the SHA exists, and they tie recovery to branch retention.
+- **Mirror:** the issue labelled with the mirror label (`queue.controlLabels.mirror`) is for people. It is rewritten after each tick, and read for one decision only: the initialisation guard above. An issue cannot be the store, because issue edits have no conditional write and a stale writer could erase a landing. Check runs on queue SHAs cannot either: they cannot journal intent before the SHA exists, and they tie recovery to branch retention.
 - **Cross-checks:** target writers cannot touch the state branches. Every tick also checks the state against live reads: the target repo id, that `queue/<n>` exists at the recorded head, that the recorded base is the head's first-parent root, and that each second parent is the pin. A mismatch pauses the queue.
 
 ```json
@@ -139,8 +139,9 @@ The record is (PR, `H`, base ref and repo id, policy hash, label event id, the e
 
 - **A CI-policy approval,** counted from its `ready` label: the comment names the head and the approvers and gives the exact `/qlander approve-policy <head>` line to post.
 - **Mergeability GitHub has not computed,** counted from the hold's start in `state.held`: the comment says so and suggests a push.
+- **A red fast lane,** counted from its `ready` label: the comment names the head and the verdict, and says to rerun it or push a fix, or to remove `ready`. Red means the newest run for the head has finished without the job passing, so a run still going never counts, and neither does a failed read.
 
-The comment is re-raised on every tick while the PR waits, and the outbox's marker check posts it once (a duplicate needs GitHub's comment list to miss a posted comment for longer than a tick). `comments.omit` never leaves it out, since it asks someone to act. It is best effort (`isBestEffort`, src/outbox.ts): a failure to post it never pauses the queue or holds up other notices. Waits for a fast lane or a review get no comment, because their checks are visible on the PR.
+The comment is re-raised on every tick while the PR waits, and the outbox's marker check posts it once (a duplicate needs GitHub's comment list to miss a posted comment for longer than a tick). `comments.omit` never leaves it out, since it asks someone to act. It is best effort (`isBestEffort`, src/outbox.ts): a failure to post it never pauses the queue or holds up other notices. A fast lane still running or not yet started, and a wait for a review, get no comment, because their checks are visible on the PR and nothing has gone wrong yet.
 
 **No ready PR is ignored silently.** Every tick that decides reports a verdict for every PR that is ready but not admitted when the decision ends: a log line `#N ignored: <reason>`, and the same list in the tick's JSON report (`ignored`), which the status issue shows.
 
@@ -571,7 +572,7 @@ Qlander is not enabled on a target until each requirement is in place and verifi
 **Rulesets**, replacing classic branch protection on `main`:
 - main-landing: PR required plus the fast-lane checks, and **restrict updates**, so only bypass actors can move main at all. That covers UI and API PR merges, and it makes main exclusive (§12.1). Bypass for the queue App, plus the target's named break-glass humans.
 - main-integrity: **no bypass**; required signatures, non-fast-forward, deletion.
-- release-landing (with release advance): PR required, full checks, strict up-to-date, merge commits only; bypass for the release App, plus the break-glass humans.
+- release-landing (with release advance): PR required, full checks, strict up-to-date, merge commits only; bypass for the release App, plus the break-glass humans. It doesn't restrict updates, because a person merges a green hotfix PR there (§9).
 - release-integrity: no bypass; signatures, non-fast-forward, deletion.
 - queue-refs (`queue/**`, `qlander-build/**`): restrict creation, update and deletion; bypass for the queue App only.
 

@@ -90,7 +90,7 @@ export const ALERT_HELP: Record<AlertKind, { meaning: string; impact: string; ac
   "ticks-stopped": {
     meaning: "The landing queue has not run for a while. Qlander works in short runs called ticks, and none has finished recently.",
     impact: "Yes. No PR lands, and ready PRs wait, until ticks run again.",
-    action: "Check whether tick.yml is enabled and whether a qlander runner is up on the CI hosts. A \"runner not picking up ticks\" or \"tick workflow disabled\" alert usually explains it.",
+    action: "Check whether tick.yml is enabled and, if you run your own runners, whether a qlander runner is up. A \"runner not picking up ticks\" or \"tick workflow disabled\" alert usually explains it.",
   },
   "ticks-failing": {
     meaning: "The last few landing-queue runs (ticks) all failed.",
@@ -100,7 +100,7 @@ export const ALERT_HELP: Record<AlertKind, { meaning: string; impact: string; ac
   "runner-stuck": {
     meaning: "A landing-queue run (tick) has been waiting for a machine to run on, and none has picked it up.",
     impact: "Yes, if no tick has finished recently (a \"ticks stopped\" alert would say so). If ticks are still finishing, it is one stuck run and landing is not affected.",
-    action: "Check the qlander runners and the CI controllers on the CI hosts (docs/operating.md: \"Restarting a runner host's controller\"). A run GitHub queued but never gave any jobs is ignored once a newer tick finishes, so this alert then closes by itself.",
+    action: "Check the qlander runners and, if you run your own, the CI controllers on their hosts (docs/operating.md: \"Restarting a runner host's controller\"). A run GitHub queued but never gave any jobs is ignored once a newer tick finishes, so this alert then closes by itself.",
   },
   paused: {
     meaning: "Someone paused the landing queue (a pause issue is open) and it has stayed paused for over 2 hours.",

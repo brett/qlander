@@ -138,7 +138,7 @@ The opt-in priority lane lets a human put an urgent PR first. See [Operating it]
 
 GitHub marks a landed PR merged once it sees the PR's head in `main`, and qlander then removes `ready`. If GitHub doesn't mark it merged within [`queue.verify.ticks`](configuration.md#queueverify) ticks, and at least 15 minutes, qlander comments to say so. It never closes a PR.
 
-A push to an admitted PR normally drops it from the queue. If a push arrives after qlander's last check before landing, the pinned head lands, and qlander comments that the later commits are not in `main`.
+A push before admission changes what would land, and `ready` stays on: the new head is admitted once its fast lane is green. A push to an admitted PR normally drops it from the queue and removes `ready`. If a push arrives after qlander's last check before landing, the pinned head lands, and qlander comments that the later commits are not in `main`.
 
 ## Release advance
 

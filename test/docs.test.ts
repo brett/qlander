@@ -154,6 +154,31 @@ function namedCommands(text: string): { cli: string[]; slash: string[] } {
   };
 }
 
+describe("what the docs claim", () => {
+  test("a push is only said to drop a PR once it has been admitted", () => {
+    const rules = read("template/agent-landing-rules.md");
+    expect(rules).not.toContain("A later push drops the PR");
+    expect(rules).toContain("Don't add `ready` until the head is final");
+    expect(rules).toMatch(/Before qlander admits the PR, a push changes what would land and `ready` stays on/);
+    expect(rules).toMatch(/After admission.*a push takes the PR out of the queue/);
+    expect(read("docs/how-it-works.md")).toContain("A push before admission changes what would land");
+  });
+
+  test("the status issue's comments, T0 and C0, and a dry run's exit are as the code has them", () => {
+    expect(read("docs/operating.md")).not.toContain("so the issue makes no notification noise");
+    expect(read("docs/operating.md")).toContain("logs one comment here");
+    expect(read("docs/getting-started.md")).toContain("T0 and C0 appear only for a problem");
+    expect(read("template/AGENTS.md")).not.toContain("A dry run can exit 0 and print");
+    expect(read("AGENTS.md")).toContain("| `qlander quiesce --dry-run` | The state is idle now.");
+  });
+
+  test("the design names a red fast lane among the told waits, and setup and audit agree on release-landing", () => {
+    expect(read("DESIGN.md")).toContain("- **A red fast lane,** counted from its `ready` label");
+    expect(read("DESIGN.md")).not.toContain("Waits for a fast lane or a review get no comment");
+    expect(read("DESIGN.md")).toContain("It doesn't restrict updates, because a person merges a green hotfix PR there");
+  });
+});
+
 describe("the agent docs", () => {
   test("the extraction finds a command that doesn't exist, and skips names that aren't commands", () => {
     const sample = '`bun "${bundle:?}" frobnicate` `qlander nope --x` `<target>-qlander` `qlander.yml` `/qlander zap <sha>`\n```sh\nbun src/cli.ts fenced\n```\nqlander prose';

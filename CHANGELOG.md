@@ -1,8 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2.3
+
+One fix and a documentation update. State is unchanged, so this release reads what 0.2.2 wrote, and the policy hash is unchanged, so no admitted PR loses its place.
 
 - A batch no longer waits forever when GitHub reports its CI run `completed` but still lists one of its jobs as `in_progress` (or `queued`), even with that job's conclusion and `completed_at` set. Before, the in-progress timeout skipped completed runs, so the batch stayed pending until someone bounced the PR. Such a job still never counts as a pass. Once it is past `queue.timeouts.inProgressMinutes` from its own start, or the attempt is past the usual caps, the queue pauses with a configuration problem that names the run and the job, and the batch's PRs go back to the front of the queue with `ready` kept (or are parked, with `queue.strategy.reuseGreen`). Close the pause to carry on. A failure conclusion on such a job is still red at once.
+- Docs: new runbooks for renaming the control repo, an App or a label, and for a job still running after its run finished; when ticks run, and why a new repo can go hours without a scheduled run; full command forms in both agent guides; agents may merge a config change before the first live tick; and a wording pass over the install and operating guides and the template.
 
 ## 0.2.2
 

@@ -26,7 +26,23 @@ export const LAND_STACK_MAX = 100;
 const COMPARE_FILE_CAP = 300;
 import { GitHubError, Http, type HttpOptions, isGraphqlInternal } from "./http";
 
-export type Role = "queue" | "release" | "read";
+/**
+ * queue and release write their own refs. dispatch (the release job in
+ * release.mode dispatch, DESIGN.md §8.1) writes no ref at all, only its epoch
+ * branch, and may dispatch exactly one configured workflow. read writes nothing.
+ */
+export type Role = "queue" | "release" | "dispatch" | "read";
+
+/** What a dispatch-role client may start: one workflow, on one ref, with exactly these input names. */
+export interface DispatchAllow {
+  workflow: string;
+  ref: string;
+  inputs: readonly string[];
+}
+
+/** A workflow_dispatch input value qlander sends: a sha, true/false, or a dispatch id. */
+const INPUT_VALUE_RE = /^[A-Za-z0-9_.-]{1,100}$/;
+const VARIABLE_RE = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
 
 const NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
 const WORKFLOW_RE = /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/;
@@ -67,6 +83,8 @@ interface RawRun {
   created_at: string;
   run_started_at: string;
   display_title?: string;
+  actor?: RawAccount | null;
+  triggering_actor?: RawAccount | null;
 }
 
 const toRun = (r: RawRun): Run => ({
@@ -83,6 +101,8 @@ const toRun = (r: RawRun): Run => ({
   created_at: r.created_at,
   run_started_at: r.run_started_at ?? r.created_at,
   display_title: r.display_title ?? "",
+  actor: account(r.actor),
+  triggering_actor: account(r.triggering_actor),
 });
 
 export class TargetClient implements TargetApi {
@@ -96,11 +116,15 @@ export class TargetClient implements TargetApi {
     /** Target files qlander may read, as data only (a target-hosted qualification manifest). */
     private readonly dataFiles: ReadonlySet<string>,
     readonly epochBranch: string | null,
+    private readonly dispatchAllow: DispatchAllow | null = null,
   ) {}
 
   /** Connect and verify the repository id before anything else (DESIGN.md §11). */
-  static async connect(o: HttpOptions & { owner: string; repo: string; repoId: number; role: Role; names: Names; dataFiles: readonly string[]; epochBranch?: string | null }): Promise<TargetClient> {
+  static async connect(o: HttpOptions & { owner: string; repo: string; repoId: number; role: Role; names: Names; dataFiles: readonly string[]; epochBranch?: string | null; dispatch?: DispatchAllow | null }): Promise<TargetClient> {
     if (!NAME_RE.test(o.owner) || !NAME_RE.test(o.repo)) bad("bad owner or repo name");
+    const allow = o.dispatch ?? null;
+    if ((o.role === "dispatch") !== (allow !== null)) bad("a dispatch allowance goes with the dispatch role, and only with it");
+    if (allow && (!WORKFLOW_RE.test(allow.workflow) || (allow.ref !== o.names.main && allow.ref !== o.names.release) || allow.inputs.length === 0)) bad("bad dispatch allowance");
     const epoch = o.epochBranch ?? null;
     if (epoch !== null) {
       if (o.role === "read") bad("a read-only client has no epoch branch");
@@ -112,11 +136,13 @@ export class TargetClient implements TargetApi {
     const path = `repos/${o.owner}/${o.repo}`;
     const res = await http.request<{ id: number; node_id: string }>("GET", path);
     if (res.json.id !== o.repoId) bad(`${o.owner}/${o.repo} has id ${res.json.id}, expected ${o.repoId}`);
-    return new TargetClient(http, path, o.repoId, res.json.node_id, o.role, o.names, new Set(o.dataFiles), epoch);
+    return new TargetClient(http, path, o.repoId, res.json.node_id, o.role, o.names, new Set(o.dataFiles), epoch, allow);
   }
 
   private can(action: "refs" | "queueOps", ref?: string): void {
     if (this.role === "read") bad("this client is read-only");
+    // The dispatch role writes no target ref (its epoch branch goes through advanceEpoch and epochHeld, never here).
+    if (this.role === "dispatch") bad("role dispatch writes no ref and makes no queue write");
     if (action === "queueOps" && this.role !== "queue") bad(`role ${this.role} may not do this`);
     if (ref !== undefined && !isWritableRef(this.names, ref, this.role)) bad(`role ${this.role} may not write ${ref}`);
   }
@@ -349,17 +375,24 @@ export class TargetClient implements TargetApi {
     return { items: items.map(toRun), truncated: truncated || total === null || items.length !== total };
   }
 
-  async listWorkflowRuns(workflowPath: string, q: { branch?: string; event?: string; maxPages?: number }): Promise<Listed<Run>> {
+  async listWorkflowRuns(workflowPath: string, q: { branch?: string; event?: string; maxPages?: number; created?: Date }): Promise<Listed<Run>> {
     if (!WORKFLOW_RE.test(workflowPath)) bad(`bad workflow path ${workflowPath}`);
     if (q.branch !== undefined) this.branchName(q.branch);
+    if (q.created !== undefined && Number.isNaN(q.created.getTime())) bad("bad created time");
     const file = workflowPath.slice(".github/workflows/".length);
+    let total: number | null = null;
     const { items, truncated } = await this.http.paginate(
       `${this.path}/actions/workflows/${file}/runs`,
-      { branch: q.branch, event: q.event },
-      (p) => (p as { workflow_runs: RawRun[] }).workflow_runs,
+      { branch: q.branch, event: q.event, created: q.created ? `>=${q.created.toISOString().replace(/\.\d{3}Z$/, "Z")}` : undefined },
+      (p) => {
+        const page = p as { total_count?: number; workflow_runs: RawRun[] };
+        total ??= typeof page.total_count === "number" ? page.total_count : null;
+        return page.workflow_runs;
+      },
       q.maxPages ?? 2,
     );
-    return { items: items.map(toRun), truncated };
+    // As listRuns: complete only when every page was read and the count matches GitHub's total (a filtered search stops at 1,000 runs).
+    return { items: items.map(toRun), truncated: truncated || total === null || items.length !== total };
   }
 
   async getRun(id: number): Promise<Run | null> {
@@ -622,6 +655,36 @@ export class TargetClient implements TargetApi {
     const body = { event_type: eventType, client_payload: clientPayload };
     if (new TextEncoder().encode(JSON.stringify(body)).length >= 64_000) bad("dispatch body is 64 KB or more");
     await this.http.request("POST", `${this.path}/dispatches`, { body });
+  }
+
+  /**
+   * POST /actions/workflows/{file}/dispatches (Actions: write). Only the
+   * configured workflow, on the configured ref, with exactly the configured
+   * input names, each value a sha, true/false or a dispatch id. A POST is
+   * never retried (src/github/http.ts), so a lost response stays ambiguous.
+   */
+  async dispatchWorkflow(workflowPath: string, ref: string, inputs: Record<string, string>): Promise<void> {
+    if (this.role !== "dispatch" || !this.dispatchAllow) bad(`role ${this.role} may not dispatch workflows`);
+    const a = this.dispatchAllow;
+    if (workflowPath !== a.workflow || ref !== a.ref) bad(`only ${a.workflow} on ${a.ref} may be dispatched`);
+    const keys = Object.keys(inputs).sort();
+    if (!Bun.deepEquals(keys, [...a.inputs].sort())) bad(`dispatch inputs must be exactly ${a.inputs.join(", ")}`);
+    for (const v of Object.values(inputs)) if (typeof v !== "string" || !INPUT_VALUE_RE.test(v)) bad("bad dispatch input value");
+    const file = workflowPath.slice(".github/workflows/".length);
+    await this.http.request("POST", `${this.path}/actions/workflows/${file}/dispatches`, { body: { ref, inputs } });
+  }
+
+  async readVariable(name: string): Promise<string | null> {
+    if (this.role !== "dispatch") bad(`role ${this.role} reads no variables`);
+    if (!VARIABLE_RE.test(name)) bad(`bad variable name ${name}`);
+    try {
+      const r = await this.http.request<{ name: string; value: unknown }>("GET", `${this.path}/actions/variables/${name}`);
+      if (typeof r.json.value !== "string") bad(`variable ${name} has no string value`);
+      return r.json.value;
+    } catch (e) {
+      if (e instanceof GitHubError && e.kind === "not_found") return null;
+      throw e;
+    }
   }
 
   async removeLabel(n: number, label: string): Promise<void> {

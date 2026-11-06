@@ -149,18 +149,74 @@ export function reviewProof(
  * configured human (matched by id and login).
  */
 export function policyApproval(comments: IssueComment[], humans: Human[], head: string): IssueComment | undefined {
-  if (!isSha(head)) return undefined;
-  const want = `/qlander approve-policy ${head}`;
-  return comments.find(
-    (c) =>
-      c.body.trim() === want &&
-      c.created_at === c.updated_at &&
-      humans.some((h) => h.id === c.user.id && h.login === c.user.login),
-  );
+  return isSha(head) ? comments.find((c) => isExactApproval(c, humans, `/qlander approve-policy ${head}`)) : undefined;
+}
+
+/** The one rule both approvals share: the whole body is the command, the comment was never edited, and its author is listed by id and login. */
+const isExactApproval = (c: IssueComment, humans: Human[], want: string) =>
+  c.body.trim() === want && c.created_at === c.updated_at && humans.some((h) => h.id === c.user.id && h.login === c.user.login);
+
+export const APPROVE_RELEASE = "/qlander approve-release";
+
+/**
+ * A release approval (DESIGN.md §8.1): the status issue comment whose whole
+ * body is `/qlander approve-release <sha>`, by an account in
+ * release.dispatch.approvers (id and login), unedited, and posted strictly
+ * after `notBefore` (the candidate's dry-run dispatch), so an approval written
+ * before that dry run existed never counts. The same rule as a CI-policy
+ * approval, bound to the release candidate's sha instead of a PR head.
+ * `refused` says, for every other approve-release comment, why it does not count.
+ */
+export function releaseApproval(comments: IssueComment[], approvers: Human[], sha: string, notBefore: Date): { approval: IssueComment | null; refused: string[] } {
+  const refused: string[] = [];
+  if (!isSha(sha)) return { approval: null, refused: [`${String(sha)} is not a sha`] };
+  const want = `${APPROVE_RELEASE} ${sha}`;
+  for (const c of comments) {
+    const body = c.body.trim();
+    if (!body.startsWith(APPROVE_RELEASE)) continue;
+    const who = `comment ${c.id} by ${c.user.login}`;
+    const named = body.slice(APPROVE_RELEASE.length).trim();
+    if (body !== want) refused.push(`${who} names ${named.slice(0, 40) || "nothing"}, not the candidate ${sha}`);
+    else if (!approvers.some((h) => h.id === c.user.id && h.login === c.user.login)) refused.push(`${who}: not in release.dispatch.approvers (login and id)`);
+    else if (c.created_at !== c.updated_at) refused.push(`${who} was edited`);
+    else if (!(Date.parse(c.created_at) > notBefore.getTime())) refused.push(`${who} predates the candidate's dry run`);
+    else if (isExactApproval(c, approvers, want)) return { approval: c, refused };
+  }
+  return { approval: null, refused };
 }
 
 /** True when any changed file falls inside the policy boundary. */
 export function isPolicyChange(files: string[], boundary: string[]): boolean {
   const globs = boundary.map((g) => new Bun.Glob(g));
   return files.some((f) => globs.some((g) => g.match(f)));
+}
+
+export const REARM_RELEASE = "/qlander rearm-release";
+
+/**
+ * A release re-arm (DESIGN.md §8.1): one more attempt for `sha`, after the
+ * incident whose dispatch id is `incident`. The status issue comment's whole
+ * body is `/qlander rearm-release <sha> <incident>`, by an account in
+ * release.dispatch.approvers (id and login), unedited, and posted strictly
+ * after `notBefore` (when that incident's candidate closed). Bound to the
+ * incident, it authorises exactly one attempt: the next one's dispatch id
+ * replaces the incident. `refused` says why every other re-arm comment does not count.
+ */
+export function releaseRearm(comments: IssueComment[], approvers: Human[], sha: string, incident: string, notBefore: Date): { rearm: IssueComment | null; refused: string[] } {
+  const refused: string[] = [];
+  if (!isSha(sha)) return { rearm: null, refused: [`${String(sha)} is not a sha`] };
+  const want = `${REARM_RELEASE} ${sha} ${incident}`;
+  for (const c of comments) {
+    const body = c.body.trim();
+    if (!body.startsWith(REARM_RELEASE)) continue;
+    const who = `comment ${c.id} by ${c.user.login}`;
+    const [named, inc] = body.slice(REARM_RELEASE.length).trim().split(/\s+/);
+    if (named !== sha) refused.push(`${who} re-arms ${String(named ?? "nothing").slice(0, 40)}, not ${sha}, the last sha dispatched`);
+    else if (body !== want) refused.push(`${who} names incident ${String(inc ?? "none").slice(0, 60)}, not the last attempt ${incident}`);
+    else if (!approvers.some((h) => h.id === c.user.id && h.login === c.user.login)) refused.push(`${who}: not in release.dispatch.approvers (login and id)`);
+    else if (c.created_at !== c.updated_at) refused.push(`${who} was edited`);
+    else if (!(Date.parse(c.created_at) > notBefore.getTime())) refused.push(`${who} predates the end of that attempt`);
+    else if (isExactApproval(c, approvers, want)) return { rearm: c, refused };
+  }
+  return { rearm: null, refused };
 }

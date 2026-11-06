@@ -145,8 +145,8 @@ export interface TargetApi {
   // CI
   /** truncated: the listing is incomplete (page limit, or fewer runs than total_count) and must not be trusted as the whole set. */
   listRuns(q: { headSha: string; branch?: string; event?: string }): Promise<Listed<Run>>;
-  /** Newest first. truncated: more runs exist past maxPages. */
-  listWorkflowRuns(workflowPath: string, q: { branch?: string; event?: string; maxPages?: number }): Promise<Listed<Run>>;
+  /** Newest first. truncated: more runs exist past maxPages. `created`: only runs created at or after this time. */
+  listWorkflowRuns(workflowPath: string, q: { branch?: string; event?: string; maxPages?: number; created?: Date }): Promise<Listed<Run>>;
   getRun(id: number): Promise<Run | null>;
   /** The latest attempt's jobs. truncated: the list is incomplete and must not be trusted. */
   listJobs(runId: number): Promise<Listed<Job>>;
@@ -241,7 +241,39 @@ export interface TargetApi {
   removeLabel(n: number, label: string): Promise<void>;
   /** A repository_dispatch event on this repo (lifecycle hooks, src/hooks.ts). Needs Contents: write. */
   dispatch(eventType: string, clientPayload: object): Promise<void>;
+
+  // the release dispatch mode (DESIGN.md §8.1); each refused unless the client's role is "dispatch"
+  /**
+   * POST /actions/workflows/{file}/dispatches: start `workflowPath` on
+   * `ref` with string `inputs`. GitHub answers 204 with no run id, so the
+   * caller finds the run itself (by a dispatch id the run name echoes).
+   * Needs Actions: write. Never retried: a lost response is ambiguous.
+   */
+  dispatchWorkflow(workflowPath: string, ref: string, inputs: Record<string, string>): Promise<void>;
+  /** A repository variable's value, or null when it is not set (404). Needs Variables: read. */
+  readVariable(name: string): Promise<string | null>;
 }
+
+/** Every TargetApi method that writes to GitHub. */
+export type TargetWriteMethod =
+  | "createRef"
+  | "deleteRef"
+  | "updateRef"
+  | "epochUpdateRefs"
+  | "advanceEpoch"
+  | "voidEpoch"
+  | "merge"
+  | "createCommit"
+  | "landStack"
+  | "rerunFailedJobs"
+  | "cancelRun"
+  | "comment"
+  | "removeLabel"
+  | "dispatch"
+  | "dispatchWorkflow";
+
+/** The target's reads only: what discovery and qualification need. */
+export type TargetReads = Omit<TargetApi, TargetWriteMethod>;
 
 /**
  * The store of record for qlander's state (DESIGN.md §3.1): one JSON
@@ -280,4 +312,11 @@ export interface StateRepoApi {
   jobState(runId: number, attempt: number, job: string): Promise<"completed" | "running" | "unknown">;
   createIssue(title: string, body: string, labels: string[]): Promise<number>;
   updateIssueBody(n: number, body: string): Promise<void>;
+  /** An issue's comments, oldest first; truncated: some were not read. (The release dispatch mode reads approvals on the status issue.) */
+  listIssueComments(n: number): Promise<Listed<IssueComment>>;
+  /** Comment on an issue; only a release-candidate report (it starts with RELEASE_REPORT_MARKER). Returns the comment id. */
+  commentIssue(n: number, body: string): Promise<number>;
 }
+
+/** Every release-candidate report on the status issue starts with this, then the sha (src/release-dispatch.ts). */
+export const RELEASE_REPORT_MARKER = "<!-- qlander-release-candidate:";

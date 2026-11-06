@@ -5,6 +5,7 @@
 // name prefix; nothing is specific to one deployment.
 
 import type { LoadedConfig } from "../config/load";
+import { releaseAppBypassesRelease, releaseTokenPermissions } from "../release-permissions";
 
 export type Role = "queue" | "release" | "state";
 export type Level = "read" | "write";
@@ -58,7 +59,6 @@ export function permissionDiff(have: Permissions, want: Permissions): { name: st
 }
 
 const QUEUE_TOKEN: Permissions = { contents: "write", workflows: "write", pull_requests: "write", actions: "write", checks: "read", statuses: "read" };
-const RELEASE_TOKEN: Permissions = { contents: "write", workflows: "write", actions: "read", checks: "read", statuses: "read" };
 const STATE_TOKEN: Permissions = { contents: "write" };
 
 /** The Apps a config needs: queue and state always, release when release advance is enabled. */
@@ -86,7 +86,8 @@ export function appSpecs(c: LoadedConfig, prefix: string): AppSpec[] {
   });
   return [
     spec("queue", target, QUEUE_TOKEN, "QUEUE_APP"),
-    ...(c.release.enabled ? [spec("release", target, RELEASE_TOKEN, "RELEASE_APP")] : []),
+    // release.mode dispatch: least privilege, src/release-permissions.ts.
+    ...(c.release.enabled ? [spec("release", target, releaseTokenPermissions(c.release, c.runner.epochFence), "RELEASE_APP")] : []),
     spec("state", control, STATE_TOKEN, "STATE_APP"),
   ];
 }
@@ -140,6 +141,8 @@ export interface Rule {
  * says whether other bypass actors already on the ruleset (break-glass
  * humans, added by hand) are kept ("keep") or removed ("none"): a ruleset
  * whose point is that nobody else bypasses it is always "none".
+ * `apps` adds Apps that are not qlander's by id: the release ruleset in
+ * dispatch mode lists the target's promote identity, and not the release App.
  */
 export interface RulesetSpec {
   repo: Repo;
@@ -149,6 +152,8 @@ export interface RulesetSpec {
   rules: Rule[];
   bypass: Role[];
   extraBypass: "keep" | "none";
+  /** Other Apps, by id, that must be bypass actors too (release.dispatch.promoterApps). */
+  apps?: number[];
   /** The Apps that must be installed on `repo` before this ruleset can name them. */
   needsInstalled: Role[];
 }
@@ -256,9 +261,12 @@ export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSp
           // No `update` rule: a person merges a release PR once its checks pass (the hotfix path, DESIGN.md §9).
           { type: "required_status_checks", parameters: { required_status_checks: full, strict_required_status_checks_policy: true } },
         ],
-        bypass: ["release"],
-        extraBypass: "keep",
-        needsInstalled: ["release"],
+        // Dispatch mode: the release App never bypasses release; the configured promote identity
+        // (release.dispatch.promoterApps) and named break-glass users are the only bypass actors kept.
+        ...(releaseAppBypassesRelease(c.release)
+          ? { bypass: ["release"] as Role[], extraBypass: "keep" as const, needsInstalled: ["release"] as Role[] }
+          : // The release App's id is resolved too, so that a promoterApps entry naming it is refused (src/setup/rulesets.ts).
+            { bypass: [] as Role[], extraBypass: "keep" as const, needsInstalled: ["release"] as Role[], apps: [...(c.release.dispatch?.promoterApps ?? [])] }),
       },
       { repo, name: "release-integrity", include: [heads(n.release)], rules: INTEGRITY, bypass: [], extraBypass: "none", needsInstalled: [] },
     );

@@ -5,7 +5,8 @@
 // before any request, whichever method asks: every other Actions write is refused.
 
 import { type AssignOn, GitHubError, Http, type HttpOptions, postIssue } from "./http";
-import type { StateIssue, StateRepoApi } from "./api";
+import { type Listed, RELEASE_REPORT_MARKER, type StateIssue, type StateRepoApi } from "./api";
+import type { IssueComment } from "../types";
 import type { ChainApi } from "../wake";
 import { CONTROL_BRANCH, RELEASE_JOB_NAME } from "../job-names";
 import { listOpenIssuesByLabel } from "./issues";
@@ -35,6 +36,8 @@ class GuardedHttp extends Http {
     this.allowed = [
       { method: "POST", re: new RegExp(`^${r}/issues$`) },
       { method: "PATCH", re: new RegExp(`^${r}/issues/[1-9][0-9]*$`) },
+      // The release dispatch mode's candidate report on the status issue (commentIssue checks the body).
+      { method: "POST", re: new RegExp(`^${r}/issues/[1-9][0-9]*/comments$`) },
       { method: "POST", re: /^\/graphql$/ },
     ];
   }
@@ -114,6 +117,22 @@ export class StateRepoClient implements StateRepoApi, ChainApi {
     if (!Number.isSafeInteger(n) || n < 1) bad("bad issue number");
     if (body.length > 65_000) bad("state too large for an issue body");
     await this.http.request("PATCH", `${this.path}/issues/${n}`, { body: { body } });
+  }
+
+  async listIssueComments(n: number): Promise<Listed<IssueComment>> {
+    if (!Number.isSafeInteger(n) || n < 1) bad("bad issue number");
+    type Raw = { id: number; user: { login: string; id: number } | null; body: string | null; created_at: string; updated_at: string };
+    const { items, truncated } = await this.http.paginate(`${this.path}/issues/${n}/comments`, {}, (p) => p as Raw[]);
+    // A comment whose author GitHub cannot resolve (a deleted account) is nobody's: it is dropped, never matched.
+    const comments = items.flatMap((c) => (c.user && typeof c.user.login === "string" && Number.isSafeInteger(c.user.id) ? [{ id: c.id, user: { login: c.user.login, id: c.user.id }, body: c.body ?? "", created_at: c.created_at, updated_at: c.updated_at }] : []));
+    return { items: comments, truncated };
+  }
+
+  async commentIssue(n: number, body: string): Promise<number> {
+    if (!Number.isSafeInteger(n) || n < 1) bad("bad issue number");
+    if (!body.startsWith(RELEASE_REPORT_MARKER) || body.length > 60_000) bad("the only issue comment the release job posts is its candidate report");
+    const r = await this.http.request<{ id: number }>("POST", `${this.path}/issues/${n}/comments`, { body: { body } });
+    return r.json.id;
   }
 
   /** Dispatch tick.yml on main, with no inputs. The path and ref are fixed. */

@@ -5,7 +5,7 @@
 // reads the other's credentials (main.ts refuses to start if it can see them).
 
 import type { RunnerContract } from "./config/runner";
-import type { Names } from "./config";
+import type { Human, Names } from "./config";
 import { controlConfig } from "./config/load";
 import type { Qualification } from "./qualification";
 
@@ -39,6 +39,38 @@ export interface ReleaseConfig {
   historyLimit: number;
   /** Environment variable holding the release App's installation token (tokens.release). */
   tokenEnv: string;
+  /**
+   * advance (default): the job fast-forwards release itself (DESIGN.md §8).
+   * dispatch: it never writes release; it dispatches the target's own
+   * workflow and only observes release (DESIGN.md §8.1, src/release-dispatch.ts).
+   */
+  mode: "advance" | "dispatch";
+  /** The dispatch mode's settings, defaults filled in; null in advance mode. */
+  dispatch: DispatchConfig | null;
+}
+
+/** release.dispatch (DESIGN.md §8.1). */
+export interface DispatchConfig {
+  /** The target workflow that promotes a commit and moves release itself. */
+  workflow: string;
+  /** The branch it is dispatched on: the target's main or release. */
+  ref: string;
+  /** The workflow_dispatch input names qlander sets. */
+  inputs: { sha: string; dryRun: string; dispatchId: string };
+  /** The release App's bot account: a run counts only if it is the run's actor and triggering actor (DESIGN.md §8.1). */
+  actor: Human;
+  /** The target's promote identity, by App id: with named users, the only bypass actors on the release ruleset (DESIGN.md §8.1). */
+  promoterApps: number[];
+  /** Whose `/qlander approve-release <sha>` comment counts (login and id). Never empty. */
+  approvers: Human[];
+  dryRunValidMinutes: number;
+  appearMinutes: number;
+  runHours: number;
+  observeMinutes: number;
+  /** At most `window` dispatches, dry and real together, in any `windowHours`. */
+  budget: { window: number; windowHours: number };
+  /** Target repository variables that stop new dispatches while one equals its value. */
+  freeze: { variable: string; value: string }[];
 }
 
 /** The release config, loaded from qlander.yml with the queue's (src/config.ts). Labels: names.releaseLabels (pause, alert, mirror). */

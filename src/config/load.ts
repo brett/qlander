@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import schemaJson from "../../schema/qlander.schema.json" with { type: "json" };
 import { allowedPathProblem } from "../automation";
 import type { Config, Names, Strategy, TrustedAutomation } from "../config";
-import type { ReleaseConfig } from "../release-config";
+import type { DispatchConfig, ReleaseConfig } from "../release-config";
 import type { Proof, ProofRun, Qualification } from "../qualification";
 import type { Hook, HookEventName } from "../hooks";
 import { CONTROL_BRANCH } from "../job-names";
@@ -236,6 +236,21 @@ interface ConfigYaml {
       checksGreen?: { required: WorkflowYaml[] };
       commitStatus?: { context: string; creators: number[]; producerWorkflow?: string; targetUrl?: "actions-run"; proof?: ProofRunYaml };
     };
+    mode?: "advance" | "dispatch";
+    dispatch?: {
+      workflow: string;
+      ref?: string;
+      inputs: { sha: string; dryRun: string; dispatchId: string };
+      approvers: { login: string; id: number }[];
+      actor: { login: string; id: number };
+      promoterApps?: number[];
+      dryRunValidMinutes?: number;
+      appearMinutes?: number;
+      runHours?: number;
+      observeMinutes?: number;
+      budget?: { window: number; windowHours: number };
+      freeze?: { variable: string; value: string }[];
+    };
   };
   watchdog: { labels: { alert: string; status: string } };
   hooks?: { events: HookEventName[]; eventType: string }[];
@@ -358,9 +373,8 @@ export const LINEAR_BODY_MAX = 2000;
  * `release` an ancestor of `main` again. Linear landing squashes it, so the
  * release job would report `diverged` from then on. Refused whenever release
  * is enabled in advance mode, dry runs included, since a dry run is the step
- * before a live one. `release.mode` (advance | dispatch) is not in this
- * schema yet; read defensively so dispatch, which moves no branch by
- * fast-forward, stays allowed once it is.
+ * before a live one. Dispatch mode (release.mode dispatch), where qlander
+ * moves no release ref, is allowed.
  */
 export function linearReleaseProblems(y: { queue: { landing?: { mode?: string } }; release: { enabled?: boolean } }): string[] {
   if (y.queue.landing?.mode !== "linear" || y.release.enabled !== true) return [];
@@ -446,7 +460,55 @@ function toReleaseConfig(y: ConfigYaml, names: Names, qualification: Qualificati
     runner,
     historyLimit: r.historyLimit,
     tokenEnv: tokens.release,
+    mode: r.mode ?? "advance",
+    dispatch: toDispatch(r.dispatch, y.target.main),
   };
+}
+
+/** The dispatch mode's defaults (schema/qlander.schema.json). */
+export const DISPATCH_DEFAULTS = { dryRunValidMinutes: 1440, appearMinutes: 30, runHours: 6, observeMinutes: 60, budget: { window: 8, windowHours: 24 } } as const;
+
+/** release.dispatch with its defaults; null when absent (semanticProblems pairs it with the mode). */
+function toDispatch(d: ConfigYaml["release"]["dispatch"], main: string): DispatchConfig | null {
+  if (!d) return null;
+  const D = DISPATCH_DEFAULTS;
+  return {
+    workflow: d.workflow,
+    ref: d.ref ?? main,
+    inputs: { sha: d.inputs.sha, dryRun: d.inputs.dryRun, dispatchId: d.inputs.dispatchId },
+    approvers: d.approvers.map((a) => ({ login: a.login, id: a.id })),
+    actor: { login: d.actor.login, id: d.actor.id },
+    promoterApps: [...new Set(d.promoterApps ?? [])],
+    dryRunValidMinutes: d.dryRunValidMinutes ?? D.dryRunValidMinutes,
+    appearMinutes: d.appearMinutes ?? D.appearMinutes,
+    runHours: d.runHours ?? D.runHours,
+    observeMinutes: d.observeMinutes ?? D.observeMinutes,
+    budget: d.budget ? { window: d.budget.window, windowHours: d.budget.windowHours } : { ...D.budget },
+    freeze: (d.freeze ?? []).map((f) => ({ variable: f.variable, value: f.value })),
+  };
+}
+
+/** The dispatch mode's semantic checks (DESIGN.md §8.1). */
+function dispatchProblems(rel: ReleaseConfig, cronMinutes: number): string[] {
+  const out: string[] = [];
+  const d = rel.dispatch;
+  if (rel.mode === "dispatch" && !d) out.push("release.dispatch is required when release.mode is dispatch");
+  if (rel.mode !== "dispatch" && d) out.push("release.dispatch is set, but release.mode is not dispatch");
+  if (!d) return out;
+  const n = rel.names;
+  if (d.ref !== n.main && d.ref !== n.release) out.push(`release.dispatch.ref must be the target's main (${n.main}) or release.branch (${n.release}), not ${d.ref}`);
+  const inputs = Object.values(d.inputs);
+  for (const x of dup(inputs)) out.push(`release.dispatch.inputs: ${x} is used twice`);
+  for (const x of dup(d.approvers.map((h) => h.login))) out.push(`release.dispatch.approvers: login ${x} is listed twice`);
+  for (const x of dup(d.approvers.map((h) => h.id))) out.push(`release.dispatch.approvers: id ${x} is listed twice`);
+  if (d.promoterApps.includes(ACTIONS_APP_ID)) out.push(`release.dispatch.promoterApps must not include the GitHub Actions App (${ACTIONS_APP_ID}): any workflow could then bypass the release ruleset`);
+  if (d.approvers.some((h) => h.id === d.actor.id || h.login === d.actor.login)) out.push("release.dispatch.approvers must not include release.dispatch.actor: the job cannot approve its own release");
+  for (const x of dup(d.freeze.map((f) => f.variable.toUpperCase()))) out.push(`release.dispatch.freeze: ${x} is listed twice`);
+  for (const f of d.freeze) if (f.variable.toUpperCase().startsWith("GITHUB_")) out.push(`release.dispatch.freeze: ${f.variable}: GitHub refuses variable names starting with GITHUB_`);
+  if (d.appearMinutes < 2 * cronMinutes) out.push(`release.dispatch.appearMinutes (${d.appearMinutes}) must be at least twice runner.cronMinutes (${cronMinutes}): a run is looked for on the release job's ticks`);
+  if (d.observeMinutes < 2 * cronMinutes) out.push(`release.dispatch.observeMinutes (${d.observeMinutes}) must be at least twice runner.cronMinutes (${cronMinutes})`);
+  if (d.dryRunValidMinutes < 2 * cronMinutes) out.push(`release.dispatch.dryRunValidMinutes (${d.dryRunValidMinutes}) must be at least twice runner.cronMinutes (${cronMinutes})`);
+  return out;
 }
 
 /**
@@ -532,8 +594,11 @@ function semanticProblems(cfg: Config, rel: ReleaseConfig, runner: RunnerContrac
       if (!cfg.review[k].includes("{sha}")) out.push(`queue.admission.review.producer.${k} must contain {sha}`);
     }
   }
-  const { gates: releaseGates, problems: releaseProblems } = qualificationChecks(rel.qualification);
+  const { gates: qualificationGates, problems: releaseProblems } = qualificationChecks(rel.qualification);
   out.push(...releaseProblems);
+  out.push(...dispatchProblems(rel, runner.cronMinutes));
+  // The dispatched workflow promotes what it is given: a change to it is a CI-policy change.
+  const releaseGates: [string, string][] = [...qualificationGates, ...(rel.dispatch ? [["release.dispatch.workflow", rel.dispatch.workflow] as [string, string]] : [])];
 
   // §1.3: every file that defines a gate must be a policy path, so a target PR that edits it is a policy PR.
   const globs = cfg.policyBoundary.map((g) => new Bun.Glob(g));

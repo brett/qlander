@@ -53,7 +53,7 @@ Every upgrade goes through `quiesce`. Opening a pause issue alone isn't enough.
 
 ## CI-policy approval
 
-By default, agents don't approve: don't post `/qlander approve-policy <sha>`, and don't run `qlander approve-policy`. The approval is only as human as the account behind it, and letting an agent use a person's account removes that human check. That is this repo's owner's choice to make, never an agent's.
+By default, agents don't approve: don't post `/qlander approve-policy <sha>`, `/qlander approve-release <sha>` or `/qlander rearm-release <sha> <incident>`, and don't run `qlander approve-policy`, `qlander approve-release` or `qlander rearm-release`. The approval is only as human as the account behind it, and letting an agent use a person's account removes that human check. That is this repo's owner's choice to make, never an agent's.
 
 ## Where to find detail
 

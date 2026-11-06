@@ -48,6 +48,12 @@ Qlander reads one file: `qlander.yml`, at the root of the control repo. Start fr
   - [release.qualification.checksGreen.required[]](#releasequalificationchecksgreenrequired)
   - [release.qualification.commitStatus](#releasequalificationcommitstatus)
   - [release.qualification.commitStatus.proof](#releasequalificationcommitstatusproof)
+  - [release.dispatch](#releasedispatch)
+  - [release.dispatch.inputs](#releasedispatchinputs)
+  - [release.dispatch.actor](#releasedispatchactor)
+  - [release.dispatch.approvers[]](#releasedispatchapprovers)
+  - [release.dispatch.budget](#releasedispatchbudget)
+  - [release.dispatch.freeze[]](#releasedispatchfreeze)
 - [watchdog](#watchdog)
   - [watchdog.labels](#watchdoglabels)
 - [hooks[]](#hooks)
@@ -69,7 +75,7 @@ qlander.yml: the whole configuration of one deployment. It lives in the control 
 | `runner` | mapping | required | The runner contract: where the tick jobs run, and what bounds a job that freezes. See [runner](#runner). |
 | `lease` | mapping | required | Each job's whole-tick lease. See [lease](#lease). |
 | `queue` | mapping | required | The merge queue: what admits a PR, how batches are built and tested, and the budgets that bound them. See [queue](#queue). |
-| `release` | mapping | required | Release advance: fast-forward the target's release branch to qualified main commits. See [release](#release). |
+| `release` | mapping | required | Release advance: move the target's release branch to qualified main commits, by fast-forwarding it (mode advance) or by dispatching the target's own release workflow (mode dispatch). See [release](#release). |
 | `watchdog` | mapping | required | The watchdog's issues in the control repo. See [watchdog](#watchdog). |
 | `hooks` | list of mappings | `[]` | Lifecycle event hooks: notifications sent to the target as repository_dispatch events. See [hooks[]](#hooks). |
 | `tokens` | mapping | none | The environment variables the tick workflow puts each App's installation token in. See [tokens](#tokens). |
@@ -626,7 +632,7 @@ queue:
 
 ## `release`
 
-Release advance: fast-forward the target's release branch to qualified main commits. A separate job, with its own App, lease, state branch and pause. Not policy, except branch, stateBranch and labels.
+Release advance: move the target's release branch to qualified main commits, by fast-forwarding it (mode advance) or by dispatching the target's own release workflow (mode dispatch). A separate job, with its own App, lease, state branch and pause. Not policy, except branch, stateBranch and labels.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -638,6 +644,8 @@ Release advance: fast-forward the target's release branch to qualified main comm
 | `release.maxCandidates` | integer | required | How many of main's newest first-parent commits are examined. If none of them qualifies and older ones remain, a release-blocked issue says so. |
 | `release.historyLimit` | integer | required | Release receipts kept in the release state. |
 | `release.qualification` | mapping | required | How a main commit is proved qualified. See [release.qualification](#releasequalification). |
+| `release.mode` | string | `advance` | advance: the release job fast-forwards release itself. dispatch: it never writes release; it dispatches the target's own release workflow, first as a dry run and then, once an approver approves that exact sha, for real, and counts release as advanced only when it sees the ref there. Values: `advance`, `dispatch`. |
+| `release.dispatch` | mapping | none | The dispatch mode's settings. See [release.dispatch](#releasedispatch). |
 
 ```yaml
 release:
@@ -647,6 +655,7 @@ release:
   dryRun: true
   maxCandidates: 20
   historyLimit: 100
+  mode: dispatch
 ```
 
 ### `release.labels`
@@ -801,6 +810,121 @@ release:
         events:
           - workflow_run
         jobTemplate: "Qualified {sha}"
+```
+
+### `release.dispatch`
+
+The dispatch mode's settings. Required when mode is dispatch, refused otherwise.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `release.dispatch.workflow` | [workflow path](#formats) | required | The target workflow that promotes a commit and moves release itself. It must have a workflow_dispatch trigger with the three inputs below, and a run-name that contains the dispatch id input. |
+| `release.dispatch.ref` | [branch](#formats) | none | The branch the workflow is dispatched on, whose copy of the workflow file runs: the target's main or release.branch. Absent: the target's main. |
+| `release.dispatch.inputs` | mapping | required | The workflow_dispatch input names qlander sets. See [release.dispatch.inputs](#releasedispatchinputs). |
+| `release.dispatch.actor` | mapping | required | The release App's bot account: a dispatched run counts only if GitHub reports it as both the run's actor and its triggering actor. See [release.dispatch.actor](#releasedispatchactor). |
+| `release.dispatch.promoterApps` | list of integers | none | The App ids of the identity the target's promote workflow uses to move release. setup makes them, and named users, the only bypass actors on the release-landing ruleset; audit fails any other (a role, a team, another App, the release App). Absent: none. Never the GitHub Actions App (15368), which any workflow can use. |
+| `release.dispatch.approvers` | list of mappings | required | Accounts whose /qlander approve-release comment on the status issue counts. See [release.dispatch.approvers[]](#releasedispatchapprovers). |
+| `release.dispatch.dryRunValidMinutes` | integer | `1440` | How long a green dry run stays good for its real run. Past it, that commit is not released, and a newer one gets its own dry run. |
+| `release.dispatch.appearMinutes` | integer | `30` | How long after a dispatch its run may take to appear. At least twice runner.cronMinutes. |
+| `release.dispatch.runHours` | integer | `6` | How long a dispatched run may run before qlander stops waiting for it. |
+| `release.dispatch.observeMinutes` | integer | `60` | How long after a green real run release may take to reach the commit before a release-blocked issue says it did not. |
+| `release.dispatch.budget` | mapping | none | At most window dispatches, dry and real together, in any windowHours. See [release.dispatch.budget](#releasedispatchbudget). |
+| `release.dispatch.freeze` | list of mappings | none | Target repository variables that stop new dispatches while any of them equals its value. See [release.dispatch.freeze[]](#releasedispatchfreeze). |
+
+```yaml
+release:
+  dispatch:
+    workflow: .github/workflows/promote.yml
+    ref: main
+    promoterApps:
+      - 424242
+    dryRunValidMinutes: 1440
+    appearMinutes: 30
+    runHours: 6
+    observeMinutes: 60
+```
+
+### `release.dispatch.inputs`
+
+The workflow_dispatch input names qlander sets.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `release.dispatch.inputs.sha` | string | required | Gets the candidate commit's full sha. |
+| `release.dispatch.inputs.dryRun` | string | required | Gets "true" for the dry run and "false" for the real one. |
+| `release.dispatch.inputs.dispatchId` | string | required | Gets a unique id per dispatch. The workflow's run-name must contain it, which is how qlander finds the run it started. |
+
+```yaml
+release:
+  dispatch:
+    inputs:
+      sha: sha
+      dryRun: dry_run
+      dispatchId: dispatch_id
+```
+
+### `release.dispatch.actor`
+
+The release App's bot account: a dispatched run counts only if GitHub reports it as both the run's actor and its triggering actor. audit checks it against the release App.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `release.dispatch.actor.login` | string | required | The bot's login, <app slug>[bot]. |
+| `release.dispatch.actor.id` | integer | required | The bot account's id (not the App id): gh api 'users/<slug>[bot]' --jq .id. |
+
+```yaml
+release:
+  dispatch:
+    actor:
+      login: acme-release[bot]
+      id: 90000001
+```
+
+### `release.dispatch.approvers[]`
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `release.dispatch.approvers[].login` | string | required | The approver's login. |
+| `release.dispatch.approvers[].id` | integer | required | The approver's account id. |
+
+```yaml
+release:
+  dispatch:
+    approvers:
+      - login: alice
+        id: 1001
+```
+
+### `release.dispatch.budget`
+
+At most window dispatches, dry and real together, in any windowHours. Absent: 8 in 24 hours.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `release.dispatch.budget.window` | integer | required | Dispatches allowed in the window. |
+| `release.dispatch.budget.windowHours` | integer | required | The window's length in hours. |
+
+```yaml
+release:
+  dispatch:
+    budget:
+      window: 8
+      windowHours: 24
+```
+
+### `release.dispatch.freeze[]`
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `release.dispatch.freeze[].variable` | string | required | The repository variable's name. |
+| `release.dispatch.freeze[].value` | string | required | The value that means frozen, compared exactly. |
+
+```yaml
+release:
+  dispatch:
+    freeze:
+      - variable: RELEASE_FREEZE
+        value: "true"
 ```
 
 ## `watchdog`

@@ -17,6 +17,7 @@ import type { HttpOptions } from "./github/http";
 import { CONTROL_BRANCH, QUEUE_JOB_NAME } from "./job-names";
 import { type OperatorIo, why } from "./operator";
 import type { ReleaseState } from "./release-state";
+import type { DispatchConfig } from "./release-config";
 import type { State } from "./state";
 import type { DocRead } from "./status";
 import type { IssueInfo, TickJob, TickRun } from "./watchdog-core";
@@ -65,6 +66,8 @@ export type ControlConfig = Pick<Config, "names" | "humans"> & {
    * to roll back, unless releaseAbsenceProblem finds it held state once.
    */
   releaseWritesState: boolean;
+  /** release.dispatch when release.mode is dispatch (approve-release reads its approvers); absent or null otherwise. */
+  releaseDispatch?: DispatchConfig | null;
 };
 
 /** How an absent release state branch reads when the release job never writes state. */

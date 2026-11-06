@@ -5,16 +5,23 @@
 // pending acceptance (docs/deployment.md §4.2, §5.3).
 
 import { GitHubError } from "../github/http";
+import type { ReleaseConfig } from "../release-config";
+import { releaseTokenPermissions } from "../release-permissions";
 import { type AuditGh, fail, type Finding, pass, readFailed, skipped, unread } from "./types";
 
 export type AppRole = "queue" | "release" | "state";
 
-/** Exactly these permissions, not fewer and not more (DESIGN.md §12.1). */
+/** Exactly these permissions, not fewer and not more (DESIGN.md §12.1), for release advance (release.mode advance). */
 export const EXPECTED_PERMISSIONS: Record<AppRole, Record<string, string>> = {
   queue: { contents: "write", workflows: "write", pull_requests: "write", actions: "write", checks: "read", statuses: "read", metadata: "read" },
-  release: { contents: "write", workflows: "write", actions: "read", checks: "read", statuses: "read", metadata: "read" },
+  release: { ...releaseTokenPermissions({ mode: "advance", dispatch: null }, false), metadata: "read" },
   state: { contents: "write", metadata: "read" },
 };
+
+/** The permissions one App must have under this config: in release.mode dispatch the release App's set is src/release-permissions.ts's least-privilege one. */
+export function expectedPermissions(role: AppRole, release: Pick<ReleaseConfig, "mode" | "dispatch">, epochFence = false): Record<string, string> {
+  return role === "release" ? { ...releaseTokenPermissions(release, epochFence), metadata: "read" } : EXPECTED_PERMISSIONS[role];
+}
 
 export interface AppIdentity {
   role: AppRole;
@@ -64,7 +71,7 @@ export async function readApps(gh: AuditGh, slugs: { role: AppRole; slug: string
  * accepted permissions and repository selection. Which repos an
  * installation covers needs the App's own JWT, so that line is SKIPPED.
  */
-export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], id = "T11"): Promise<Finding[]> {
+export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], id = "T11", release: Pick<ReleaseConfig, "mode" | "dispatch"> = { mode: "advance", dispatch: null }, epochFence = false): Promise<Finding[]> {
   const out: Finding[] = [];
   let installs: Installation[] | null = null;
   let installErr = "";
@@ -78,17 +85,18 @@ export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], i
     installErr = e instanceof GitHubError && e.kind === "auth" ? "the token cannot list the organization's installations (it needs org admin read)" : why(e);
   }
   for (const app of apps) {
-    const want = EXPECTED_PERMISSIONS[app.role];
+    const want = expectedPermissions(app.role, release, epochFence);
     const label = `${app.role} App ${app.slug}`;
     if (app.id === null || !app.permissions) {
       const f = fail(id, `${label}: cannot read its registration (${app.error ?? "no permissions in the response"})`, `check the slug (--${app.role}-app) and that the App exists`);
       out.push(app.unread ? { ...f, inconclusive: true } : f);
       continue;
     }
+    if (app.role === "release" && release.mode === "dispatch" && release.dispatch) out.push(...(await actorCheck(gh, id, app, release.dispatch.actor)));
     const reg = permissionDiff(want, app.permissions);
     out.push(
       reg.length
-        ? fail(id, `${label}: registration permissions differ from DESIGN §12.1`, `set exactly these in the App's settings: ${fmt(want)}`, reg)
+        ? fail(id, `${label}: registration permissions differ from DESIGN §12.1${app.role === "release" && release.mode === "dispatch" ? " for release.mode dispatch" : ""}`, `set exactly these in the App's settings: ${fmt(want)}`, reg)
         : pass(id, `${label}: registration permissions are exactly ${fmt(want)}`),
     );
     if (!installs) {
@@ -109,6 +117,20 @@ export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], i
     out.push(skipped(id, `${label}: which repos each installation covers needs the App's JWT`, "check it in the installation's settings, or with `setup --step verify`"));
   }
   return out;
+}
+
+/** release.dispatch.actor must be this App's bot account: `<slug>[bot]`, with the id GitHub reports for that login. */
+async function actorCheck(gh: AuditGh, id: string, app: AppIdentity, actor: { login: string; id: number }): Promise<Finding[]> {
+  const want = `${app.slug}[bot]`;
+  if (actor.login !== want) return [fail(id, `release.dispatch.actor is ${actor.login}, not the release App's bot ${want}`, `set release.dispatch.actor.login to ${want}`)];
+  try {
+    const u = await gh.get<{ id?: unknown }>(`users/${encodeURIComponent(want)}`);
+    if (u.id !== actor.id) return [fail(id, `release.dispatch.actor: ${want} has id ${String(u.id)}, not ${actor.id}`, `set release.dispatch.actor.id to ${String(u.id)}`)];
+    return [pass(id, `release.dispatch.actor is the release App's bot ${want} (${actor.id})`)];
+  } catch (e) {
+    const f = fail(id, `release.dispatch.actor: ${want} could not be read: ${why(e)}`, "check the release App's slug");
+    return [readFailed(e) ? { ...f, inconclusive: true } : f];
+  }
 }
 
 const fmt = (p: Record<string, string>) =>

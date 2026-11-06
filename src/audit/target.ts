@@ -83,7 +83,7 @@ export async function t7(cfg: LoadedConfig, gh: AuditGh, repo: string): Promise<
 export function t8(cfg: LoadedConfig, c: RulesetCtx, queueApp: AppIdentity | undefined, release: AppIdentity | undefined, classic: boolean | null): Finding[] {
   const N = cfg.config.names;
   // queue.landing.author: author commits are unsigned (DESIGN.md §7.4): T13 then requires main not to demand signatures.
-  const out = branchRulesets("T8", N.main, queueApp, c, fail, false, cfg.config.landing?.author === "author" ? ["non_fast_forward", "deletion"] : undefined);
+  const out = branchRulesets("T8", N.main, queueApp, c, fail, false, { integrity: cfg.config.landing?.author === "author" ? ["non_fast_forward", "deletion"] : undefined });
   out.push(...landingRequirements("T8", N.main, c, { contexts: [cfg.config.fastLane.job], strict: false, mergeOnly: false }));
   out.push(...prefixRuleset("T8", "queue refs", N.queuePrefix, queueApp, c), ...prefixRuleset("T8", "build refs", N.buildPrefix, queueApp, c));
   if (cfg.runner.epochFence) {
@@ -144,7 +144,7 @@ async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs:
     if (!(e instanceof GitHubError && e.kind === "not_found")) throw e;
     out.push(sev("T10", `the release branch ${branch} does not exist${tag}`, `create ${branch} at a qualified commit of ${main}`));
   }
-  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, true), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
+  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, true, { appMustNotBypass: R.mode === "dispatch", promoterApps: R.dispatch?.promoterApps ?? [] }), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
   for (const e of cfg.config.preLanding) {
     const w = wfs.find((x) => x.path === e.path);
     if (!w?.wf) continue;
@@ -266,7 +266,7 @@ export async function auditTarget(gh: AuditGh, cfg: LoadedConfig, apps: AppIdent
   }
   out.push(...(await guard("T9", "T9", () => t9(cfg, gh, repo))));
   out.push(...(await guard("T10", "T10", () => t10(cfg, view, wfs ?? [], rc, releaseApp))));
-  out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11"))));
+  out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11", cfg.release, cfg.runner.epochFence))));
   out.push(...(await guard("T12", "T12", () => t12(cfg, view))));
   out.push(...(await guard("T13", "T13", () => t13(cfg, gh, repo, rc, queueApp, admin))));
   return out;

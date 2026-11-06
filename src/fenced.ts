@@ -22,7 +22,7 @@
 import { epochBranchFor, predecessorEpoch, type RunnerContract } from "./config/runner";
 import type { CommitAuthor, RefUpdate, TargetApi } from "./github/api";
 import { GitHubError, isGraphqlInternal } from "./github/http";
-import { type EpochHandover, LeaseHeldError, LostLockError } from "./store";
+import { type EpochHandover, LeaseHeldError, LostLockError, VoidNeedsWriteError } from "./store";
 import { ZERO_SHA } from "./validate";
 
 /** Waits between re-reads of a ref that a lagging replica may still show at its previous value. */
@@ -260,7 +260,14 @@ export function epochHandover(target: TargetApi, r: RunnerContract, job: "queue"
       const p = predecessorEpoch(r, job, recorded, expired !== null);
       if (p === null) return null;
       if ("refuse" in p) throw new LeaseHeldError(`${expired?.owner ?? "the last holder"}: ${p.refuse}`);
-      const after = await target.voidEpoch(p.void, `qlander void ${runId}`);
+      let after: string;
+      try {
+        after = await target.voidEpoch(p.void, `qlander void ${runId}`);
+      } catch (e) {
+        // Fence off in dispatch mode, the one job whose token is read-only (src/release-permissions.ts).
+        if (e instanceof GitHubError && e.kind === "auth") throw new VoidNeedsWriteError(`the recorded epoch branch ${p.void} could not be voided, so the lease is not taken: ${e.message}`);
+        throw e;
+      }
       return `voided the recorded epoch branch ${p.void} (now ${after})`;
     },
   };

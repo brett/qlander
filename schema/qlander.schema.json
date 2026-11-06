@@ -694,7 +694,7 @@
       "additionalProperties": false,
       "required": ["repo"],
       "properties": {
-        "repo": { "description": "The repo whose releases hold the bundle.", "$ref": "#/$defs/repo", "examples": ["example/qlander"] },
+        "repo": { "description": "The repo whose releases hold the bundle. After changing it, run `render`: it also updates the download in `ci.yml` and `verify-sandbox.yml`.", "$ref": "#/$defs/repo", "examples": ["example/qlander"] },
         "private": {
           "description": "Download through the API with the job's own token, which reads only the control repo, so repo must be the control repo. False: an anonymous download of a public release.",
           "type": "boolean",

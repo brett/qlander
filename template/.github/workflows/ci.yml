@@ -2,7 +2,8 @@
 # checked-in tick.yml and watchdog.yml are exactly what the pinned release
 # renders from it, and the workflows pass zizmor and actionlint.
 # GitHub-hosted runners, no secrets, no environments, read-only token.
-# Unlike tick.yml, this file is not rendered: edit it by hand if you must.
+# Unlike tick.yml, only this file's qlander download is rendered (`render`
+# keeps it in line with `bundle`). Edit the rest by hand if you must.
 
 name: ci
 

@@ -14,7 +14,7 @@ import { schemaProblems } from "../src/config/schema";
 import { CONTROL_BRANCH, QUEUE_JOB_NAME, RELEASE_JOB_NAME } from "../src/job-names";
 import { policyHash } from "../src/queue";
 import { DISPATCH_SECONDS, WATCH_MINUTES } from "../src/wake";
-import { BUN_SECONDS, BUNDLE_SECONDS, CURL, firstDifference, HOSTED_RUNS_ON, qlanderCommand, watchdogInput, RenderError, renderTick, tickCron, renderWatchdog, renderWorkflows, scalar, TICK_WORKFLOW, WATCHDOG_WORKFLOW } from "../src/render";
+import { BUN_SECONDS, BUNDLE_SECONDS, CURL, firstDifference, HAND_WORKFLOWS, HOSTED_RUNS_ON, withBundleDownload, qlanderCommand, watchdogInput, RenderError, renderTick, tickCron, renderWatchdog, renderWorkflows, scalar, TICK_WORKFLOW, WATCHDOG_WORKFLOW } from "../src/render";
 
 type Obj = Record<string, any>;
 const YAML = (Bun as unknown as { YAML: { parse(s: string): unknown } }).YAML;
@@ -270,6 +270,104 @@ describe("cli", () => {
     const io = memIo(missing);
     expect(await main(["render", "--check", "--config", config], io)).toBe(1);
     expect(io.errors.join("\n")).toContain("(missing)");
+  });
+
+  describe("the hand-edited workflows' qlander download follows bundle", () => {
+    const T = join(import.meta.dir, "..", "template");
+    const tmpl = (p: string) => readFileSync(join(T, p), "utf8");
+    const templateText = readFileSync(join(T, "qlander.yml"), "utf8");
+    const CI = HAND_WORKFLOWS[0]!;
+    const SANDBOX = HAND_WORKFLOWS[1]!;
+    const withBundle = (block: string) => templateText.replace(/^bundle:\n(?: {2}.*\n)+/m, `bundle:\n${block}`);
+    const setUp = (cfgText: string, over: Record<string, string | null> = {}) => {
+      const { dir, config } = controlDir(cfgText);
+      const files = new Map<string, string>();
+      for (const w of renderWorkflows(parseConfig(cfgText))) files.set(join(dir, w.path), w.text);
+      for (const p of HAND_WORKFLOWS) {
+        const text = over[p] === undefined ? tmpl(p) : over[p];
+        if (text !== null) files.set(join(dir, p), text);
+      }
+      return { dir, config, files };
+    };
+
+    test("the template's own files already match: an install on the default repo sees no change, comments and edits aside", async () => {
+      const b = parseConfig(templateText).bundle!;
+      for (const p of HAND_WORKFLOWS) expect(withBundleDownload(tmpl(p), b)).toBe(tmpl(p));
+      const edited = tmpl(CI).replace("timeout-minutes: 5", "timeout-minutes: 9").replace("# CI for every", "# Our CI, for every");
+      expect(withBundleDownload(edited, b)).toBe(edited);
+      const { config, files } = setUp(templateText, { [CI]: edited });
+      const before = new Map(files);
+      const io = memIo(files);
+      expect(await main(["render", "--check", "--config", config], io)).toBe(0);
+      expect(io.errors).toEqual([]);
+      expect(await main(["render", "--config", config], io)).toBe(0);
+      expect(files).toEqual(before);
+    });
+
+    test("another public repo: render --check says so and still passes, render moves every download and keeps every edit", async () => {
+      const text = withBundle("  repo: acme/qlander-fork\n");
+      const edited = tmpl(SANDBOX).replace("timeout-minutes: 15", "timeout-minutes: 20");
+      const { dir, config, files } = setUp(text, { [SANDBOX]: edited });
+      const io = memIo(files);
+      expect(await main(["render", "--check", "--config", config], io)).toBe(0);
+      for (const p of HAND_WORKFLOWS) expect(io.lines.join("\n")).toContain(`${p}: its qlander download differs from bundle`);
+      expect(files.get(join(dir, CI))).toBe(tmpl(CI));
+      expect(await main(["render", "--config", config], memIo(files))).toBe(0);
+      const ci = files.get(join(dir, CI))!;
+      const sandbox = files.get(join(dir, SANDBOX))!;
+      expect(ci).toBe(tmpl(CI).replaceAll("github.com/brett/qlander/releases", "github.com/acme/qlander-fork/releases"));
+      expect(sandbox).toBe(edited.replaceAll("github.com/brett/qlander/releases", "github.com/acme/qlander-fork/releases"));
+      expect(sandbox.match(/acme\/qlander-fork\/releases/g)?.length).toBe(3);
+      const again = memIo(files);
+      expect(await main(["render", "--check", "--config", config], again)).toBe(0);
+      expect(again.lines.join("\n")).not.toContain("differs from bundle");
+    });
+
+    test("a private bundle: the same API download as the tick, with the job's own token in each step's env", () => {
+      const b = { repo: "acme/control", private: true, watchdog: true };
+      const tick = renderWorkflows({ ...acme(HOSTED), bundle: b }).find((w) => w.path === TICK_WORKFLOW)!.text;
+      const ci = withBundleDownload(tmpl(CI), b);
+      const sandbox = withBundleDownload(tmpl(SANDBOX), b);
+      const listing = 'releases="https://api.github.com/repos/acme/control/releases"';
+      expect(tick).toContain(listing);
+      expect(ci).toContain(listing);
+      expect(ci).not.toContain("releases/download/v${relversion}");
+      expect(ci).toContain("        env:\n          GITHUB_TOKEN: ${{ github.token }}\n        run: |");
+      expect(sandbox.match(/\n {8}env:\n {10}GITHUB_TOKEN: \$\{\{ github\.token \}\}\n/g)?.length).toBe(3);
+      for (const text of [ci, sandbox]) {
+        expect((YAML.parse(text) as Obj).jobs).toBeDefined();
+        expect(withBundleDownload(text, b)).toBe(text);
+      }
+      expect(sandbox).toContain("VERIFY_QUEUE_TOKEN: ${{ steps.queue.outputs.token }}");
+    });
+
+    test("a private bundle finds a step's env wherever it sits, and never adds a second one", () => {
+      const b = { repo: "acme/control", private: true, watchdog: true };
+      const step = (env: string) => `jobs:\n  a:\n    steps:\n      - name: x\n        run: |\n${tmpl(CI).split("\n").filter((l) => l.startsWith("          [[ ") || l.startsWith('          (cd "$dir" && echo "${relsum}')).join("\n")}\n${env}      - name: y\n        run: echo\n`;
+      const after = withBundleDownload(step("        env:\n          OTHER: 1\n"), b);
+      expect(after.match(/ env:/g)?.length).toBe(1);
+      expect((YAML.parse(after) as Obj).jobs.a.steps[0].env).toEqual({ GITHUB_TOKEN: "${{ github.token }}", OTHER: 1 });
+      expect((YAML.parse(after) as Obj).jobs.a.steps[1].env).toBeUndefined();
+      const inline = withBundleDownload(step("        env: { OTHER: 1 }\n"), b);
+      expect(inline.match(/ env:/g)?.length).toBe(1);
+    });
+
+    test("nothing to do: source mode, a missing file, a file with no recognisable download", async () => {
+      const b = { repo: "acme/qlander", private: false, watchdog: true };
+      const own = "name: ci\non: push\njobs: {}\n";
+      expect(withBundleDownload(own, b)).toBe(own);
+      const { dir, config, files } = setUp(withBundle("  repo: acme/qlander\n"), { [CI]: own, [SANDBOX]: null });
+      const io = memIo(files);
+      expect(await main(["render", "--check", "--config", config], io)).toBe(0);
+      expect(io.errors).toEqual([]);
+      expect(await main(["render", "--config", config], memIo(files))).toBe(0);
+      expect(files.get(join(dir, CI))).toBe(own);
+      expect(files.has(join(dir, SANDBOX))).toBe(false);
+      const source = controlDir(text);
+      const seen = memIo(new Map([[join(source.dir, CI), tmpl(CI)]]));
+      expect(await main(["render", "--config", source.config], seen)).toBe(0);
+      expect(seen.files.get(join(source.dir, CI))).toBe(tmpl(CI));
+    });
   });
 
   test("render and validate refuse an invalid config with its problems; render refuses an unrenderable one", async () => {

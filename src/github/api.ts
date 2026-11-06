@@ -210,7 +210,7 @@ export interface TargetApi {
   branchRules(branch: string): Promise<{ type: string; rulesetId: number | null }[]>;
   /** A ruleset that applies to the repo (its own or its organization's): its name and `current_user_can_bypass` for this App (null when absent). */
   rulesetBypass(id: number): Promise<{ name: string; bypass: string | null }>;
-  /** A PR branch's `protected` flag (classic branch protection); false if the branch does not exist. */
+  /** Whether a PR branch has classic branch protection (a ruleset alone is not it); false if the branch does not exist. */
   branchProtected(branch: string): Promise<boolean>;
 
   // writes (each refused unless the client's role allows it)

@@ -7,9 +7,12 @@ import { readFileSync } from "node:fs";
 import { appChecks, type AppIdentity, EXPECTED_PERMISSIONS, expectedPermissions } from "../src/audit/apps";
 import type { AuditGh } from "../src/audit/types";
 import { ConfigError, parseConfig } from "../src/config/load";
+import { GitHubError } from "../src/github/http";
+import { RELEASE_JOB_NAME } from "../src/job-names";
 import { policyHash } from "../src/queue";
 import { releaseTokenPermissions } from "../src/release-permissions";
 import { renderTick } from "../src/render";
+import { Ctx, StepFailed } from "../src/setup/context";
 import { appSpecs, targetRulesets } from "../src/setup/expected";
 import { qlanderAppsAsExtra, rulesetBody, rulesetDiff } from "../src/setup/rulesets";
 import { branchRulesets } from "../src/audit/ruleset-checks";
@@ -100,6 +103,27 @@ describe("release.mode", () => {
 });
 
 describe("the release App's permissions in dispatch mode: least privilege", () => {
+  test("fence off: a read token every tick, and a write token only in the steps that run when a tick asks for one", () => {
+    const FENCE_OFF = parseConfig(withRelease(DISPATCH));
+    const jobOf = (c: Parameters<typeof renderTick>[0]) => {
+      const y = (Bun as unknown as { YAML: { parse(s: string): any } }).YAML.parse(renderTick(c));
+      return y.jobs[RELEASE_JOB_NAME] ?? Object.values(y.jobs).find((j: any) => j.environment === "release-write");
+    };
+    const off = jobOf({ ...FENCE_OFF, runner: { ...FENCE_OFF.runner, epochFence: false, mode: "self-hosted-kill" }, runsOn: FENCE_OFF.runsOn ?? ["r"] } as never) as { steps: any[] };
+    const tokens = off.steps.filter((s) => String(s.uses).includes("create-github-app-token") && s.with["permission-actions"]);
+    expect(tokens.map((s) => [s.with["permission-contents"], s.if])).toEqual([["read", undefined], ["write", "steps.tick.outputs.needs-contents-write == 'true'"]]);
+    const runs = off.steps.filter((s) => String(s.run).includes("tick release"));
+    expect(runs.map((s) => s.if)).toEqual([undefined, "steps.tick.outputs.needs-contents-write == 'true'"]);
+    expect(runs[0].id).toBe("tick");
+    expect(runs[0].env[FENCE_OFF.tokens.release]).toBe("${{ steps.target.outputs.token }}");
+    expect(runs[1].env[FENCE_OFF.tokens.release]).toBe(`${"$"}{{ steps.${tokens[1].id}.outputs.token }}`);
+    // Fence on, or advance mode: nothing to ask for, and one tick step.
+    const on = jobOf({ ...FENCE_OFF, runner: { ...FENCE_OFF.runner, epochFence: true, epochPrefix: "q-epoch/" }, runsOn: FENCE_OFF.runsOn ?? ["r"] } as never) as { steps: any[] };
+    expect(on.steps.filter((s) => String(s.run).includes("tick release")).map((s) => s.id)).toEqual([undefined]);
+    const advance = parseConfig(withRelease([]));
+    expect(renderTick({ ...advance, runsOn: advance.runsOn ?? ["r"] } as never)).not.toContain("needs-contents-write");
+  });
+
   const FREEZE = [...DISPATCH, "    freeze:", "      - variable: RELEASE_FREEZE", "        value: \"true\""];
   test("Actions: write and Contents: read, no Workflows; Contents: write only for the epoch fence; Variables: read only with a freeze", () => {
     const d = parseConfig(withRelease(DISPATCH));
@@ -227,6 +251,38 @@ describe("the release App's permissions in dispatch mode: least privilege", () =
     // Without an admin token the bypass lists are unread: SKIPPED, never a PASS.
     const noAdmin = branchRulesets("T10", "release", app, { ...(ctx([ruleset(1, "release-landing", ["pull_request", "update"], [promoter]), integrity]) as object), admin: false } as never, undefined, false, { appMustNotBypass: true, promoterApps: [PROMOTER], promoterUpdates: true });
     expect(noAdmin.filter((f) => f.message.includes("promote App")).map((f) => f.status)).toEqual(["SKIPPED"]);
+  });
+
+  test("setup: a ruleset GitHub refuses names the promoter ids it adds and what to check; other refusals are left as they are", async () => {
+    const refused = new GitHubError("validation", 422, "Validation Failed");
+    const d = parseConfig(withRelease(PROMOTED));
+    const spec = targetRulesets(d, true).find((r) => r.name === "release-landing")!;
+    const ids = { queue: 1, release: 2, state: 3 };
+    const run = async (s: typeof spec, have: unknown, err: unknown = refused) => {
+      const out: string[] = [];
+      const fail = async () => {
+        throw err;
+      };
+      const api = { rulesets: async () => (have ? [{ id: 9, name: s.name }] : []), ruleset: async () => have, createRuleset: fail, updateRuleset: fail };
+      const c = new Ctx({ config: d, prefix: "x", api, apply: true, out: (l: string) => out.push(l) } as never);
+      const caught = await c.ensureRuleset(s, ids).then(() => null, (e: unknown) => e);
+      return { out, caught };
+    };
+    const created = await run(spec, null);
+    expect(created.caught).toBeInstanceOf(StepFailed);
+    expect(created.out.at(-1)).toContain(`release.dispatch.promoterApps (${PROMOTER})`);
+    expect(created.out.at(-1)).toContain("Validation Failed");
+    expect(created.out.at(-1)).toContain("App ID");
+    expect(created.out.at(-1)).toContain("installed");
+    const live = { id: 9, name: spec.name, target: "branch", enforcement: "active", conditions: { ref_name: { include: spec.include, exclude: [] } }, rules: [], bypass_actors: [] };
+    expect((await run(spec, live)).out.at(-1)).toContain(`(${PROMOTER})`);
+    // Already accepted on the live ruleset: this refusal is about something else, so it passes through.
+    const withPromoter = { ...live, bypass_actors: [{ actor_id: PROMOTER, actor_type: "Integration", bypass_mode: "always" }] };
+    expect((await run(spec, withPromoter)).caught).toBe(refused);
+    // No promoter in the ruleset, and any other kind of failure: unchanged too.
+    expect((await run({ ...spec, apps: [] }, null)).caught).toBe(refused);
+    const down = new GitHubError("server", 502, "Bad gateway");
+    expect((await run(spec, null, down)).caught).toBe(down);
   });
 
   test("[t2] setup refuses a promoterApps entry that is the release App (or any qlander App), in --plan too", () => {

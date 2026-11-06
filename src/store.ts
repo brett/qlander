@@ -75,6 +75,9 @@ export class LeaseHeldError extends Error {
   }
 }
 
+/** The recorded epoch branch can't be voided with this job's read-only token: the lease is not taken, and a tick with Contents: write can do it. */
+export class VoidNeedsWriteError extends LeaseHeldError {}
+
 export class CorruptStateError extends Error {
   constructor(message: string) {
     super(`corrupt state: ${message}`);

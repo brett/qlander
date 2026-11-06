@@ -4,6 +4,7 @@
 // visible to an admin token; without one those lines are SKIPPED, never a
 // guessed PASS.
 
+import { BLOCKS_DIRECT_UPDATE } from "../force-update";
 import type { AppIdentity } from "./apps";
 import { actorLabel, appliesTo, hasRule, type Ruleset } from "./rulesets";
 import { fail, type Finding, pass, skipped } from "./types";
@@ -45,6 +46,8 @@ export interface BranchRulesetOpts {
   /** release.mode dispatch (§8.1): the App must not bypass the landing ruleset; only `promoterApps` and named users may. */
   appMustNotBypass?: boolean;
   promoterApps?: readonly number[];
+  /** With appMustNotBypass: qlander's other Apps, none of which may be a promote App (setup refuses it too, src/setup/rulesets.ts). */
+  otherApps?: readonly AppIdentity[];
   /**
    * Linear landing with dispatch (§7.4): the promote Apps move `branch` directly, so each must always bypass every
    * ruleset on it that would stop a direct update (bypassing one ruleset does not bypass another).
@@ -53,7 +56,7 @@ export interface BranchRulesetOpts {
 }
 
 /** Rules that stop a direct (non-PR) fast-forward of a branch by an actor that does not bypass them. */
-const BLOCKS_UPDATE = ["update", "pull_request", "required_status_checks", "required_deployments", "merge_queue", "workflows", "code_scanning"];
+const BLOCKS_UPDATE: readonly string[] = BLOCKS_DIRECT_UPDATE;
 
 /**
  * A landing ruleset (PR, plus restrict updates where only the App may move the
@@ -63,9 +66,14 @@ const BLOCKS_UPDATE = ["update", "pull_request", "required_status_checks", "requ
  * updates would stop.
  */
 export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail, personMerges = false, o: BranchRulesetOpts = {}): Finding[] {
-  const { integrity = ["required_signatures", "non_fast_forward", "deletion"], appMustNotBypass = false, promoterApps = [], promoterUpdates = false } = o;
+  const { integrity = ["required_signatures", "non_fast_forward", "deletion"], appMustNotBypass = false, promoterApps = [], otherApps = [], promoterUpdates = false } = o;
   const out: Finding[] = [];
   const role = app?.role ?? "queue";
+  const own = otherApps.filter((a) => a.id !== null && a.id !== app?.id);
+  if (appMustNotBypass) {
+    for (const a of own) if (promoterApps.includes(a.id!)) out.push(aboutApp(fail(id, `release.dispatch.promoterApps lists ${a.id}, which is the ${a.role} App: in release.mode dispatch it must not bypass ${branch}`, "list only the target's own promote App"), a));
+    for (const a of otherApps) if (a.id === null && promoterApps.length) out.push(aboutApp(skipped(id, `release.dispatch.promoterApps: the ${a.role} App's id is unknown, so whether it is listed cannot be told`, "rerun with the App's slug"), a));
+  }
   const landing = c.rulesets.filter((r) => appliesTo(r, branch, c.defaultBranch) && (personMerges || hasRule(r, "update")) && hasRule(r, "pull_request"));
   const does = personMerges ? "requires a PR" : "restricts updates and requires a PR";
   const bypassers = appMustNotBypass ? "release.dispatch.promoterApps" : `the ${role} App`;
@@ -86,9 +94,14 @@ export function branchRulesets(id: string, branch: string, app: AppIdentity | un
         const listed = bypass.filter((a) => a.actor_type === "Integration" && a.actor_id === app.id);
         const broad = bypass.filter((a) => a.actor_type !== "User" && !(a.actor_type === "Integration" && promoterApps.includes(a.actor_id ?? -1) && a.actor_id !== app.id));
         if (listed.length) out.push(aboutApp(fail(id, `${branch}: landing ruleset "${r.name}" lists the ${role} App (${app.slug}) as a bypass actor (mode ${listed.map((a) => a.bypass_mode ?? "?").join(", ")}), which release.mode dispatch forbids`, `remove the ${role} App from its bypass actors (setup --step target does)`), app));
-        const others = broad.filter((a) => !listed.includes(a));
+        const ownListed = bypass.filter((a) => a.actor_type === "Integration" && own.some((x) => x.id === a.actor_id));
+        for (const a of ownListed) {
+          const who = own.find((x) => x.id === a.actor_id)!;
+          out.push(aboutApp(fail(id, `${branch}: landing ruleset "${r.name}" lists the ${who.role} App (${who.slug}) as a bypass actor (mode ${a.bypass_mode ?? "?"}), which release.mode dispatch forbids`, `remove the ${who.role} App from its bypass actors (setup --step target does)`), who));
+        }
+        const others = broad.filter((a) => !listed.includes(a) && !ownListed.includes(a));
         if (others.length) out.push(aboutActors(fail(id, `${branch}: landing ruleset "${r.name}" has bypass actors other than release.dispatch.promoterApps and named users`, "remove them: a role, a team or another App lets ordinary writers skip the release gates", others.map((a) => actorLabel(a, c.appNames))), app, others));
-        if (!listed.length && !others.length) out.push(pass(id, `${branch}: landing ruleset "${r.name}" ${does}; bypass: ${bypass.filter((a) => a.actor_type === "Integration").length} promote App(s) and ${bypass.filter((a) => a.actor_type === "User").length} named user(s), not the ${role} App (release.mode dispatch)`));
+        if (!listed.length && !ownListed.length && !others.length) out.push(pass(id, `${branch}: landing ruleset "${r.name}" ${does}; bypass: ${bypass.filter((a) => a.actor_type === "Integration").length} promote App(s) and ${bypass.filter((a) => a.actor_type === "User").length} named user(s), not the ${role} App (release.mode dispatch)`));
         continue;
       }
       if (!hasApp) out.push(aboutApp(sev(id, `${branch}: landing ruleset "${r.name}" does not list the ${role} App (${app?.slug ?? "unknown"}) as a bypass actor`, `add the ${role} App as a bypass actor`), app));

@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { runAudit } from "../src/audit/command";
 import type { LoadedConfig } from "../src/config/load";
 import { DEFAULT_LINEAR_BODY } from "../src/config/load";
+import { BLOCKS_DIRECT_UPDATE } from "../src/force-update";
 import { GitHubError } from "../src/github/http";
 import { acmeConfig, app, fakeGh, forbidden, lines, notFound, QUEUE_APP, type Routes, statuses, T_REPO as T, world } from "./audit-fake";
 
@@ -26,7 +27,7 @@ const prRuleset = (id: number, include: string[], bypass: { actor_id: number; ac
   bypass_actors: bypass,
   rules: [{ type: "non_fast_forward" }],
 });
-const withRuleset = (r: Routes, rs: ReturnType<typeof prRuleset>) => {
+const withRuleset = (r: Routes, rs: Omit<ReturnType<typeof prRuleset>, "rules"> & { rules: { type: string }[] }) => {
   r[`${T}/rulesets`] = [...(r[`${T}/rulesets`] as { id: number }[]), { id: rs.id }];
   r[`${T}/rulesets/${rs.id}`] = rs;
   return r;
@@ -97,6 +98,33 @@ describe("T13: force updates of PR branches", () => {
     r[`${T}/branches/feat/a/protection`] = new GitHubError("server", 502, "Bad gateway");
     const f = await audit(r, linear());
     expect(f.find((x) => x.status === "SKIPPED")?.inconclusive).toBe(true);
+  });
+
+  test("a branch protected by rulesets alone is not classic protection: nothing to read, with or without admin", async () => {
+    for (const admin of [true, false]) {
+      const r = withPrs(world(), [openPr(1, "feat/a")]);
+      (r[T] as { permissions: { admin: boolean } }).permissions.admin = admin;
+      r[`${T}/branches/feat/a`] = { protected: true, protection: { enabled: false } };
+      r[`${T}/branches/feat/a/protection`] = new GitHubError("server", 502, "must not be read");
+      const f = await audit(r, linear());
+      expect(f.filter((x) => x.message.startsWith("feat/a"))).toEqual([]);
+    }
+  });
+
+  test("every rule that refuses a forced update counts, as at admission; bypass still clears it", async () => {
+    for (const type of ["non_fast_forward", ...BLOCKS_DIRECT_UPDATE]) {
+      const on = (bypass: Parameters<typeof prRuleset>[2]) => withRuleset(withPrs(world(), [openPr(1, "feat/a")]), { ...prRuleset(60, ["refs/heads/feat/**"], bypass), rules: [{ type }] });
+      expect(lines(await audit(on([]), linear()))).toEqual([`FAIL ruleset "pr-branches-60" has ${type} on open PR branch(es) feat/a, and the queue App may not bypass it: their linear landing would be refused`]);
+      expect(statuses(await audit(on([{ ...app(QUEUE_APP), bypass_mode: "always" }]), linear()))).toEqual(["PASS"]);
+    }
+  });
+
+  test("rules the landing satisfies or never meets do not count; required signatures on a PR branch count only for unsigned author commits", async () => {
+    const quiet = withRuleset(withPrs(world(), [openPr(1, "feat/a")]), { ...prRuleset(60, ["refs/heads/feat/**"]), rules: [{ type: "deletion" }, { type: "required_linear_history" }, { type: "commit_message_pattern" }] });
+    expect(statuses(await audit(quiet, linear()))).toEqual(["PASS"]);
+    const signed = () => withRuleset(withPrs(world(), [openPr(1, "feat/a")]), { ...prRuleset(60, ["refs/heads/feat/**"]), rules: [{ type: "required_signatures" }] });
+    expect(statuses(await audit(signed(), linear("app")))).toEqual(["PASS"]);
+    expect(lines(await audit(signed(), linear("author")))).toContain('FAIL ruleset "pr-branches-60" has required_signatures on open PR branch(es) feat/a, and the queue App may not bypass it: their linear landing would be refused');
   });
 
   test("the open PR list unreadable: SKIPPED and inconclusive; the patterns are still checked", async () => {

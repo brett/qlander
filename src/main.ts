@@ -22,7 +22,7 @@
 // Every repo, branch and label comes from qlander.yml (Config.names).
 // Each job refuses to start if it can see the other App's token (DESIGN.md §12.1).
 
-import { readFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { type Config, defaultComments, defaultConfig, defaultHooks, defaultNotify, epochBranchFor, type Names } from "./config";
 import type { AssignOn } from "./github/http";
 import type { TargetApi, StateRefApi, StateRepoApi } from "./github/api";
@@ -251,6 +251,11 @@ export async function runReleaseDry(
   return releaseDryRun({ ...(await connect(env)), cfg });
 }
 
+/** What the rendered workflow's later steps read from this tick: only the request for a Contents: write token. */
+export function writeTickOutputs(result: object, env: Env): void {
+  if ("needsContentsWrite" in result && result.needsContentsWrite === true && env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, "needs-contents-write=true\n");
+}
+
 /**
  * One tick of `job` for this execution, as the tick workflow runs it
  * (`bun src/cli.ts tick queue|release`): the event payload from
@@ -266,6 +271,7 @@ export async function runTickJob(job: "queue" | "release", env: Env = process.en
     const result =
       job === "queue" ? await runDry(env, payload) : isReleaseLive(env) ? await runRelease(env, payload) : await runReleaseDry(env, payload);
     console.log(JSON.stringify(result, null, 1));
+    writeTickOutputs(result, env);
   }
 }
 

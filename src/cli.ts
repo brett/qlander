@@ -49,7 +49,7 @@ import { dirname, join, resolve } from "node:path";
 import pkg from "../package.json" with { type: "json" };
 import { CONFIG_PATH, ConfigError, type LoadedConfig, loadConfig, useConfigFile } from "./config/load";
 import { CONTROL_USAGE, isControlCommand } from "./control-usage";
-import { firstDifference, RenderError, renderWorkflows } from "./render";
+import { firstDifference, HAND_WORKFLOWS, RenderError, renderWorkflows, withBundleDownload } from "./render";
 
 export const USAGE = [
   "usage: bun src/cli.ts <command>",
@@ -147,7 +147,20 @@ function render(args: string[], io: Io): number {
     return 1;
   }
   const root = dirname(config);
-  if (!flags.has("--check")) {
+  const check = flags.has("--check");
+  // Only their download is rendered, and they may be hand-edited: --check says so, and never fails an install over them.
+  for (const path of c.bundle ? HAND_WORKFLOWS : []) {
+    const have = io.read(join(root, path));
+    if (have === null) continue;
+    const want = withBundleDownload(have, c.bundle!);
+    if (want === have) continue;
+    if (check) io.out(`${path}: its qlander download differs from bundle; run render to update it`);
+    else {
+      io.write(join(root, path), want);
+      io.out(`updated the qlander download in ${path}`);
+    }
+  }
+  if (!check) {
     for (const f of files) {
       io.write(join(root, f.path), f.text);
       io.out(`wrote ${f.path}`);

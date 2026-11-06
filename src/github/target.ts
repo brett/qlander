@@ -7,6 +7,7 @@
 import type { CheckRun, IssueComment, Job, Run } from "../types";
 import type { Names } from "../config";
 import { refsOverlap } from "../config/runner";
+import { classicProtection } from "../force-update";
 import { EVENT_TYPE_RE } from "../hooks";
 import { BRANCH_NAME_RE, isBuildRef, isCommandLabel, isForbiddenHeadRef, isGitBranchName, isQlanderBranch, isPrNumber, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../validate";
 import type { Account, CommitAuthor, TargetApi, Commit, Compare, LabelEvent, Listed, MergeResult, PullRequest, RefActivity, RefUpdate, Review, Status, StatusEntry } from "./api";
@@ -263,7 +264,7 @@ export class TargetClient implements TargetApi {
 
   async branchProtected(branch: string): Promise<boolean> {
     try {
-      return (await this.http.request<{ protected?: unknown }>("GET", `${this.path}/branches/${this.branchPath(branch)}`)).json.protected === true;
+      return classicProtection((await this.http.request<{ protected?: unknown; protection?: { enabled?: unknown } }>("GET", `${this.path}/branches/${this.branchPath(branch)}`)).json);
     } catch (e) {
       if (e instanceof GitHubError && e.kind === "not_found") return false;
       throw e;

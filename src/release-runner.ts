@@ -40,7 +40,7 @@ import { DispatchTick, dispatchOnly, describeDispatch } from "./release-dispatch
 import type { Executor } from "./state";
 import { isTransient as isTransientError, openOnce, pauseReason } from "./outbox";
 export type { ReleaseOutcome } from "./release-tick";
-import { CorruptStateError, inspectState, LeaseHeldError, LostLockError, StateStore, upsertMirror } from "./store";
+import { CorruptStateError, inspectState, LeaseHeldError, LostLockError, StateStore, upsertMirror, VoidNeedsWriteError } from "./store";
 import { isSha } from "./validate";
 
 /** The release job keeps no count of GitHub's generic GraphQL error (src/queue.ts does), so here it stays a hard failure. */
@@ -64,6 +64,8 @@ export interface ReleaseResult {
   outcome: ReleaseOutcome;
   log: string[];
   decision: ReleaseDecision | null;
+  /** The recorded epoch branch needs voiding and this token can't: tick.yml runs the tick again with Contents: write. */
+  needsContentsWrite?: true;
 }
 
 /** main's first-parent chain, newest first, within the listed commits of release...main. */
@@ -251,7 +253,7 @@ export async function releaseTick(d: ReleaseDeps): Promise<ReleaseResult> {
       await openOnce(d.repo, d.cfg.names.releaseLabels.pause, "release:corrupt-state", "qlander release paused: corrupt state", e.message);
       return { outcome: "paused", log: [e.message], decision: null };
     }
-    if (e instanceof LeaseHeldError) return { outcome: "busy", log: [e.message], decision: null };
+    if (e instanceof LeaseHeldError) return { outcome: "busy", log: [e.message], decision: null, ...(e instanceof VoidNeedsWriteError ? { needsContentsWrite: true as const } : {}) };
     if (isTransient(e)) return { outcome: "retry-later", log: [String(e)], decision: null };
     throw e;
   }

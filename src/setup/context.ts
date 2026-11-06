@@ -5,7 +5,7 @@
 
 import type { LoadedConfig } from "../config/load";
 import { GitHubError } from "../github/http";
-import type { App, Installation, SetupApi } from "./client";
+import type { App, Installation, Ruleset, SetupApi } from "./client";
 import { type AppSpec, appSpecs, full, type Permissions, type Repo, type Role, type RulesetSpec } from "./expected";
 import { appJwt } from "./jwt";
 import type { AppRecord, KeyStore } from "./keys";
@@ -207,7 +207,7 @@ export class Ctx {
     const found = (await this.d.api.rulesets(spec.repo)).filter((r) => r.name === spec.name);
     if (found.length > 1) this.fail(`${where}: ${found.length} rulesets have this name; delete all but one`);
     if (found.length === 0) {
-      await this.change(`${where}: create it`, () => this.d.api.createRuleset(spec.repo, rulesetBody(spec, null, appIds)));
+      await this.change(`${where}: create it`, () => this.writeRuleset(where, spec, null, () => this.d.api.createRuleset(spec.repo, rulesetBody(spec, null, appIds))));
       return;
     }
     const have = await this.d.api.ruleset(spec.repo, found[0]!.id);
@@ -217,6 +217,17 @@ export class Ctx {
       return;
     }
     for (const line of diff) this.d.out(`        ${line}`);
-    await this.change(`${where}: update it`, () => this.d.api.updateRuleset(spec.repo, have.id, rulesetBody(spec, have, appIds)));
+    await this.change(`${where}: update it`, () => this.writeRuleset(where, spec, have, () => this.d.api.updateRuleset(spec.repo, have.id, rulesetBody(spec, have, appIds))));
+  }
+
+  /** GitHub's 422 for a bypass actor it rejects names nothing, so say which ids this write adds and what to check. */
+  private async writeRuleset(where: string, spec: RulesetSpec, have: Ruleset | null, write: () => Promise<void>): Promise<void> {
+    try {
+      await write();
+    } catch (e) {
+      const added = (spec.apps ?? []).filter((id) => !have?.bypass_actors.some((a) => a.actor_type === "Integration" && a.actor_id === id));
+      if (!(e instanceof GitHubError && e.kind === "validation") || !added.length) throw e;
+      this.fail(`${where}: GitHub refused it (${e.message}). It does not say why; the likely cause is release.dispatch.promoterApps (${added.join(", ")}). Check that each is the App ID from the App's settings page, not its client id or an installation id, and that the App exists and is installed on ${full(spec.repo)}`);
+    }
   }
 }

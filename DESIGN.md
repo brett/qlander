@@ -396,6 +396,8 @@ A skipped or cancelled required job is never green.
 2. the attempt is older than `queuedHours` and no job is `in_progress`: cause `starved`;
 3. the attempt is older than `queuedHours` plus `inProgressMinutes`, whatever its jobs show: cause `timeout`. This hard cap means no run, however its jobs come and go, can hold the queue for longer.
 
+GitHub can report a run `completed` while its job list still shows a job `queued` or `in_progress`, even with that job's conclusion and `completed_at` already set. Such a job is never a pass, whatever its conclusion says (a `failure` or `timed_out` conclusion is red at once, as above), so the batch waits. The same three limits bound the wait: past one, there is nothing left to cancel, and classification returns `config`, which pauses and puts the batch back with its PRs still ready.
+
 A run qlander has cancelled is not timed again, but cancellation is a request: `always()` jobs can keep it open. If a cancelled attempt is still not `completed` once it is older than the hard cap plus `rerunBarrierMinutes`, classification returns `config`, which pauses and abandons the batch.
 
 ## 7. Build, sign check, land, verify

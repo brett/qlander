@@ -14,7 +14,7 @@ import { cfg, job, HUMAN, LANE, OTHER_LANE, REVIEW_WORKFLOW } from "./sim";
 import type { Hook } from "../src/hooks";
 import type { CommentSettings } from "../src/config/load";
 
-export type CiOutcome = "pass" | "fail" | "skip" | "cancel" | "hang" | "starve" | "cancelAggregate" | "failCancelAggregate";
+export type CiOutcome = "pass" | "fail" | "skip" | "cancel" | "hang" | "starve" | "cancelAggregate" | "failCancelAggregate" | "stale";
 export interface BatchCi {
   n: number;
   prs: number[];
@@ -144,6 +144,10 @@ export class World {
       Object.assign(test, { status: "in_progress", conclusion: null, started_at: "2026-10-01T00:00:00Z" });
       status = "in_progress";
       conclusion = null;
+    }
+    if (outcome === "stale") {
+      // What GitHub has returned: the run completed and succeeded, but one job still says in_progress, with its conclusion and completed_at set.
+      Object.assign(test, { status: "in_progress", completed_at: "2026-10-21T10:40:00Z" });
     }
     if (outcome === "starve") {
       // A target on a saturated CI host: the quick jobs ran, a lane waits for a runner.

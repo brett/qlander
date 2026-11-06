@@ -111,6 +111,21 @@ describe("runner: the design's worked cases", () => {
     expect(w.mainHistory).toHaveLength(1);
   });
 
+  test("a completed run whose job still says in_progress never lands, and pauses past the time limit instead of waiting forever", async () => {
+    const w = new World(() => "stale");
+    w.readyPr(1);
+    await w.runUntilIdle(); // 80 ticks, 10 minutes apart: past the 150-minute limit
+    expect(w.landed()).toEqual([]);
+    expect(w.mainHistory).toHaveLength(1);
+    expect(w.paused()).toBe(true);
+    expect(w.pauseReasons()[0]).toContain("configuration problem");
+    const pause = w.repo.issues.find((i) => i.labels.includes(w.config.names.controlLabels.pause))!;
+    expect(pause.body).toContain(`job '${LANE}' still shows in_progress past its time limit`);
+    // Put back, not bounced: the PR keeps ready and its place, to be retested once the pause is closed.
+    expect(w.target.prs.get(1)!.pr.labels).toContain(w.config.names.labels.ready);
+    expect(w.state().pending.flatMap((p) => p.prs)).toEqual([1]);
+  });
+
   test("a cancelled job is never green: one rerun, then a pause", async () => {
     const w = new World(() => "cancel");
     w.readyPr(1);

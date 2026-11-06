@@ -291,3 +291,72 @@ describe("time limits exclude time spent waiting for a runner", () => {
     expect(stuck.kind).toBe("config");
   });
 });
+
+// GitHub has reported a job as `in_progress` with its conclusion and
+// completed_at already set, in a run it reports `completed`. A status that is
+// not `completed` is never trusted for a pass, so such a job keeps the batch
+// pending, but only for the time limits a running job gets: past them it is a
+// configuration problem (there is nothing left to cancel), which pauses.
+describe("a completed run whose job list still shows a job running", () => {
+  const at = (d: number, h: number, m = 0) => `2026-10-${d}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00Z`;
+  // The shape GitHub returned: the run completed and succeeded, the job still says in_progress.
+  const doneRun = (over: Partial<Run> = {}) => ciRun({ status: "completed", conclusion: "success", created_at: at(21, 10), ...over });
+  const staleJob = (conclusion: string | null = "success", status = "in_progress"): Job => ({
+    ...job("Test", conclusion, status, at(21, 10, 1)),
+    completed_at: at(21, 10, 40),
+    run_attempt: 1,
+  });
+  const ci = (j: Job) => [job("Build", "success", "completed", at(21, 10, 1)), j, job("pr-gate", "skipped")];
+
+  test("24 hours later it is not still pending: it is config, naming the job", () => {
+    const c = classify(input([doneRun(), scanRun()], { "100": ci(staleJob()), "200": okScan }, { now: new Date(at(22, 10, 1)), builtAt: at(21, 10) }));
+    expect(c.kind).toBe("config");
+    if (c.kind === "config") expect(c.reason).toBe("CI run 100 completed, but job 'Test' still shows in_progress past its time limit");
+  });
+
+  test("within the in-progress limit it waits, and its success conclusion is never green", () => {
+    const c = classify(input([doneRun(), scanRun()], { "100": ci(staleJob()), "200": okScan }, { now: new Date(at(21, 12, 30)), builtAt: at(21, 10) }));
+    expect(c.kind).toBe("pending");
+  });
+
+  test("the limit is the job's own: past inProgressMinutes from its started_at", () => {
+    const run = (m: number) => classify(input([doneRun(), scanRun()], { "100": ci(staleJob()), "200": okScan }, { now: new Date(at(21, 12, m)), builtAt: at(21, 10) }));
+    expect(run(31).kind).toBe("pending"); // 150 minutes after 10:01
+    expect(run(32).kind).toBe("config");
+  });
+
+  test("a failure conclusion on such a job is red at once, without waiting", () => {
+    const c = classify(input([doneRun({ conclusion: "failure" }), scanRun()], { "100": ci(staleJob("failure")), "200": okScan }, { now: new Date(at(21, 10, 45)), builtAt: at(21, 10) }));
+    expect(c.kind).toBe("red");
+  });
+
+  test("a job still queued in a completed run is bounded by queuedHours (nothing running)", () => {
+    const queued = { ...staleJob(null, "queued"), started_at: null, completed_at: null };
+    const at6h = (m: number) => classify(input([doneRun(), scanRun()], { "100": ci(queued), "200": okScan }, { now: new Date(at(21, 16, m)), builtAt: at(21, 10) }));
+    expect(at6h(0).kind).toBe("pending");
+    expect(at6h(1)).toMatchObject({ kind: "config", reason: "CI run 100 completed, but job 'Test' still shows queued past its time limit" });
+  });
+
+  test("whatever its jobs show, a completed run's stale job is bounded by queuedHours + inProgressMinutes", () => {
+    // A job restarted at 18:00 is under its own limit and is in_progress, so only the hard cap (18:30) applies.
+    const restarted = { ...staleJob(), started_at: at(21, 18) };
+    const run = (h: number, m: number) => classify(input([doneRun(), scanRun()], { "100": ci(restarted), "200": okScan }, { now: new Date(at(21, h, m)), builtAt: at(21, 10) }));
+    expect(run(18, 30).kind).toBe("pending");
+    expect(run(18, 31).kind).toBe("config");
+  });
+
+  test("a run qlander already cancelled for time that then completed this way is not exempt", () => {
+    const cancels = [{ runId: 100, attempt: 1, cause: "timeout" as const }];
+    const c = classify(input([doneRun(), scanRun()], { "100": ci(staleJob()), "200": okScan }, { now: new Date(at(22, 10, 1)), builtAt: at(21, 10), cancels }));
+    expect(c.kind).toBe("config");
+  });
+
+  test("a long job in a run still in progress keeps the existing timeout (cancel, then infra)", () => {
+    const running = ciRun({ status: "in_progress", conclusion: null, created_at: at(21, 10) });
+    const jobs = ci({ ...staleJob(null), completed_at: null });
+    const ok = classify(input([running, scanRun()], { "100": jobs, "200": okScan }, { now: new Date(at(21, 12, 30)), builtAt: at(21, 10) }));
+    expect(ok.kind).toBe("pending");
+    const late = classify(input([running, scanRun()], { "100": jobs, "200": okScan }, { now: new Date(at(21, 12, 32)), builtAt: at(21, 10) }));
+    expect(late).toMatchObject({ kind: "timeout", cause: "timeout" });
+  });
+});

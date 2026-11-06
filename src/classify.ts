@@ -53,9 +53,15 @@ const INFRA = new Set(["cancelled", "action_required", "stale", "neutral"]);
 //   2. starved: the attempt is older than queuedHours and no job is running;
 //   3. timeout: the attempt is older than queuedHours + inProgressMinutes,
 //      whatever its jobs show, so no run can hold the queue forever.
+// The same limits bound a completed run whose job list still shows a job
+// running (see classify).
 function overdue(i: ClassifyInput, run: Run | undefined, jobs: Job[] | undefined): "timeout" | "starved" | null {
   if (!run || run.status === "completed") return null;
   if (i.cancels.some((c) => c.runId === run.id && c.attempt === run.run_attempt)) return null;
+  return pastLimit(i, run, jobs);
+}
+
+function pastLimit(i: ClassifyInput, run: Run, jobs: Job[] | undefined): "timeout" | "starved" | null {
   const running = (jobs ?? []).filter((j) => j.status === "in_progress");
   const starts = running.map((j) => j.started_at).filter((s): s is string => s !== null && !Number.isNaN(Date.parse(s)));
   if (starts.some((s) => minutes(i.now, s) > i.limits.inProgressMinutes)) return "timeout";
@@ -220,6 +226,17 @@ export function classify(i: ClassifyInput): CiClass {
       ? { kind: "red", policy: true, failedRuns: [], failedJobs: [], reason: shape.join("; ") }
       : { kind: "config", reason: shape.join("; ") };
   }
+
+  // A completed run whose job list still shows a job queued or in_progress
+  // (GitHub has returned this with the job's conclusion and completed_at
+  // already set). A job that is not completed never counts as a pass, and
+  // there is nothing left to cancel, so past the time limits a running job
+  // gets it is a configuration problem, which pauses and puts the batch back.
+  const stuck = done.flatMap(({ wf, run, jobs }) => {
+    const j = (jobs ?? []).find((x) => x.status !== "completed");
+    return j && pastLimit(i, run!, jobs) ? [`${wf.name} run ${run!.id} completed, but job '${j.name}' still shows ${j.status} past its time limit`] : [];
+  });
+  if (stuck.length > 0) return { kind: "config", reason: stuck.join("; ") };
 
   const waiting = perWf.filter(
     ({ wf, run, jobs }) =>

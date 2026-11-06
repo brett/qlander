@@ -404,7 +404,7 @@
       }
     },
     "release": {
-      "description": "Release advance: fast-forward the target's release branch to qualified main commits. A separate job, with its own App, lease, state branch and pause. Not policy, except branch, stateBranch and labels.",
+      "description": "Release advance: move the target's release branch to qualified main commits, by fast-forwarding it (mode advance) or by dispatching the target's own release workflow (mode dispatch). A separate job, with its own App, lease, state branch and pause. Not policy, except branch, stateBranch and labels.",
       "type": "object",
       "additionalProperties": false,
       "required": ["branch", "stateBranch", "labels", "dryRun", "maxCandidates", "historyLimit", "qualification"],
@@ -503,6 +503,102 @@
                   "examples": ["actions-run"]
                 },
                 "proof": { "description": "Also require a proof run, as for the manifest provider.", "$ref": "#/$defs/proofRun" }
+              }
+            }
+          }
+        },
+        "mode": {
+          "description": "advance: the release job fast-forwards release itself. dispatch: it never writes release; it dispatches the target's own release workflow, first as a dry run and then, once an approver approves that exact sha, for real, and counts release as advanced only when it sees the ref there.",
+          "enum": ["advance", "dispatch"],
+          "default": "advance",
+          "examples": ["dispatch"]
+        },
+        "dispatch": {
+          "description": "The dispatch mode's settings. Required when mode is dispatch, refused otherwise.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["workflow", "inputs", "approvers"],
+          "properties": {
+            "workflow": {
+              "description": "The target workflow that promotes a commit and moves release itself. It must have a workflow_dispatch trigger with the three inputs below, and a run-name that contains the dispatch id input.",
+              "$ref": "#/$defs/workflowPath",
+              "examples": [".github/workflows/promote.yml"]
+            },
+            "ref": {
+              "description": "The branch the workflow is dispatched on, whose copy of the workflow file runs: the target's main or release.branch. Absent: the target's main.",
+              "$ref": "#/$defs/branch",
+              "examples": ["main"]
+            },
+            "inputs": {
+              "description": "The workflow_dispatch input names qlander sets.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["sha", "dryRun", "dispatchId"],
+              "properties": {
+                "sha": { "description": "Gets the candidate commit's full sha.", "$ref": "#/$defs/inputName", "examples": ["sha"] },
+                "dryRun": { "description": "Gets \"true\" for the dry run and \"false\" for the real one.", "$ref": "#/$defs/inputName", "examples": ["dry_run"] },
+                "dispatchId": {
+                  "description": "Gets a unique id per dispatch. The workflow's run-name must contain it, which is how qlander finds the run it started.",
+                  "$ref": "#/$defs/inputName",
+                  "examples": ["dispatch_id"]
+                }
+              }
+            },
+            "approvers": {
+              "description": "Accounts whose /qlander approve-release comment on the status issue counts. Login and id must both match. Keep these to people.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["login", "id"],
+                "properties": {
+                  "login": { "description": "The approver's login.", "$ref": "#/$defs/name", "examples": ["alice"] },
+                  "id": { "description": "The approver's account id.", "$ref": "#/$defs/repoId", "examples": [1001] }
+                }
+              }
+            },
+            "dryRunValidMinutes": {
+              "description": "How long a green dry run stays good for its real run. Past it, that commit is not released, and a newer one gets its own dry run.",
+              "$ref": "#/$defs/positive",
+              "default": 1440,
+              "examples": [1440]
+            },
+            "appearMinutes": {
+              "description": "How long after a dispatch its run may take to appear. At least twice runner.cronMinutes.",
+              "$ref": "#/$defs/positive",
+              "default": 30,
+              "examples": [30]
+            },
+            "runHours": { "description": "How long a dispatched run may run before qlander stops waiting for it.", "$ref": "#/$defs/positive", "default": 6, "examples": [6] },
+            "observeMinutes": {
+              "description": "How long after a green real run release may take to reach the commit before a release-blocked issue says it did not.",
+              "$ref": "#/$defs/positive",
+              "default": 60,
+              "examples": [60]
+            },
+            "budget": {
+              "description": "At most window dispatches, dry and real together, in any windowHours. Absent: 8 in 24 hours.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["window", "windowHours"],
+              "properties": {
+                "window": { "description": "Dispatches allowed in the window.", "$ref": "#/$defs/positive", "examples": [8] },
+                "windowHours": { "description": "The window's length in hours.", "$ref": "#/$defs/positive", "examples": [24] }
+              }
+            },
+            "freeze": {
+              "description": "Target repository variables that stop new dispatches while any of them equals its value. A variable that cannot be read counts as frozen. Needs Variables: read on the release App.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["variable", "value"],
+                "properties": {
+                  "variable": { "description": "The repository variable's name.", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,99}$", "examples": ["RELEASE_FREEZE"] },
+                  "value": { "description": "The value that means frozen, compared exactly.", "type": "string", "examples": ["true"] }
+                }
               }
             }
           }
@@ -684,6 +780,7 @@
       }
     },
     "workflowPath": { "description": "A workflow file under .github/workflows/.", "type": "string", "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$" },
+    "inputName": { "description": "A workflow_dispatch input name: a letter or _, then letters, digits, _ or -.", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,99}$" },
     "hook": {
       "description": "One hook: the events it sends, and the event_type they are sent as. Not policy.",
       "type": "object",

@@ -23,6 +23,7 @@ Qlander reads one file: `qlander.yml`, at the root of the control repo. Start fr
   - [queue.concurrency](#queueconcurrency)
   - [queue.strategy](#queuestrategy)
   - [queue.strategy.adaptive](#queuestrategyadaptive)
+  - [queue.landing](#queuelanding)
   - [queue.controlLabels](#queuecontrollabels)
   - [queue.admission](#queueadmission)
   - [queue.admission.fastLane](#queueadmissionfastlane)
@@ -189,6 +190,7 @@ The merge queue: what admits a PR, how batches are built and tested, and the bud
 | `queue.priority` | mapping | none | Priority lane settings. See [queue.priority](#queuepriority). |
 | `queue.concurrency` | mapping | none | Run more than one batch's CI at a time. See [queue.concurrency](#queueconcurrency). |
 | `queue.strategy` | mapping | none | How a red batch is isolated and how big fresh batches grow. See [queue.strategy](#queuestrategy). |
+| `queue.landing` | mapping | none | How a green batch lands on main. See [queue.landing](#queuelanding). |
 | `queue.controlLabels` | mapping | required | Labels on control-repo issues. See [queue.controlLabels](#queuecontrollabels). |
 | `queue.admission` | mapping | required | What a PR needs, on its current head, before the ready label admits it. See [queue.admission](#queueadmission). |
 | `queue.policy` | mapping | required | The CI-policy boundary: which changes land alone, with an approval bound to their SHA from an account listed in approvers. See [queue.policy](#queuepolicy). |
@@ -311,6 +313,22 @@ queue:
     adaptive:
       greens: 2
       ceiling: 16
+```
+
+### `queue.landing`
+
+How a green batch lands on main. Absent: merge mode, one merge commit per PR. Policy.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `queue.landing.mode` | string | `merge` | merge: each PR lands as a merge commit, and main fast-forwards to the tested queue commit. linear: each PR lands as one squashed commit on a linear stack, and the one atomic update that moves main also force-moves each PR's head branch, from its admitted head, to its own commit, so GitHub marks it merged. For repos that require linear history. See DESIGN.md §7.4. Values: `merge`, `linear`. |
+| `queue.landing.body` | string | `Squashed from #{number} at {head}.\n\nLanded-by: qlander batch {batch}` | linear mode only: the body of each squashed commit, below the subject `<PR title> (#<number>)`. Placeholders: {number}, {head} (the admitted head SHA) and {batch}. A \n in a double-quoted string is a line break. |
+
+```yaml
+queue:
+  landing:
+    mode: linear
+    body: "Squashed from #{number} at {head}.\\n\\nLanded-by: qlander batch {batch}"
 ```
 
 ### `queue.controlLabels`

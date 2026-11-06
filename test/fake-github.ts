@@ -7,7 +7,7 @@ import type { Account, TargetApi, Commit, Compare, RefActivity, RefUpdate, Label
 import { GitHubError } from "../src/github/http";
 import type { CheckRun, IssueComment, Job, Run } from "../src/types";
 import type { Names } from "../src/config";
-import { isBuildRef, isCommandLabel, isForbiddenHeadRef, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../src/validate";
+import { isBuildRef, isCommandLabel, isForbiddenHeadRef, isGitBranchName, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../src/validate";
 import { APPROVERS, HUMAN, NAMES, sha } from "./sim";
 
 export interface FakePr {
@@ -250,8 +250,15 @@ export class FakeTarget implements TargetApi {
 
   // ------------------------------------------------------------ TargetApi: reads
 
+  /** The next `reads` reads of main return `value`: a replica that has not seen the latest write. */
+  staleMain: { value: string; reads: number } | null = null;
+
   async getRef(branch: string) {
     this.log(`getRef ${branch}`);
+    if (branch === this.names.main && this.staleMain && this.staleMain.reads > 0) {
+      this.staleMain.reads--;
+      return this.staleMain.value;
+    }
     return this.refs.get(branch) ?? null;
   }
   async listRefs(prefix: string) {
@@ -264,7 +271,7 @@ export class FakeTarget implements TargetApi {
     return tree ? { ...c, tree } : c;
   }
   async getPrBranch(branch: string) {
-    if (isForbiddenHeadRef(this.names, branch)) throw new GitHubError("validation", null, `'${branch}' is reserved`);
+    if (!isGitBranchName(branch) || isForbiddenHeadRef(this.names, branch)) throw new GitHubError("validation", null, `'${branch}' is reserved or not a branch name`);
     this.log(`getPrBranch ${branch}`);
     return this.prOnBranch(branch)?.pr.head.sha ?? null;
   }
@@ -547,7 +554,7 @@ export class FakeTarget implements TargetApi {
     if (main.branch !== this.names.main || heads.length === 0) throw new GitHubError("validation", null, "bad landStack");
     const all = [main, ...heads];
     if (all.some((u) => !isRealSha(u.before) || !isRealSha(u.after) || u.before === u.after)) throw new GitHubError("validation", null, "bad oids");
-    if (heads.some((h) => isForbiddenHeadRef(this.names, h.branch) || h.branch === this.epochBranch)) throw new GitHubError("validation", null, "reserved branch");
+    if (heads.some((h) => !isGitBranchName(h.branch) || isForbiddenHeadRef(this.names, h.branch) || h.branch === this.epochBranch)) throw new GitHubError("validation", null, "reserved branch");
     if (new Set(all.map((u) => u.branch)).size !== all.length) throw new GitHubError("validation", null, "a branch twice");
     if ((epoch === null) !== (this.epochBranch === null)) throw new GitHubError("validation", null, "epoch mismatch");
     this.log(`landStack ${main.before} -> ${main.after} with ${heads.map((h) => h.branch).join(",")}`);

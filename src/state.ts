@@ -5,7 +5,7 @@ import type { Cancel } from "./classify";
 import { type HooksState, hooksStateProblem } from "./hooks";
 import type { FailedJob, RunRef } from "./types";
 import type { Names } from "./config";
-import { BRANCH_NAME_RE, isCommandLabel, isPrNumber, isSha, isWritableRef } from "./validate";
+import { BRANCH_NAME_RE, isCommandLabel, isGitBranchName, isPrNumber, isSha, isWritableRef } from "./validate";
 
 export interface Pin {
   pr: number;
@@ -585,7 +585,7 @@ function checkOp(x: unknown, where: string): string {
       heads.forEach((h, i) => {
         const m = obj(h, `${where}.heads[${i}]`, ["pr", "ref", "before", "after"]);
         pr(m.pr, `${where}.heads[${i}].pr`);
-        if (!BRANCH_NAME_RE.test(str(m.ref, `${where}.heads[${i}].ref`))) fail(`${where}.heads[${i}].ref: bad`);
+        if (!isGitBranchName(str(m.ref, `${where}.heads[${i}].ref`))) fail(`${where}.heads[${i}].ref: bad`);
         sha(m.before, `${where}.heads[${i}].before`);
         sha(m.after, `${where}.heads[${i}].after`);
       });
@@ -820,7 +820,7 @@ export function parseState(json: string, names: Names): State {
   for (const [k, v] of Object.entries(auth)) {
     if (!/^[1-9][0-9]{0,7}$/.test(k)) fail(`auth: bad key ${k}`);
     const a = obj(v, `auth.${k}`, ["head", "baseRepoId", "policy", "policyPr", "admittedAt", "labelledAt", "evidence", "reviewRun"], ["author", "waiver", "priority", "headRef"]);
-    if (a.headRef !== undefined && !BRANCH_NAME_RE.test(str(a.headRef, `auth.${k}.headRef`))) fail(`auth.${k}.headRef: bad`);
+    if (a.headRef !== undefined && !isGitBranchName(str(a.headRef, `auth.${k}.headRef`))) fail(`auth.${k}.headRef: bad`);
     if (a.author !== undefined) str(a.author, `auth.${k}.author`);
     if (a.priority !== undefined) {
       const p = obj(a.priority, `auth.${k}.priority`, ["by", "at"]);

@@ -8,7 +8,7 @@ import type { CheckRun, IssueComment, Job, Run } from "../types";
 import type { Names } from "../config";
 import { refsOverlap } from "../config/runner";
 import { EVENT_TYPE_RE } from "../hooks";
-import { BRANCH_NAME_RE, isBuildRef, isCommandLabel, isForbiddenHeadRef, isQlanderBranch, isPrNumber, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../validate";
+import { BRANCH_NAME_RE, isBuildRef, isCommandLabel, isForbiddenHeadRef, isGitBranchName, isQlanderBranch, isPrNumber, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../validate";
 import type { Account, TargetApi, Commit, Compare, LabelEvent, Listed, MergeResult, PullRequest, RefActivity, RefUpdate, Review, Status, StatusEntry } from "./api";
 
 /** git's empty tree: every epoch commit has it (docs/deployment.md §3.4). */
@@ -195,7 +195,7 @@ export class TargetClient implements TargetApi {
    * prefixes) or the epoch branch.
    */
   private prBranch(b: string): string {
-    if (!BRANCH_NAME_RE.test(b) || b.length > 255 || b.split("/").some((c) => c.endsWith(".lock"))) bad(`bad branch name ${b}`);
+    if (!isGitBranchName(b)) bad(`bad branch name ${JSON.stringify(b)}`);
     if (isForbiddenHeadRef(this.names, b) || isQlanderBranch(this.names, b)) bad(`'${b}' is reserved, never a PR head qlander moves`);
     if (this.epochBranch !== null && refsOverlap(b, this.epochBranch)) bad(`'${b}' overlaps the epoch branch`);
     return b;
@@ -203,7 +203,9 @@ export class TargetClient implements TargetApi {
 
   async getPrBranch(branch: string): Promise<string | null> {
     try {
-      const r = await this.http.request<{ object: { sha: string } }>("GET", `${this.path}/git/ref/heads/${this.prBranch(branch)}`);
+      // Each component encoded: git allows `#`, `%` and `+` in a branch name, which a URL path does not take as they are.
+      const path = this.prBranch(branch).split("/").map(encodeURIComponent).join("/");
+      const r = await this.http.request<{ object: { sha: string } }>("GET", `${this.path}/git/ref/heads/${path}`);
       return sha(r.json.object.sha, `ref ${branch}`);
     } catch (e) {
       if (e instanceof GitHubError && e.kind === "not_found") return null;

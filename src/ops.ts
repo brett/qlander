@@ -37,6 +37,8 @@ export type OpResult =
   | { kind: "landRejected"; retry: boolean; reason: string }
   /** Linear landing (DESIGN.md §7.4): refused because these PRs' branches moved since admission; nothing moved. */
   | { kind: "headMoved"; prs: number[] }
+  /** Linear landing (DESIGN.md §7.4): reads disagree on whether it applied. The journal stays; `overdue` also pauses. */
+  | { kind: "landUnsettled"; overdue: boolean; reason: string }
   | { kind: "baseMoved" }
   | { kind: "cancelled" }
   | { kind: "retryOp" };
@@ -118,6 +120,11 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
     return withEvents(c, { state: s, log: [...c.log, line] });
   };
   if (result.kind === "retryOp") return { state: s, log: [`retry ${op.kind}`] };
+  if (result.kind === "landUnsettled" && op.kind === "land") {
+    // Never terminal: the journal stays, so the next tick observes again, paused or not.
+    if (result.overdue) pause(c, `batch ${s.active?.n ?? "?"}: ${result.reason}`);
+    return withEvents(c, { state: s, log: [...c.log, `landing unsettled: ${result.reason}`] });
+  }
 
   if (op.kind === "build") {
     const rec = j.checkpoint;
@@ -337,21 +344,30 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
 }
 
 /**
- * Linear landing (DESIGN.md §7.4), with main still at its base after the
- * update failed or its outcome was lost: GitHub applies the update atomically,
- * so no PR branch may be at its stack commit. One that is means the promise
- * was broken: pause, and say which branches to restore. A branch at anything
- * else than its admitted head was pushed to: the update was refused for it,
- * and the next tick drops it. Null: every branch is untouched.
+ * Linear landing (DESIGN.md §7.4), with main reading at its base after the
+ * update failed or its outcome was lost. GitHub applies the update
+ * atomically, so a PR branch at its stack commit means the update applied and
+ * the main read lags, or (never expected) GitHub broke its promise. Reads
+ * cannot tell these apart, so that is never terminal: the journal stays and
+ * later reads settle it (`landUnsettled`); past `reconcileMinutes` it also
+ * pauses, still keeping the journal, naming the branches. A branch at
+ * anything but its admitted head and its stack commit was pushed to: the
+ * update was refused for it, and the next tick drops it. Null: every branch
+ * is untouched.
  */
-export function headsVerdict(heads: Extract<Op, { kind: "land" }>["heads"], now: Record<string, string | null> | undefined): OpResult | null {
+export function headsVerdict(
+  heads: Extract<Op, { kind: "land" }>["heads"],
+  now: Record<string, string | null> | undefined,
+  timing: { since: string; now: Date; reconcileMinutes: number },
+): OpResult | null {
   if (!heads || !now) return null;
   const half = heads.filter((h) => now[String(h.pr)] === h.after);
   if (half.length > 0) {
+    const overdue = timing.now.getTime() - Date.parse(timing.since) >= timing.reconcileMinutes * 60_000;
     return {
-      kind: "landRejected",
-      retry: false,
-      reason: `the linear landing moved ${half.map((h) => `${h.ref} (#${h.pr}) to ${h.after}`).join(", ")} but not main, which GitHub's atomic updateRefs should never do; restore ${half.length > 1 ? "each branch to its admitted head" : `it to ${half[0]!.before}`} (${half.map((h) => `#${h.pr}: ${h.before}`).join(", ")}) before resuming`,
+      kind: "landUnsettled",
+      overdue,
+      reason: `the linear landing's PR branches ${half.map((h) => `${h.ref} (#${h.pr})`).join(", ")} read at their stack commits while main still reads at its base. Either main's read lags (the landing applied, and the next read settles it) or GitHub applied only part of an atomic update. If main still does not move, restore ${half.map((h) => `#${h.pr} to ${h.before}`).join(", ")} before resuming; the journal is kept, so a landing that did apply is still recorded`,
     };
   }
   const moved = heads.filter((h) => now[String(h.pr)] !== h.before).map((h) => h.pr);
@@ -435,7 +451,7 @@ export function interpretObservation(
     }
     case "land":
       if (o.afterReachable === true) return { kind: "landed" };
-      if (o.main === op.before) return headsVerdict(op.heads, o.heads) ?? { kind: "landRejected", retry: true, reason: "not applied" };
+      if (o.main === op.before) return headsVerdict(op.heads, o.heads, { since: j.at, now: timing?.now ?? new Date(0), reconcileMinutes: timing?.reconcileMinutes ?? 0 }) ?? { kind: "landRejected", retry: true, reason: "not applied" };
       return { kind: "baseMoved" };
     case "cancel":
       return { kind: "retryOp" };

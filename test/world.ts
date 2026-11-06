@@ -116,18 +116,21 @@ export class World {
     return out;
   }
 
-  /** Linear landing: the PRs a stack holds, one per stack commit, by the change each commit adds to its parent's tree. */
+  /**
+   * Linear landing: the PRs a stack holds, from the build's own record (the
+   * checkpoint's survivors, persisted before the queue ref is pushed), never
+   * guessed from trees: a PR based on another's branch adds both heads' changes.
+   */
+  private stacks = new Map<string, number[]>();
   stackPrs(sha: string): number[] {
-    const out: number[] = [];
-    let cur = sha;
-    while (this.target.created.has(cur)) {
-      const parent = this.target.commits.get(cur)!.parents[0]!;
-      const added = [...this.target.content.get(cur)!].filter((x) => !this.target.content.get(parent)?.has(x));
-      const pr = [...this.target.prs.values()].find((f) => added.includes(f.pr.head.sha));
-      if (pr) out.unshift(pr.pr.number);
-      cur = parent;
+    let prs = this.stacks.get(sha);
+    if (!prs) {
+      const cp = this.stateRef.current ? parseState(this.stateRef.current.text, this.config.names).journal?.checkpoint : null;
+      if (!cp?.stack || cp.chainHead !== sha) throw new Error(`world: no recorded build for stack head ${sha}`);
+      prs = cp.survivors.map((p) => p.pr);
+      this.stacks.set(sha, prs);
     }
-    return out;
+    return prs;
   }
 
   private mainHas(): number[] {

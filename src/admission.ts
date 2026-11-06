@@ -5,7 +5,7 @@ import type { AutomationTrust } from "./automation";
 import type { Config } from "./config";
 import type { Proof } from "./evidence";
 import type { Auth, Waiver } from "./state";
-import { isForbiddenHeadRef, isSha } from "./validate";
+import { isForbiddenHeadRef, isGitBranchName, isSha } from "./validate";
 
 export interface LivePr {
   number: number;
@@ -65,6 +65,8 @@ export function admit(pr: LivePr, cfg: Config): Admission {
   if (pr.baseRef !== n.main || pr.baseRepoId !== n.target.id) return ignore(`base is not ${n.target.name} ${n.main}`);
   if (pr.headRepoId !== n.target.id) return ignore(`head is not in ${n.target.name} (fork)`);
   if (isForbiddenHeadRef(n, pr.headRef)) return ignore(`head branch '${pr.headRef}' is reserved`);
+  // Linear landing moves this branch (DESIGN.md §7.4): one rule for admission, the state and the ref client.
+  if (cfg.landing && !isGitBranchName(pr.headRef)) return unready(`its head branch name ${JSON.stringify(pr.headRef)} is not one linear landing can move`);
   if (!isSha(pr.head)) return ignore("head is not a sha");
   if (!pr.labels.includes(n.labels.ready)) return ignore("not labelled ready");
   if (!pr.ready) return ignore("who applied ready is not readable");

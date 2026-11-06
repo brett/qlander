@@ -385,7 +385,7 @@ class Tick {
           else {
             const heads: Record<string, string | null> = {};
             for (const h of op.heads ?? []) heads[String(h.pr)] = await c.getPrBranch(h.ref);
-            result = headsVerdict(op.heads, op.heads ? heads : undefined) ?? { kind: "landRejected", retry: isTransient(e), reason: String(e) };
+            result = headsVerdict(op.heads, op.heads ? heads : undefined, { since: j.at, now: this.d.now(), reconcileMinutes: this.d.cfg.reconcileMinutes }) ?? { kind: "landRejected", retry: isTransient(e), reason: String(e) };
           }
         }
         await this.apply(result);
@@ -482,6 +482,8 @@ class Tick {
       this.log.push(`admission not evaluated this tick: a journalled ${this.state.journal.op.kind} is outstanding`);
       if (paused) return "paused";
       if (outstanding.kind === "rerunReconcile" && (this.state.journal.op.kind !== "rerun" || (this.state.journal.op.requested ?? []).length > 0)) return "waiting";
+      // A linear landing the reads cannot settle yet (DESIGN.md §7.4): never re-sent, only observed again next tick.
+      if (outstanding.kind === "landUnsettled") return "waiting";
       const snap = await this.snapshot(paused);
       await this.resolve(outstanding, snap);
       await this.drainOutbox();

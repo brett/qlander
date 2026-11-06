@@ -20,6 +20,7 @@ import { headsVerdict } from "../src/ops";
 import { type CrashPoint, linearMessage, policyHash } from "../src/queue";
 import { parseState } from "../src/state";
 import { LostLockError } from "../src/store";
+import { isGitBranchName } from "../src/validate";
 import { FakeTarget } from "./fake-github";
 import { APPROVERS, job, NAMES, OPT_IN_FREE_HASH, OPT_IN_FREE_YAML, pathRe, sha, TARGET, TARGET_OPTS, TARGET_SLUG } from "./sim";
 import { type BatchCi, type CiOutcome, World } from "./world";
@@ -253,15 +254,22 @@ describe("the landing never overwrites a push", () => {
     for (const n of [1, 2]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
   });
 
-  test("a GitHub that moved the PR branches but not main pauses with what to restore, and lands once they are restored", async () => {
+  test("a GitHub that moved the PR branches but not main: the journal is kept, it pauses only past the reconcile window, and lands once they are restored", async () => {
     const w = linearWorld();
     const heads = [1, 2].map((n) => pr(w, n).pr.head.sha);
     w.target.partialLanding = true;
-    for (let i = 0; i < 12 && !w.paused(); i++) await w.tick();
+    let unsettledAt: number | null = null;
+    for (let i = 0; i < 40 && !w.paused(); i++) {
+      await w.tick();
+      if (unsettledAt === null && w.state().journal?.op.kind === "land" && w.target.prs.get(1)!.pr.head.sha !== heads[0]) unsettledAt = w.now.getTime();
+    }
     expect(w.paused()).toBe(true);
+    // Not before reconcileMinutes: until then it may be a main read that lags.
+    expect(w.now.getTime() - unsettledAt!).toBeGreaterThanOrEqual(w.config.reconcileMinutes * 60_000);
+    expect(w.state().journal?.op.kind).toBe("land");
     const why = w.repo.issues.filter((i) => i.open && i.labels.includes(NAMES.controlLabels.pause)).map((i) => i.body).join(" ");
-    expect(why).toContain("but not main");
-    expect(why).toContain(heads[0]!);
+    expect(why).toContain("while main still reads at its base");
+    expect(why).toContain(`#1 to ${heads[0]!}`);
     // Nobody was told their PR changed: the moved branches are qlander's, not a push.
     for (const n of [1, 2]) expect(w.comments(n).some((c) => c.startsWith("Removed from the landing queue"))).toBe(false);
     // An operator restores the branches and resumes.
@@ -273,6 +281,100 @@ describe("the landing never overwrites a push", () => {
     expect(w.landed()).toEqual([[1, 2]]);
     for (const n of [1, 2]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
   });
+});
+
+describe("a main read that lags behind an applied landing is never taken for a half-applied one", () => {
+  test("a crash after the landing, then one stale main read: the journal is kept, and the next read records the landing", async () => {
+    const w = linearWorld();
+    for (const n of [1, 2]) pr(w, n);
+    let crashed = false;
+    for (let i = 0; i < 20 && !crashed; i++) {
+      crashed =
+        (await w.tick({
+          crashWhen: (p) => {
+            if (p !== "after-effect" || w.state().journal?.op.kind !== "land") return false;
+            w.target.staleMain = { value: w.mainHistory.at(-2)!, reads: 1 }; // the next read of main comes from a lagging replica
+            return true;
+          },
+        })) === "crashed";
+    }
+    expect(crashed).toBe(true);
+    const r = await w.tick();
+    expect(r !== "crashed" && r.log.some((l) => l.startsWith("landing unsettled"))).toBe(true);
+    expect(w.state().journal?.op.kind).toBe("land");
+    expect(w.paused()).toBe(false);
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[1, 2]]);
+    for (const n of [1, 2]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
+    expect(w.target.landings).toHaveLength(1);
+  });
+
+  test("a landing whose response is lost, then one stale main read: unsettled, not a pause, and recorded on the next tick", async () => {
+    const w = linearWorld();
+    for (const n of [1, 2]) pr(w, n);
+    const land = w.target.landStack.bind(w.target);
+    w.target.landStack = async (m, h, e) => {
+      await land(m, h, e);
+      w.target.staleMain = { value: m.before, reads: 1 };
+      throw new (await import("../src/github/http")).GitHubError("server", 502, "Bad gateway"); // applied, but the response is lost
+    };
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[1, 2]]);
+    expect(w.target.landings).toHaveLength(1);
+    for (const n of [1, 2]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
+  });
+});
+
+describe("branch names", () => {
+  test("a head branch git allows but the config-name pattern does not (feat/fix+tests) is admitted, persisted and landed", async () => {
+    const w = linearWorld();
+    pr(w, 1).pr.head.ref = "feat/fix+tests";
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[1]]);
+    expect(w.target.landings[0]!.heads[0]!.branch).toBe("feat/fix+tests");
+  });
+
+  test("a name git would refuse is refused at admission with a comment, so the state never holds it", async () => {
+    const w = linearWorld();
+    pr(w, 1).pr.head.ref = "feat/a..b";
+    pr(w, 2);
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[2]]);
+    expect(w.comments(1).some((c) => c.startsWith("Not queued: its head branch name") && c.includes("feat/a..b"))).toBe(true);
+    expect(w.target.prs.get(1)!.pr.labels.includes(NAMES.labels.ready)).toBe(false);
+  });
+
+  test("isGitBranchName follows git check-ref-format", () => {
+    for (const ok of ["feat/fix+tests", "a#b", "release-notes/2026.10", "x@y", "UPPER/ünïcode"]) expect(isGitBranchName(ok), ok).toBe(true);
+    for (const bad of ["", "@", "a..b", "a b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "/a", "a/", "a//b", "a.", ".a", "a/.b", "a.lock", "a/b.lock/c", "a@{b", "-a", "a\u0001b", "x".repeat(256)]) expect(isGitBranchName(bad), JSON.stringify(bad)).toBe(false);
+  });
+});
+
+describe("a PR based on another PR's branch", () => {
+  // #1 is not ready; #2 is built on #1's head. Only #2 is in the batch, and the oracle must be told so in both modes.
+  for (const mode of ["merge", "linear"] as const) {
+    test(`${mode} mode: CI judges the batch as #2 alone, and a failure of #2 bounces it`, async () => {
+      const seen: number[][] = [];
+      const oracle = (b: BatchCi): CiOutcome => {
+        seen.push(b.prs);
+        return b.prs.includes(2) ? "fail" : "pass";
+      };
+      const w = mode === "linear" ? linearWorld(oracle) : new World(oracle);
+      const p1 = w.target.addPr(1, { labels: [] });
+      const p2 = pr(w, 2);
+      p2.pr.head.sha = w.target.commit([p1.pr.head.sha], "pr2-on-pr1", true, ["src/feature_2.py"]);
+      w.evidence(2);
+      await w.runUntilIdle();
+      expect(seen.length).toBeGreaterThan(0);
+      for (const prs of seen) expect(prs).toEqual([2]);
+      expect(w.landed()).toEqual([]);
+      expect(w.bounced()).toEqual([2]);
+    });
+  }
 });
 
 describe("a crash at every step boundary converges, linear", () => {
@@ -452,15 +554,17 @@ describe("headsVerdict (recovery with main unmoved)", () => {
     { pr: 1, ref: "feat/a", before: sha("h1"), after: sha("s1") },
     { pr: 2, ref: "feat/b", before: sha("h2"), after: sha("s2") },
   ];
-  test("untouched: null; pushed to: headMoved; at its stack commit: a pause that names what to restore", () => {
-    expect(headsVerdict(heads, { "1": sha("h1"), "2": sha("h2") })).toBeNull();
-    expect(headsVerdict(heads, { "1": sha("h1"), "2": sha("x") })).toEqual({ kind: "headMoved", prs: [2] });
-    expect(headsVerdict(heads, { "1": sha("h1"), "2": null })).toEqual({ kind: "headMoved", prs: [2] });
-    const half = headsVerdict(heads, { "1": sha("s1"), "2": sha("x") });
-    expect(half?.kind).toBe("landRejected");
-    expect(half).toMatchObject({ retry: false });
-    expect((half as { reason: string }).reason).toContain(`#1: ${sha("h1")}`);
-    expect(headsVerdict(undefined, { "1": sha("s1") })).toBeNull();
+  const t = (minutes: number) => ({ since: "2026-10-21T12:00:00Z", now: new Date(Date.parse("2026-10-21T12:00:00Z") + minutes * 60_000), reconcileMinutes: 30 });
+  test("untouched: null; pushed to: headMoved; at its stack commit: unsettled, never terminal, overdue only past the window", () => {
+    expect(headsVerdict(heads, { "1": sha("h1"), "2": sha("h2") }, t(0))).toBeNull();
+    expect(headsVerdict(heads, { "1": sha("h1"), "2": sha("x") }, t(0))).toEqual({ kind: "headMoved", prs: [2] });
+    expect(headsVerdict(heads, { "1": sha("h1"), "2": null }, t(0))).toEqual({ kind: "headMoved", prs: [2] });
+    // A branch at its stack commit: main's read may lag. Even mixed with a pushed branch, it stays unsettled.
+    const half = headsVerdict(heads, { "1": sha("s1"), "2": sha("x") }, t(5));
+    expect(half).toMatchObject({ kind: "landUnsettled", overdue: false });
+    expect((half as { reason: string }).reason).toContain(`#1 to ${sha("h1")}`);
+    expect(headsVerdict(heads, { "1": sha("s1"), "2": sha("h2") }, t(30))).toMatchObject({ kind: "landUnsettled", overdue: true });
+    expect(headsVerdict(undefined, { "1": sha("s1") }, t(0))).toBeNull();
   });
 });
 
@@ -602,6 +706,10 @@ describe("the real client", () => {
     expect(seen.at(-1)!.body).toEqual({ message: "Subject (#1)\n\nbody", tree: sha("T"), parents: [sha("A")] });
     expect((await c.getCommit(sha("M"))).tree).toBe(sha("T"));
     expect(await c.getPrBranch("feat/x")).toBe(sha("H"));
+    // git allows `+` and `#` in a branch name: each path component is encoded.
+    expect(await c.getPrBranch("feat/fix+tests#2").catch(() => null)).toBeNull();
+    expect(seen.at(-1)!.url).toContain("/git/ref/heads/feat/fix%2Btests%232");
+    await expect(c.getPrBranch("feat/a..b")).rejects.toThrow("bad branch name");
     await expect(c.getPrBranch(NAMES.main)).rejects.toThrow("reserved");
     await expect(c.getPrBranch(`${NAMES.queuePrefix}3`)).rejects.toThrow("reserved");
   });

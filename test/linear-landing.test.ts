@@ -666,6 +666,15 @@ describe("config", () => {
     expect(linearReleaseProblems(y("dispatch"))).toEqual([]);
     expect(linearReleaseProblems({ queue: { landing: { mode: "linear" } }, release: { enabled: false } })).toEqual([]);
   });
+
+  test("dispatch with author: author is refused (its unsigned commits could never reach release); author: app is allowed", () => {
+    const y = (author?: string) => ({ queue: { landing: { mode: "linear", ...(author ? { author } : {}) } }, release: { enabled: true, mode: "dispatch" } });
+    expect(linearReleaseProblems(y("author"))).toEqual([expect.stringContaining("queue.landing.author author cannot be used with release.mode dispatch")]);
+    expect(linearReleaseProblems(y("app"))).toEqual([]);
+    expect(linearReleaseProblems(y())).toEqual([]);
+    expect(linearReleaseProblems({ queue: { landing: { mode: "linear", author: "author" } }, release: { enabled: false, mode: "dispatch" } })).toEqual([]);
+    expect(linearReleaseProblems({ queue: { landing: { mode: "linear", author: "author" } }, release: { enabled: true } })).toHaveLength(1);
+  });
 });
 
 describe("the real client", () => {

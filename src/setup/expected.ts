@@ -217,6 +217,9 @@ export function controlRulesets(c: LoadedConfig): RulesetSpec[] {
 /** The full suite's checks, which release-landing requires (the hotfix path, DESIGN.md §9); audit T10 checks for the same list. */
 export const releaseRequiredChecks = (c: Pick<LoadedConfig, "config">): string[] => [...new Set(c.config.preLanding.flatMap((w) => w.required_jobs))];
 
+/** Linear landing with release dispatch (DESIGN.md §7.4): release only ever fast-forwards to main commits; setup and audit T10 both read this. */
+export const linearDispatch = (c: Pick<LoadedConfig, "config" | "release">): boolean => c.config.landing?.mode === "linear" && c.release.mode === "dispatch";
+
 export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSpec[] {
   const n = c.config.names;
   const repo = { owner: n.target.owner, name: n.target.name };
@@ -260,6 +263,10 @@ export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSp
           { type: "pull_request", parameters: { required_approving_review_count: 0, allowed_merge_methods: ["merge"] } },
           // No `update` rule: a person merges a release PR once its checks pass (the hotfix path, DESIGN.md §9).
           { type: "required_status_checks", parameters: { required_status_checks: full, strict_required_status_checks_policy: true } },
+          // Except with linear landing and dispatch: main could never take a release-only commit back, so there is no
+          // hotfix path, and only the bypass actors (the promote App, break-glass users) may move release (DESIGN.md §7.4, §9).
+          // Setup only tightens: switching back to merge mode leaves this rule until a person removes it.
+          ...(linearDispatch(c) ? [{ type: "update", parameters: { update_allows_fetch_and_merge: false } }] : []),
         ],
         // Dispatch mode: the release App never bypasses release; the configured promote identity
         // (release.dispatch.promoterApps) and named break-glass users are the only bypass actors kept.

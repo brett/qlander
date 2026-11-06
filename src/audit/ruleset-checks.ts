@@ -45,7 +45,15 @@ export interface BranchRulesetOpts {
   /** release.mode dispatch (§8.1): the App must not bypass the landing ruleset; only `promoterApps` and named users may. */
   appMustNotBypass?: boolean;
   promoterApps?: readonly number[];
+  /**
+   * Linear landing with dispatch (§7.4): the promote Apps move `branch` directly, so each must always bypass every
+   * ruleset on it that would stop a direct update (bypassing one ruleset does not bypass another).
+   */
+  promoterUpdates?: boolean;
 }
+
+/** Rules that stop a direct (non-PR) fast-forward of a branch by an actor that does not bypass them. */
+const BLOCKS_UPDATE = ["update", "pull_request", "required_status_checks", "required_deployments", "merge_queue", "workflows", "code_scanning"];
 
 /**
  * A landing ruleset (PR, plus restrict updates where only the App may move the
@@ -55,12 +63,13 @@ export interface BranchRulesetOpts {
  * updates would stop.
  */
 export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail, personMerges = false, o: BranchRulesetOpts = {}): Finding[] {
-  const { integrity = ["required_signatures", "non_fast_forward", "deletion"], appMustNotBypass = false, promoterApps = [] } = o;
+  const { integrity = ["required_signatures", "non_fast_forward", "deletion"], appMustNotBypass = false, promoterApps = [], promoterUpdates = false } = o;
   const out: Finding[] = [];
   const role = app?.role ?? "queue";
   const landing = c.rulesets.filter((r) => appliesTo(r, branch, c.defaultBranch) && (personMerges || hasRule(r, "update")) && hasRule(r, "pull_request"));
   const does = personMerges ? "requires a PR" : "restricts updates and requires a PR";
-  if (!landing.length) out.push(sev(id, personMerges ? `${branch}: no active ruleset requires a PR` : `${branch}: no active ruleset both restricts updates and requires a PR`, `add a landing ruleset on ${branch} (${personMerges ? "" : '"Restrict updates" and '}"Require a pull request"), bypass: the ${role} App and break-glass humans`));
+  const bypassers = appMustNotBypass ? "release.dispatch.promoterApps" : `the ${role} App`;
+  if (!landing.length) out.push(sev(id, personMerges ? `${branch}: no active ruleset requires a PR` : `${branch}: no active ruleset both restricts updates and requires a PR`, `add a landing ruleset on ${branch} (${personMerges ? "" : '"Restrict updates" and '}"Require a pull request"), bypass: ${bypassers} and break-glass humans`));
   else if (!c.admin) out.push(skipped(id, `${branch}: landing ruleset ${landing.map((r) => `"${r.name}"`).join(", ")} exists; its bypass list needs an admin token`, "rerun with an admin token"));
   else
     for (const r of landing) {
@@ -86,8 +95,24 @@ export function branchRulesets(id: string, branch: string, app: AppIdentity | un
       if (others.length) out.push(aboutActors(sev(id, `${branch}: landing ruleset "${r.name}" has bypass actors other than the ${role} App and named users`, "remove them", others.map((a) => actorLabel(a, c.appNames))), app, others));
       if (hasApp && !others.length) out.push(pass(id, `${branch}: landing ruleset "${r.name}" ${does}; bypass: the ${role} App and ${bypass.filter((a) => a.actor_type === "User").length} named user(s)`));
     }
+  // setup writes update_allows_fetch_and_merge false; true would let a fork sync move the branch.
+  if (promoterUpdates)
+    for (const r of landing.filter((x) => hasRule(x, "update")?.parameters?.update_allows_fetch_and_merge === true))
+      out.push(sev(id, `${branch}: landing ruleset "${r.name}" restricts updates but allows fetch and merge`, `set update_allows_fetch_and_merge to false on its update rule (setup --step target does)`));
+  if (promoterUpdates && promoterApps.length) out.push(promotersMayUpdate(id, branch, promoterApps, c, sev));
   for (const rule of integrity) out.push(noBypassRule(id, branch, branch, rule, c, sev));
   return out;
+}
+
+/** Each promote App always bypasses every active ruleset on `branch` that would stop it fast-forwarding the branch. */
+function promotersMayUpdate(id: string, branch: string, promoterApps: readonly number[], c: RulesetCtx, sev: Sev): Finding {
+  const carrying = c.rulesets.filter((r) => appliesTo(r, branch, c.defaultBranch) && BLOCKS_UPDATE.some((t) => hasRule(r, t)));
+  if (!c.admin) return skipped(id, `${branch}: whether the promote App(s) can move ${branch} needs an admin token (bypass lists)`, "rerun with an admin token");
+  for (const r of carrying)
+    for (const p of promoterApps)
+      if (!(r.bypass_actors ?? []).some((a) => a.actor_type === "Integration" && a.actor_id === p && (a.bypass_mode === undefined || a.bypass_mode === "always")))
+        return sev(id, `${branch}: the promote App ${c.appNames.get(p) ?? p} (release.dispatch.promoterApps) cannot always bypass "${r.name}", so it cannot move ${branch}`, `add it to "${r.name}" as a bypass actor with bypass mode "always", or remove the rules that stop it`);
+  return pass(id, `${branch}: every ruleset that would stop a direct update lets the promote App(s) (${promoterApps.map((p) => c.appNames.get(p) ?? p).join(", ")}) always bypass it`);
 }
 
 /** Refs only one App may write: `rules` restricted on each ref, and that App the only bypass actor. */

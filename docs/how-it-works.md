@@ -147,6 +147,7 @@ By default each PR lands as a merge commit. For a repo that requires linear hist
 - **Branch rules.** The queue App must be able to force-update PR branches. A PR whose branch has a rule the App can't bypass waits with a comment naming the rule and keeps `ready`; `audit` (T13) checks your rulesets and branch protection for this.
 - **A refused landing is retried.** If GitHub refuses the landing and nothing has moved, qlander retries it on the next tick, and pauses only after `queue.landing.maxRefusals` refusals in a row.
 - **Release advance.** It can't be combined with linear landing: a hotfix merge-back would land squashed, so `release` would never rejoin `main`. Validation refuses the combination.
+- **Release dispatch mode.** It can be combined with linear landing, with `queue.landing.author: app` only. `release` then only fast-forwards to `main` commits: `setup` restricts updates on it, so only the promote App and the break-glass people can move it, and there is no hotfix path. Fix forward on `main`.
 
 The setting is policy, so changing it takes `ready` off admitted PRs. Qlander's tests can only model GitHub's side of this (the atomic update and the merged mark), so check it in a sandbox repo first ([DESIGN.md §14](../DESIGN.md#14-rollout-gates-in-order-each-is-mandatory), G1). See [DESIGN.md, Linear landing](../DESIGN.md#74-linear-landing-opt-in-queuelandingmode-linear).
 

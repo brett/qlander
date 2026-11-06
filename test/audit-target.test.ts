@@ -226,6 +226,45 @@ describe("T10: release", () => {
     expect(f.filter((x) => x.status === "FAIL" || x.status === "WARN")).toEqual([]);
     expect(lines(f, "T10")).toContain('PASS stable: landing ruleset "release-landing" requires a PR; bypass: the release App and 0 named user(s)');
   });
+  describe("release.mode dispatch", () => {
+    const PROMOTER = 424242;
+    const dispatchOn = (linear: boolean): LoadedConfig => {
+      const c = releaseOn(false);
+      const dispatch = { workflow: ".github/workflows/promote.yml", ref: "trunk", inputs: { sha: "sha", dryRun: "dry_run", dispatchId: "dispatch_id" }, actor: { login: "acme-release[bot]", id: 90000001 }, promoterApps: [PROMOTER], approvers: [{ login: "alice", id: 1001 }], dryRunValidMinutes: 1440, appearMinutes: 30, runHours: 6, observeMinutes: 60, budget: { window: 8, windowHours: 24 }, freeze: [] };
+      return { ...c, config: { ...c.config, ...(linear ? { landing: { mode: "linear" as const, body: "b", author: "app" as const, maxRefusals: 3 } } : {}) }, release: { ...c.release, mode: "dispatch", dispatch } };
+    };
+    const setupWorld = (cfg: LoadedConfig) => {
+      const r = releaseWorld();
+      targetRulesets(cfg, true)
+        .filter((s) => s.name.startsWith("release-"))
+        .forEach((s, i) => (r[`${T}/rulesets/${6 + i}`] = { id: 6 + i, ...rulesetBody(s, null, { release: RELEASE_APP, queue: QUEUE_APP }) }));
+      return r;
+    };
+    const bad = (f: Awaited<ReturnType<typeof audit>>) => lines(f, "T10").filter((l) => !l.startsWith("PASS"));
+    test("merge mode: what setup writes passes without an update rule, and the pre-landing workflows must still run on PRs into release", async () => {
+      const cfg = dispatchOn(false);
+      const f = await audit(setupWorld(cfg), cfg);
+      expect(bad(f)).toEqual([]);
+      expect(lines(f, "T10")).toContain('PASS stable: landing ruleset "release-landing" requires a PR; bypass: 1 promote App(s) and 0 named user(s), not the release App (release.mode dispatch)');
+      expect(lines(f, "T10").some((l) => l.includes("runs on PRs into stable"))).toBe(true);
+      expect(lines(f, "T10").some((l) => l.includes("every ruleset that would stop a direct update"))).toBe(false);
+    });
+    test("linear landing: what setup writes passes; release restricts updates, the promote App always bypasses, and there are no PRs into release to check", async () => {
+      const cfg = dispatchOn(true);
+      const f = await audit(setupWorld(cfg), cfg);
+      expect(bad(f)).toEqual([]);
+      expect(lines(f, "T10")).toContain('PASS stable: landing ruleset "release-landing" restricts updates and requires a PR; bypass: 1 promote App(s) and 0 named user(s), not the release App (release.mode dispatch)');
+      expect(lines(f, "T10")).toContain(`PASS stable: every ruleset that would stop a direct update lets the promote App(s) (${PROMOTER}) always bypass it`);
+      expect(lines(f, "T10").some((l) => l.includes("PRs into stable"))).toBe(false);
+    });
+    test("linear landing: the merge-mode ruleset (no update rule) fails; a promote App with only a PR bypass fails", async () => {
+      const cfg = dispatchOn(true);
+      expect(bad(await audit(setupWorld(dispatchOn(false)), cfg))).toEqual(["FAIL stable: no active ruleset both restricts updates and requires a PR"]);
+      const r = setupWorld(cfg);
+      (r[`${T}/rulesets/6`] as { bypass_actors: { bypass_mode: string }[] }).bypass_actors[0]!.bypass_mode = "pull_request";
+      expect(bad(await audit(r, cfg))).toEqual([`FAIL stable: the promote App ${PROMOTER} (release.dispatch.promoterApps) cannot always bypass "release-landing", so it cannot move stable`]);
+    });
+  });
   test("on release, only a ruleset that requires a PR counts: without one it fails when live and warns in dry run", async () => {
     const r = releaseWorld();
     (r[`${T}/rulesets/6`] as { rules: { type: string }[] }).rules = [{ type: "update" }];

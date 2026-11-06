@@ -194,6 +194,41 @@ describe("the release App's permissions in dispatch mode: least privilege", () =
     const adv = branchRulesets("T10", "release", app, rs([{ actor_id: 444, actor_type: "Integration" }]), undefined, true);
     expect(adv.some((f) => f.status === "FAIL" && f.message.includes("does not list the release App"))).toBe(true);
   });
+  test("linear landing with dispatch: setup restricts updates on release, so only the bypass actors can move it; merge mode and advance mode do not", () => {
+    const linear = (text: string) => text.replace(/\nqueue:\n/, "\nqueue:\n  landing:\n    mode: linear\n");
+    const rules = (text: string) => targetRulesets(parseConfig(text), true).find((r) => r.name === "release-landing")!.rules;
+    const d = rules(linear(withRelease(PROMOTED)));
+    expect(d.find((r) => r.type === "update")).toEqual({ type: "update", parameters: { update_allows_fetch_and_merge: false } });
+    expect(rules(withRelease(PROMOTED)).map((r) => r.type)).not.toContain("update");
+    expect(rules(base).map((r) => r.type)).not.toContain("update");
+    // The PR and checks rules stay, and the bypass is unchanged: the promote App and named users.
+    expect(d.map((r) => r.type)).toEqual(["pull_request", "required_status_checks", "update"]);
+    expect(targetRulesets(parseConfig(linear(withRelease(PROMOTED))), true).find((r) => r.name === "release-landing")).toMatchObject({ bypass: [], extraBypass: "keep", apps: [PROMOTER] });
+  });
+
+  test("audit, linear landing with dispatch: release must restrict updates, and each promote App must always bypass every ruleset that would stop it moving release", () => {
+    const app: AppIdentity = { role: "release", slug: "acme-release", id: 2, permissions: {} };
+    const ruleset = (id: number, name: string, rules: string[], actors: { actor_id: number; actor_type: string; bypass_mode?: string }[]) => ({ id, name, enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/release"] } }, rules: rules.map((type) => ({ type })), bypass_actors: actors });
+    const ctx = (rulesets: unknown[]) => ({ rulesets, admin: true, defaultBranch: "main", appNames: new Map([[2, "acme-release"]]) }) as never;
+    const integrity = ruleset(2, "release-integrity", ["required_signatures", "non_fast_forward", "deletion"], []);
+    const promoter = { actor_id: PROMOTER, actor_type: "Integration", bypass_mode: "always" };
+    const check = (rulesets: unknown[]) => branchRulesets("T10", "release", app, ctx(rulesets), undefined, false, { appMustNotBypass: true, promoterApps: [PROMOTER], promoterUpdates: true });
+    const failed = (fs: ReturnType<typeof check>) => fs.filter((f) => f.status === "FAIL").map((f) => f.message);
+    expect(failed(check([ruleset(1, "release-landing", ["pull_request", "required_status_checks", "update"], [promoter]), integrity]))).toEqual([]);
+    expect(failed(check([ruleset(1, "release-landing", ["pull_request", "required_status_checks"], [promoter]), integrity]))).toEqual(["release: no active ruleset both restricts updates and requires a PR"]);
+    expect(failed(check([ruleset(1, "release-landing", ["pull_request", "update"], [{ ...promoter, bypass_mode: "pull_request" }]), integrity]))).toEqual([`release: the promote App ${PROMOTER} (release.dispatch.promoterApps) cannot always bypass "release-landing", so it cannot move release`]);
+    expect(failed(check([ruleset(1, "release-landing", ["pull_request", "update"], []), integrity]))).toEqual([`release: the promote App ${PROMOTER} (release.dispatch.promoterApps) cannot always bypass "release-landing", so it cannot move release`]);
+    // Another ruleset that would stop the promote App's update, even when release-landing lets it through.
+    const other = ruleset(3, "freeze-release", ["update"], [{ actor_id: 55, actor_type: "User", bypass_mode: "always" }]);
+    expect(failed(check([ruleset(1, "release-landing", ["pull_request", "update"], [promoter]), integrity, other]))).toEqual([`release: the promote App ${PROMOTER} (release.dispatch.promoterApps) cannot always bypass "freeze-release", so it cannot move release`]);
+    // An update rule that allows fetch and merge is weaker than what setup writes.
+    const fetchMerge = { ...ruleset(1, "release-landing", ["pull_request"], [promoter]), rules: [{ type: "pull_request" }, { type: "update", parameters: { update_allows_fetch_and_merge: true } }] };
+    expect(failed(check([fetchMerge, integrity]))).toEqual(['release: landing ruleset "release-landing" restricts updates but allows fetch and merge']);
+    // Without an admin token the bypass lists are unread: SKIPPED, never a PASS.
+    const noAdmin = branchRulesets("T10", "release", app, { ...(ctx([ruleset(1, "release-landing", ["pull_request", "update"], [promoter]), integrity]) as object), admin: false } as never, undefined, false, { appMustNotBypass: true, promoterApps: [PROMOTER], promoterUpdates: true });
+    expect(noAdmin.filter((f) => f.message.includes("promote App")).map((f) => f.status)).toEqual(["SKIPPED"]);
+  });
+
   test("[t2] setup refuses a promoterApps entry that is the release App (or any qlander App), in --plan too", () => {
     const d = parseConfig(withRelease([...DISPATCH, "    promoterApps:", "      - 2"]));
     const spec = targetRulesets(d, true).find((r) => r.name === "release-landing")!;

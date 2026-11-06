@@ -318,6 +318,8 @@ where `<incident>` is the failed attempt's dispatch id, which the pause issue qu
 
 To stop new dispatches without pausing anything else, set one of `release.dispatch.freeze`'s target repository variables to its value. A run already started is still followed.
 
+**With linear landing (`queue.landing.mode: linear`).** `release` only ever fast-forwards to `main` commits: `setup` restricts updates on it, so only the promote App and the break-glass people can move it, and there is no hotfix PR into `release`. Fix forward on `main` and promote that commit. If `release` diverges anyway (a break-glass push, or a promote workflow that committed on `release`), the release job stalls: it raises a `release-blocked` issue and dispatches nothing, because `main` can never take that commit back. To recover, fix forward on `main`, then move `release` back to the last commit qlander promoted (the latest `advanced` entry in the release state's history, checked to be an ancestor of `main`), after any promotion in flight has finished. That is a force push, which release-integrity forbids with no bypass, so a repository admin turns off its "Block force pushes" rule for the move, puts it back at once, and runs `audit` to confirm. Check what moving `release` does in the target first, since it may start workflows. Tooling for this recovery is planned.
+
 ### Alert issues
 
 Each alert issue says what is wrong, whether PRs are still landing, and what to do.

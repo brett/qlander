@@ -58,7 +58,7 @@ Commit the config and the rendered workflows together, through a PR. The tick's 
 
 ### 3. Setup
 
-Run `setup` on your own machine as an owner of both repos, never in Actions. It prints every change first and writes nothing without `--apply`.
+Run `setup` on your own machine as an owner of the organization that owns both repos, never in Actions. It prints every change first and writes nothing without `--apply`.
 
 ```sh
 bun "${bundle:?}" setup --keys-dir ~/app-keys --config qlander.yml
@@ -89,9 +89,11 @@ Run this before any tick touches your target. It proves on a scratch repo that t
 
 With the repository variable `QLANDER_MODE` unset, every tick is a dry run: it reads, decides, prints what it would do in the job log, and writes nothing. Let it run for a day against the target and compare its decisions with what you would have done.
 
+GitHub's schedule is best effort. Gaps of 20 to 30 minutes between ticks are normal, and a new repo may get no scheduled runs for hours. Until the schedule starts, run the tick and the watchdog by hand: `gh workflow run tick.yml` and `gh workflow run watchdog.yml`.
+
 ### 7. Live
 
-Set `QLANDER_MODE` to `live` (Settings, Secrets and variables, Actions, Variables). The queue acts from the next tick: label a PR whose fast lane is green with `ready` and it lands. Release advance stays off until a reviewed PR sets `release.enabled: true` and `release.dryRun: false`.
+Set `QLANDER_MODE` to `live` (Settings, Secrets and variables, Actions, Variables). The queue acts from the next tick. Label a PR whose fast lane is green with `ready`, and the queue can take one to three ticks to admit it, because an idle queue waits for the schedule. It lands once its batch's full suite passes. Release advance stays off until a reviewed PR sets `release.enabled: true` and `release.dryRun: false`.
 
 ## Upgrading
 

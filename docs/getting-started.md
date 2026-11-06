@@ -285,7 +285,7 @@ What the module does:
 GitHub-hosted runners have no host-side kill. This mode needs `runner.epochFence: true` and a `takeoverGraceMinutes` of at least 15, and it has no `hostKillMinutes`.
 
 - Hosted mode relies on GitHub behaviour that the sandbox check verifies on a scratch repo with the two epoch rulesets (experiment H1 in [Deployment, The epoch fence](deployment.md#34-the-epoch-fence)). You run it yourself in [the rollout](#10-roll-out).
-- Hosted runners are billed per job, and their cron is best effort. [Deployment, Mode hosted](deployment.md#33-mode-hosted-github-hosted-runners) has the numbers.
+- Hosted runners are billed per job, and their cron is best effort ([When ticks run](#when-ticks-run)). [Deployment, Mode hosted](deployment.md#33-mode-hosted-github-hosted-runners) has the numbers.
 - The target needs the two epoch rulesets before the first tick.
 
 ### The epoch fence
@@ -391,6 +391,19 @@ Run these gates in order. Each one is mandatory.
 2. **G2, the target.** The [target-side requirements](#9-prepare-the-target) are in place. `can_approve_pull_request_reviews` is `false` on the control repo ([step 4](#4-protect-the-control-repos-main)).
 3. **G3, dry runs.** Run for at least a day against the target, with `QLANDER_MODE` unset. Compare the logged decisions with what a person would have done.
 4. **G4, live.** Set `QLANDER_MODE=live`. The queue goes live, and the release job keeps dry-running. Enable release advance separately, by a reviewed PR that sets `release.dryRun: false`, once the target's release requirements hold.
+
+### When ticks run
+
+GitHub runs scheduled workflows on a best-effort basis. Gaps of 20 to 30 minutes between scheduled ticks are normal, and a newly created repo may get no scheduled runs at all for hours. Until the schedule starts, run the tick and the watchdog by hand:
+
+```sh
+gh workflow run tick.yml -R "$R"
+gh workflow run watchdog.yml -R "$R"
+```
+
+A dispatched tick runs the queue job only. The release job runs only on the schedule.
+
+While work is in flight, the queue job dispatches its own next tick. An idle queue waits for the schedule, so a new `ready` PR can take one to three ticks to be admitted.
 
 ### Running the sandbox check
 

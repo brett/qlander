@@ -256,6 +256,7 @@ GitHub's behaviour can change, so don't take H1 from this document: `verify-sand
 
 ```
 qlander audit [--config qlander.yml] [--target-only|--control-only] [--json]
+              [--queue-app <slug>] [--release-app <slug>] [--state-app <slug>]
 ```
 
 - Reads the target only through the API with a read token (`GH_TOKEN`). It never checks anything out. Workflow files are fetched through the contents API at `target.main` and parsed as YAML data. Every request is a GET.
@@ -451,4 +452,4 @@ Rolling back a version rolls back **code**, not **state**. `StateStore.open` wri
 
 ### 8.2 The policy hash
 
-`policyHash(cfg)` is `v2:` followed by 16 hex digits of the sha256 of a canonical, sorted projection of the policy-relevant config. Every authorisation records it, and revalidation drops a PR whose recorded hash differs: the PR loses `ready` and gets a comment. So **any change to policy-relevant config unreadies every admitted PR at the next tick**, because the rules it was admitted under have changed. Apply a policy change while nothing is admitted. The projection leaves out `hooks`, `tokens`, `bundle`, `notify`, `comments`, `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `runner` (its timings feed hashed values, §3.5) and `release` except `branch`, `stateBranch` and `labels`. Everything else is in it, including `control.repo`, `queue.historyLimit` and `watchdog.labels`. A new optional key is left out while it is unset, so adding it to the code changes no existing deployment's hash.
+`policyHash(cfg)` is `v2:` followed by 16 hex digits of the sha256 of a canonical, sorted projection of the policy-relevant config. Every authorisation records it, and revalidation drops a PR whose recorded hash differs: the PR loses `ready` and gets a comment. So **any change to policy-relevant config unreadies every admitted PR at the next unpaused tick**, because the rules it was admitted under have changed. Apply a policy change while nothing is admitted. The projection leaves out `hooks`, `tokens`, `bundle`, `notify`, `comments`, `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `runner` (its timings feed hashed values, §3.5) and `release` except `branch`, `stateBranch` and `labels`. Everything else is in it, including `control.repo`, `queue.historyLimit` and `watchdog.labels`. A new optional key is left out while it is unset, so adding it to the code changes no existing deployment's hash.

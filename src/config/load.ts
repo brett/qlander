@@ -242,6 +242,7 @@ interface ConfigYaml {
       inputs: { sha: string; dryRun: string; dispatchId: string };
       approvers: { login: string; id: number }[];
       actor: { login: string; id: number };
+      promoterApps?: number[];
       dryRunValidMinutes?: number;
       appearMinutes?: number;
       runHours?: number;
@@ -435,6 +436,7 @@ function toDispatch(d: ConfigYaml["release"]["dispatch"], main: string): Dispatc
     inputs: { sha: d.inputs.sha, dryRun: d.inputs.dryRun, dispatchId: d.inputs.dispatchId },
     approvers: d.approvers.map((a) => ({ login: a.login, id: a.id })),
     actor: { login: d.actor.login, id: d.actor.id },
+    promoterApps: [...new Set(d.promoterApps ?? [])],
     dryRunValidMinutes: d.dryRunValidMinutes ?? D.dryRunValidMinutes,
     appearMinutes: d.appearMinutes ?? D.appearMinutes,
     runHours: d.runHours ?? D.runHours,
@@ -457,6 +459,7 @@ function dispatchProblems(rel: ReleaseConfig, cronMinutes: number): string[] {
   for (const x of dup(inputs)) out.push(`release.dispatch.inputs: ${x} is used twice`);
   for (const x of dup(d.approvers.map((h) => h.login))) out.push(`release.dispatch.approvers: login ${x} is listed twice`);
   for (const x of dup(d.approvers.map((h) => h.id))) out.push(`release.dispatch.approvers: id ${x} is listed twice`);
+  if (d.promoterApps.includes(ACTIONS_APP_ID)) out.push(`release.dispatch.promoterApps must not include the GitHub Actions App (${ACTIONS_APP_ID}): any workflow could then bypass the release ruleset`);
   if (d.approvers.some((h) => h.id === d.actor.id || h.login === d.actor.login)) out.push("release.dispatch.approvers must not include release.dispatch.actor: the job cannot approve its own release");
   for (const x of dup(d.freeze.map((f) => f.variable.toUpperCase()))) out.push(`release.dispatch.freeze: ${x} is listed twice`);
   for (const f of d.freeze) if (f.variable.toUpperCase().startsWith("GITHUB_")) out.push(`release.dispatch.freeze: ${f.variable}: GitHub refuses variable names starting with GITHUB_`);

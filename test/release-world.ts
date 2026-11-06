@@ -145,6 +145,7 @@ export const DISPATCH: DispatchConfig = {
   inputs: { sha: "sha", dryRun: "dry_run", dispatchId: "dispatch_id" },
   approvers: [{ login: APPROVERS[0]!.login, id: APPROVERS[0]!.id }],
   actor: { login: "example-release[bot]", id: 90000001 },
+  promoterApps: [],
   dryRunValidMinutes: 1440,
   appearMinutes: 30,
   runHours: 6,

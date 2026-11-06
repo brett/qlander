@@ -800,6 +800,7 @@ The dispatch mode's settings. Required when mode is dispatch, refused otherwise.
 | `release.dispatch.ref` | [branch](#formats) | none | The branch the workflow is dispatched on, whose copy of the workflow file runs: the target's main or release.branch. Absent: the target's main. |
 | `release.dispatch.inputs` | mapping | required | The workflow_dispatch input names qlander sets. See [release.dispatch.inputs](#releasedispatchinputs). |
 | `release.dispatch.actor` | mapping | required | The release App's bot account: a dispatched run counts only if GitHub reports it as both the run's actor and its triggering actor. See [release.dispatch.actor](#releasedispatchactor). |
+| `release.dispatch.promoterApps` | list of integers | none | The App ids of the identity the target's promote workflow uses to move release. setup makes them, and named users, the only bypass actors on the release-landing ruleset; audit fails any other (a role, a team, another App, the release App). Absent: none. Never the GitHub Actions App (15368), which any workflow can use. |
 | `release.dispatch.approvers` | list of mappings | required | Accounts whose /qlander approve-release comment on the status issue counts. See [release.dispatch.approvers[]](#releasedispatchapprovers). |
 | `release.dispatch.dryRunValidMinutes` | integer | `1440` | How long a green dry run stays good for its real run. Past it, that commit is not released, and a newer one gets its own dry run. |
 | `release.dispatch.appearMinutes` | integer | `30` | How long after a dispatch its run may take to appear. At least twice runner.cronMinutes. |
@@ -813,6 +814,8 @@ release:
   dispatch:
     workflow: .github/workflows/promote.yml
     ref: main
+    promoterApps:
+      - 424242
     dryRunValidMinutes: 1440
     appearMinutes: 30
     runHours: 6

@@ -106,7 +106,7 @@ export const echoesId = (title: string, id: string) => new RegExp(`(^|[^A-Za-z0-
 const runUrl = (cfg: ReleaseDeps["cfg"], id: number) => `https://github.com/${cfg.names.target.owner}/${cfg.names.target.name}/actions/runs/${id}`;
 
 /** Concluded by qlander, not by GitHub: the run could not be followed. A real run left like this may still be promoting, so it pauses. */
-const UNFOLLOWED = new Set(["never-appeared", "stuck", "ambiguous", "missing"]);
+const UNFOLLOWED = new Set(["never-appeared", "stuck", "ambiguous", "missing", "foreign-attempt"]);
 
 /** Untrusted target text for an issue comment: one line, no markdown that could break out of a code span, bounded. */
 const plain = (s: string, max = 100) => s.replace(/[\s`<>]+/g, " ").trim().slice(0, max);
@@ -207,13 +207,33 @@ export class DispatchTick extends ReleaseTickBase {
         typeof r.display_title === "string" &&
         echoesId(r.display_title, rec.id),
     );
-    const ours = (a: Run["actor"]) => !!a && a.login === this.cfg.actor.login && a.id === this.cfg.actor.id;
-    const hits = named.filter((r) => ours(r.actor) && ours(r.triggering_actor));
+    const hits = named.filter((r) => this.ours(r));
     for (const r of named) if (!hits.includes(r)) this.log.push(`ignored run ${r.id}: it carries dispatch id ${rec.id} but was started by ${r.actor?.login ?? "nobody known"} (triggered by ${r.triggering_actor?.login ?? "nobody known"}), not ${this.cfg.actor.login}`);
     if (hits.length > 1) return { kind: "many", ids: hits.map((r) => r.id) };
     if (l.truncated) return { kind: "unsure" };
     if (hits.length === 1) return { kind: "found", run: hits[0]! };
     return { kind: "none" };
+  }
+
+  /** GitHub reports the release App's bot as both who started the run and who triggered its latest attempt. */
+  private ours(r: Run): boolean {
+    const me = (a: Run["actor"]) => !!a && a.login === this.cfg.actor.login && a.id === this.cfg.actor.id;
+    return me(r.actor) && me(r.triggering_actor);
+  }
+
+  /**
+   * The run read by id (whose conclusion is what counts) must itself be
+   * authenticated: started and last triggered by the release App's bot, and
+   * on the very attempt the authenticated listing showed. A listing can lag
+   * behind a rerun a person started, so it alone never vouches for getRun's
+   * answer. "foreign": the latest attempt is someone else's; "wait": the two
+   * reads disagree on the attempt (or the listing no longer shows it), so
+   * nothing is concluded this tick.
+   */
+  private authenticate(listed: Run | null, run: Run): "ok" | "foreign" | "wait" {
+    if (!this.ours(run)) return "foreign";
+    if (!listed || listed.id !== run.id || listed.run_attempt !== run.run_attempt || !this.ours(listed)) return "wait";
+    return "ok";
   }
 
   /**
@@ -259,9 +279,16 @@ export class DispatchTick extends ReleaseTickBase {
       r = { ...r, run: { id: f.run.id, url: runUrl(this.deps.cfg, f.run.id), createdAt: f.run.created_at } };
       this.log.push(`${r.kind} run for ${sha.slice(0, 8)}: found run ${f.run.id}`);
     }
+    const listed = f.kind === "found" && f.run.id === r.run!.id ? f.run : null;
     const run = await this.target.getRun(r.run!.id);
     if (!run) return done("missing", `run ${r.run!.id} can no longer be read`);
+    const auth = this.authenticate(listed, run);
+    if (auth === "foreign") return done("foreign-attempt", `run ${run.id}'s attempt ${run.run_attempt} was started by ${run.actor?.login ?? "nobody known"}, triggered by ${run.triggering_actor?.login ?? "nobody known"}, not ${this.cfg.actor.login}`);
     if (now - Date.parse(run.created_at) > this.cfg.runHours * 3_600_000 && run.status !== "completed") return done("stuck", `run ${run.id} still ${run.status} after ${this.cfg.runHours} hours`);
+    if (auth === "wait") {
+      this.log.push(`${r.kind} run ${run.id}: attempt ${run.run_attempt} cannot be authenticated yet (the listing shows ${listed ? `attempt ${listed.run_attempt}` : "no authenticated run"}); waiting`);
+      return r;
+    }
     if (run.status !== "completed") return r;
     const at = await this.completedAt(run);
     if (run.conclusion === "success") {
@@ -289,6 +316,9 @@ export class DispatchTick extends ReleaseTickBase {
     if (f.kind === "none" || f.run.id !== dry.run!.id) return { ok: false, wait: false, why: `run ${dry.run!.id} is no longer the one run carrying its dispatch id`, conclusion: "missing" };
     const run = await this.target.getRun(dry.run!.id);
     if (!run) return { ok: false, wait: false, why: `run ${dry.run!.id} can no longer be read`, conclusion: "missing" };
+    const auth = this.authenticate(f.run, run);
+    if (auth === "foreign") return { ok: false, wait: false, why: `run ${run.id}'s attempt ${run.run_attempt} was triggered by ${run.triggering_actor?.login ?? "nobody known"}, not ${this.cfg.actor.login}`, conclusion: "foreign-attempt" };
+    if (auth === "wait") return { ok: false, wait: true, why: `run ${run.id}'s attempt ${run.run_attempt} does not match the authenticated listing's attempt ${f.run.run_attempt}` };
     if (run.status !== "completed") return { ok: false, wait: true, why: `run ${run.id} is running again (attempt ${run.run_attempt})` };
     if (run.conclusion !== "success") return { ok: false, wait: false, why: `run ${run.id}'s attempt ${run.run_attempt} concluded ${run.conclusion}`, conclusion: run.conclusion ?? "unknown" };
     const at = await this.completedAt(run);

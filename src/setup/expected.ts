@@ -141,9 +141,8 @@ export interface Rule {
  * says whether other bypass actors already on the ruleset (break-glass
  * humans, added by hand) are kept ("keep") or removed ("none"): a ruleset
  * whose point is that nobody else bypasses it is always "none".
- * "keepExceptQlander" keeps every actor but qlander's own Apps: the release
- * ruleset in dispatch mode, where the target's promote identity bypasses it
- * and the release App must not.
+ * `apps` adds Apps that are not qlander's by id: the release ruleset in
+ * dispatch mode lists the target's promote identity, and not the release App.
  */
 export interface RulesetSpec {
   repo: Repo;
@@ -152,7 +151,9 @@ export interface RulesetSpec {
   include: string[];
   rules: Rule[];
   bypass: Role[];
-  extraBypass: "keep" | "none" | "keepExceptQlander";
+  extraBypass: "keep" | "none";
+  /** Other Apps, by id, that must be bypass actors too (release.dispatch.promoterApps). */
+  apps?: number[];
   /** The Apps that must be installed on `repo` before this ruleset can name them. */
   needsInstalled: Role[];
 }
@@ -259,8 +260,11 @@ export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSp
           // No `update` rule: a person merges a release PR once its checks pass (the hotfix path, DESIGN.md §9).
           { type: "required_status_checks", parameters: { required_status_checks: full, strict_required_status_checks_policy: true } },
         ],
-        // Dispatch mode: the release App never bypasses release (its id is still needed, to remove it); the target's own promote identity, added by hand, is kept.
-        ...(releaseAppBypassesRelease(c.release) ? { bypass: ["release"] as Role[], extraBypass: "keep" as const, needsInstalled: ["release"] as Role[] } : { bypass: [] as Role[], extraBypass: "keepExceptQlander" as const, needsInstalled: ["release"] as Role[] }),
+        // Dispatch mode: the release App never bypasses release; the configured promote identity
+        // (release.dispatch.promoterApps) and named break-glass users are the only bypass actors kept.
+        ...(releaseAppBypassesRelease(c.release)
+          ? { bypass: ["release"] as Role[], extraBypass: "keep" as const, needsInstalled: ["release"] as Role[] }
+          : { bypass: [] as Role[], extraBypass: "keep" as const, needsInstalled: [] as Role[], apps: [...(c.release.dispatch?.promoterApps ?? [])] }),
       },
       { repo, name: "release-integrity", include: [heads(n.release)], rules: INTEGRITY, bypass: [], extraBypass: "none", needsInstalled: [] },
     );

@@ -759,3 +759,50 @@ describe("dispatch mode: review regressions", () => {
     expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`]);
   });
 });
+
+describe("dispatch mode: second review", () => {
+  /** A person reruns run `id` to success as attempt 2, while run listings still show the App's attempt 1. */
+  function personReruns(w: DispatchWorld, run: { id: number }) {
+    const live = w.target.runs.find((x) => x.id === run.id)!;
+    w.target.listLag = 5;
+    w.target.updateRun(live, { run_attempt: 2, status: "completed", conclusion: "success", triggering_actor: { ...STRANGER } });
+    w.target.jobs.set(live.id, [{ ...job("plan"), completed_at: w.now.toISOString(), run_attempt: 2 }]);
+  }
+
+  test("[r1] the run read by id is authenticated itself: a person's rerun behind a stale listing never counts (follow)", async () => {
+    const w = new DispatchWorld();
+    w.behave = () => ({ conclusion: "failure", runTicks: 1 });
+    const a = w.land();
+    w.qualified(a);
+    await w.ok(); // dispatched; the App's attempt 1 fails before the next tick
+    personReruns(w, w.dispatched[0]!.run!);
+    w.approve(a);
+    const r = await w.ok();
+    expect(r.log.some((l) => l.includes("foreign-attempt"))).toBe(true);
+    await w.ok();
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`]);
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "dry-failed", note: expect.stringContaining("foreign-attempt") });
+  });
+
+  test("[r1] the same check right before the real run (confirmDry)", async () => {
+    const { w, a } = await greenDry();
+    personReruns(w, w.dispatched[0]!.run!);
+    w.approve(a);
+    expect((await w.ok()).outcome).toBe("alert");
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`]);
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ outcome: "dry-failed", note: expect.stringContaining("not example-release[bot]") });
+  });
+
+  test("[r1] reads that disagree on the attempt conclude nothing until they agree", async () => {
+    const { w, a } = await greenDry();
+    const live = w.target.runs.find((x) => x.id === w.dispatched[0]!.run!.id)!;
+    w.target.listLag = 1;
+    w.target.updateRun(live, { run_attempt: 2 }); // the App's own rerun, not yet in the listing
+    w.target.jobs.set(live.id, [{ ...job("plan"), completed_at: w.now.toISOString(), run_attempt: 2 }]);
+    w.approve(a);
+    const r = await w.ok();
+    expect(r.outcome).toBe("waiting");
+    expect(r.log.some((l) => l.includes("does not match the authenticated listing"))).toBe(true);
+    expect((await w.ok()).outcome).toBe("dispatched"); // the listing caught up
+  });
+});

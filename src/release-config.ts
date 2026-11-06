@@ -59,6 +59,8 @@ export interface DispatchConfig {
   inputs: { sha: string; dryRun: string; dispatchId: string };
   /** The release App's bot account: a run counts only if it is the run's actor and triggering actor (DESIGN.md §8.1). */
   actor: Human;
+  /** The target's promote identity, by App id: with named users, the only bypass actors on the release ruleset (DESIGN.md §8.1). */
+  promoterApps: number[];
   /** Whose `/qlander approve-release <sha>` comment counts (login and id). Never empty. */
   approvers: Human[];
   dryRunValidMinutes: number;

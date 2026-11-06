@@ -60,6 +60,7 @@ describe("release.mode", () => {
       inputs: { sha: "sha", dryRun: "dry_run", dispatchId: "dispatch_id" },
       approvers: [{ login: "alice", id: 1001 }],
       actor: { login: "acme-release[bot]", id: 90000001 },
+      promoterApps: [],
       dryRunValidMinutes: 1440,
       appearMinutes: 30,
       runHours: 6,
@@ -80,6 +81,7 @@ describe("release.mode", () => {
     ["an input name used twice", DISPATCH.map((l) => l.replace("dispatchId: dispatch_id", "dispatchId: sha")), /inputs: sha is used twice/],
     ["no approver", DISPATCH.slice(0, 10).concat(["    approvers: []"]), /needs at least 1/],
     ["no actor", DISPATCH.filter((l, i) => i < 7 || i > 9), /missing actor/],
+    ["the GitHub Actions App as the promoter", [...DISPATCH, "    promoterApps:", "      - 15368"], /must not include the GitHub Actions App/],
     ["the job's own bot as an approver", [...DISPATCH, "      - login: acme-release[bot]", "        id: 90000001"], /must not include release.dispatch.actor/],
     ["an approver listed twice", [...DISPATCH, "      - login: alice", "        id: 1001"], /login alice is listed twice/],
     ["appearMinutes under two cron intervals", [...DISPATCH, "    appearMinutes: 5"], /appearMinutes \(5\) must be at least twice/],
@@ -143,33 +145,50 @@ describe("the release App's permissions in dispatch mode: least privilege", () =
     expect(adv[0]!.status).toBe("FAIL");
   });
 
-  test("setup drops the release App from the release ruleset's bypass in dispatch mode, keeping the target's own promote identity", () => {
-    const d = parseConfig(withRelease(DISPATCH));
+  const PROMOTER = 424242;
+  const PROMOTED = [...DISPATCH, "    promoterApps:", `      - ${PROMOTER}`];
+
+  test("setup makes the promote App and named users the only bypass actors on release, never the release App, a role or a team", () => {
+    const d = parseConfig(withRelease(PROMOTED));
     const spec = targetRulesets(d, true).find((r) => r.name === "release-landing")!;
-    expect(spec).toMatchObject({ bypass: [], extraBypass: "keepExceptQlander" });
+    expect(spec).toMatchObject({ bypass: [], extraBypass: "keep", apps: [PROMOTER] });
     expect(targetRulesets(parseConfig(base), true).find((r) => r.name === "release-landing")).toMatchObject({ bypass: ["release"], extraBypass: "keep" });
     const ids = { queue: 1, release: 2, state: 3 };
     const live = { id: 9, name: "release-landing", target: "branch", enforcement: "active", conditions: { ref_name: { include: spec.include, exclude: [] } }, rules: spec.rules, bypass_actors: [
-      { actor_id: 2, actor_type: "Integration", bypass_mode: "always" },
+      { actor_id: 2, actor_type: "Integration", bypass_mode: "pull_request" },
       { actor_id: 444, actor_type: "Integration", bypass_mode: "always" },
+      { actor_id: 4, actor_type: "RepositoryRole", bypass_mode: "always" },
+      { actor_id: 7, actor_type: "Team", bypass_mode: "always" },
       { actor_id: 55, actor_type: "User", bypass_mode: "always" },
     ] } as never;
-    expect(rulesetDiff(spec, live, ids)).toEqual(["unexpected bypass actor: Integration 2"]);
-    expect(rulesetBody(spec, live, ids).bypass_actors.map((a) => a.actor_id)).toEqual([444, 55]);
+    expect(rulesetDiff(spec, live, ids).sort()).toEqual([
+      `bypass actor missing: App ${PROMOTER} (release.dispatch.promoterApps)`,
+      "unexpected bypass actor: Integration 2",
+      "unexpected bypass actor: Integration 444",
+      "unexpected bypass actor: RepositoryRole 4",
+      "unexpected bypass actor: Team 7",
+    ]);
+    expect(rulesetBody(spec, live, ids).bypass_actors.map((a) => `${a.actor_type} ${a.actor_id}`)).toEqual([`Integration ${PROMOTER}`, "User 55"]);
   });
 
-  test("audit fails a release ruleset that still lets the release App bypass it in dispatch mode", () => {
+  test("audit, dispatch mode: the release App in any bypass mode fails; so do roles, teams and Apps not configured; the promote App and named users pass", () => {
     const app: AppIdentity = { role: "release", slug: "acme-release", id: 2, permissions: {} };
-    const rs = (actors: { actor_id: number; actor_type: string }[]) => ({
-      rulesets: [{ id: 1, name: "release-landing", enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/release"] } }, rules: [{ type: "pull_request" }], bypass_actors: actors.map((a) => ({ ...a, bypass_mode: "always" })) }],
+    const rs = (actors: { actor_id: number; actor_type: string; bypass_mode?: string }[]) => ({
+      rulesets: [{ id: 1, name: "release-landing", enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/release"] } }, rules: [{ type: "pull_request" }], bypass_actors: actors.map((a) => ({ bypass_mode: "always", ...a })) }],
       admin: true,
       defaultBranch: "main",
       appNames: new Map([[2, "acme-release"]]),
     }) as never;
-    const bad = branchRulesets("T10", "release", app, rs([{ actor_id: 2, actor_type: "Integration" }, { actor_id: 444, actor_type: "Integration" }]), undefined, true, true);
-    expect(bad.some((f) => f.status === "FAIL" && f.message.includes("release.mode dispatch forbids"))).toBe(true);
-    const good = branchRulesets("T10", "release", app, rs([{ actor_id: 444, actor_type: "Integration" }]), undefined, true, true);
-    expect(good.some((f) => f.status === "PASS" && f.message.includes("does not bypass it"))).toBe(true);
+    const check = (actors: Parameters<typeof rs>[0]) => branchRulesets("T10", "release", app, rs(actors), undefined, true, true, [PROMOTER]);
+    const failed = (fs: ReturnType<typeof check>, text: string) => fs.some((f) => f.status === "FAIL" && f.message.includes(text));
+    expect(failed(check([{ actor_id: 2, actor_type: "Integration", bypass_mode: "pull_request" }]), "release.mode dispatch forbids")).toBe(true);
+    expect(failed(check([{ actor_id: 2, actor_type: "Integration" }]), "release.mode dispatch forbids")).toBe(true);
+    expect(failed(check([{ actor_id: 4, actor_type: "RepositoryRole" }]), "other than release.dispatch.promoterApps")).toBe(true);
+    expect(failed(check([{ actor_id: 7, actor_type: "Team" }]), "other than release.dispatch.promoterApps")).toBe(true);
+    expect(failed(check([{ actor_id: 444, actor_type: "Integration" }]), "other than release.dispatch.promoterApps")).toBe(true);
+    const good = check([{ actor_id: PROMOTER, actor_type: "Integration" }, { actor_id: 55, actor_type: "User" }]);
+    expect(good.some((f) => f.status === "PASS" && f.message.includes("not the release App"))).toBe(true);
+    expect(good.some((f) => f.status === "FAIL" && f.message.includes("landing ruleset"))).toBe(false);
     // Advance mode is unchanged: the release App must be there.
     const adv = branchRulesets("T10", "release", app, rs([{ actor_id: 444, actor_type: "Integration" }]), undefined, true);
     expect(adv.some((f) => f.status === "FAIL" && f.message.includes("does not list the release App"))).toBe(true);

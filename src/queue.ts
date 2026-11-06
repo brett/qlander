@@ -137,14 +137,34 @@ export function mergeTitle(title: string | undefined): string | null {
 }
 
 /**
- * The message of a build's merge commit for one PR. The subject and the
- * `Landed-by:` line are fixed; a `Title:` line follows when the PR's title is
- * known, always last and always one line, so it can never read as another
- * trailer.
+ * Whether a flattened title could read as the fixed merge subject or as a
+ * trailer once it starts a line: `Merge pull request`, a hyphenated token and a
+ * colon (git's trailer shape, without the one-word tokens conventional commit
+ * types use), or `Title:`; or start with `---`, git's patch divider, which
+ * hides the real trailers from `git interpret-trailers`. Judged with
+ * compatibility forms and dashes folded and invisible characters gone, so none
+ * of them can hide the words.
+ */
+function readsAsMergeLine(title: string): boolean {
+  const s = title.normalize("NFKC").replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}]/gu, "").replace(/\p{Pd}/gu, "-").replace(/\s+/g, " ").trim().toLowerCase();
+  return s.startsWith("---") || /^merge pull request\b/.test(s) || /^(?:title|[a-z0-9]+(?:-[a-z0-9]+)+) ?:/.test(s);
+}
+
+/**
+ * The message of a build's merge commit for one PR: the subject
+ * `<title> (#<pr>)`, then the admitted head and the `Landed-by:` line. A title
+ * is one line, so it adds no line of its own. Without a usable title, or with
+ * one that could read as this message's other lines, the subject is the fixed
+ * `Merge pull request #<pr> at <head>`, and such a title goes on a last `Title:`
+ * line. Nothing in qlander reads a message back: identity is the commit's
+ * parents (DESIGN.md §7.1).
  */
 export function mergeMessage(pr: number, head: string, n: number, title?: string): string {
   const t = mergeTitle(title);
-  return `Merge pull request #${pr} at ${head}\n\nLanded-by: qlander batch ${n}${t === null ? "" : `\nTitle: ${t}`}`;
+  const landedBy = `Landed-by: qlander batch ${n}`;
+  if (t === null) return `Merge pull request #${pr} at ${head}\n\n${landedBy}`;
+  if (readsAsMergeLine(t)) return `Merge pull request #${pr} at ${head}\n\n${landedBy}\nTitle: ${t}`;
+  return `${t} (#${pr})\n\nMerged from #${pr} at ${head}.\n\n${landedBy}`;
 }
 
 /**

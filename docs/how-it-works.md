@@ -136,7 +136,9 @@ The opt-in priority lane lets a human put an urgent PR first. See [Operating it]
 
 ## Linear landing (opt-in)
 
-By default each PR lands as a merge commit. For a repo that requires linear history, set [`queue.landing.mode`](configuration.md#queuelanding) to `linear`:
+By default each PR lands as a merge commit whose subject is `<PR title> (#<number>)`, with the head it was admitted at and `Landed-by: qlander batch <n>` in the body. A PR with no title, or one whose title could read as a trailer, a patch divider or qlander's fixed subject, gets `Merge pull request #<number> at <head>` instead.
+
+For a repo that requires linear history, set [`queue.landing.mode`](configuration.md#queuelanding) to `linear`:
 
 - **One commit per PR.** Each batch is built as a stack on `main`: one commit per PR, holding that PR's changes on top of the commit before it, with the message `<PR title> (#<number>)` and a body from `queue.landing.body`. Qlander still builds it through the GitHub API only, and a PR that conflicts gets the usual "Not queued" comment.
 - **CI is unchanged.** It runs on `queue/<n>` at the top of the stack. Splits and retests build new stacks.

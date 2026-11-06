@@ -31,7 +31,7 @@ Qlander opens a `pause` issue itself when it stops for a reason that needs a per
 | `configuration problem` | A required CI job was skipped, missing or never ran on a queue branch, often after a `ci.yml` change. | Fix the target's CI, or `queue.preLanding` in `qlander.yml`. |
 | `main is red` | The single PR under test failed only jobs that also fail on `main`. | Fix `main` first. |
 | `not signed and verified` | A merge commit (or, in linear mode, a stack commit) the App made isn't verified, so `main` would reject it. | Check the App and the signing rules. |
-| `but not main` | Linear mode: GitHub moved PR branches to their stack commits without moving `main`, which its atomic update should never do. | Restore each named branch to the head the issue gives, then close the issue. |
+| `while main still reads at its base` | Linear mode: for `queue.timeouts.reconcileMinutes`, PR branches have read at their stack commits while `main` has not moved, which GitHub's atomic update should never do. The landing's journal is kept. | Check `main`: if it is at the batch's head, the next tick records the landing. If not, restore each named branch to the head the issue gives, then close the issue. |
 | `window budget` | The queue used `queue.budget.window` CI runs within `queue.budget.windowHours` hours. | Check `main` and CI: usually one is broken for queue branches. |
 | `bounces in a row` | `queue.batch.breakerBounces` PRs bounced in a row without a landing. | Check `main` and CI: usually one is broken for queue branches. |
 | `not confirmed`, `no longer exist` or `still running` | A rerun or cancellation couldn't be reconciled. | Look at the named runs. |

@@ -12,7 +12,7 @@ import type { Job, Run } from "../types";
 import { appChecks, type AppIdentity } from "./apps";
 import { t12 } from "./policy-coverage";
 import { t13 } from "./linear";
-import { releaseRequiredChecks } from "../setup/expected";
+import { linearDispatch, releaseRequiredChecks } from "../setup/expected";
 import { type RepoInfo, RepoView, type Wf, why } from "./repo-view";
 import { branchRulesets, landingRequirements, noBypassRule, prefixRuleset, refsRuleset, type RulesetCtx } from "./ruleset-checks";
 import { appliesTo, hasRule, readRulesets } from "./rulesets";
@@ -144,8 +144,11 @@ async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs:
     if (!(e instanceof GitHubError && e.kind === "not_found")) throw e;
     out.push(sev("T10", `the release branch ${branch} does not exist${tag}`, `create ${branch} at a qualified commit of ${main}`));
   }
-  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, true, { appMustNotBypass: R.mode === "dispatch", promoterApps: R.dispatch?.promoterApps ?? [] }), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
-  for (const e of cfg.config.preLanding) {
+  // Linear landing with dispatch (DESIGN.md §7.4, §9): release only fast-forwards to main commits, so its landing ruleset
+  // restricts updates, the promote Apps must be able to move it, and there are no PRs into release to check.
+  const linear = linearDispatch(cfg);
+  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, !linear, { appMustNotBypass: R.mode === "dispatch", promoterApps: R.dispatch?.promoterApps ?? [], promoterUpdates: linear }), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
+  for (const e of linear ? [] : cfg.config.preLanding) {
     const w = wfs.find((x) => x.path === e.path);
     if (!w?.wf) continue;
     const t = triggers(w.wf);

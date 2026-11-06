@@ -374,11 +374,18 @@ export const LINEAR_BODY_MAX = 2000;
  * release job would report `diverged` from then on. Refused whenever release
  * is enabled in advance mode, dry runs included, since a dry run is the step
  * before a live one. Dispatch mode (release.mode dispatch), where qlander
- * moves no release ref, is allowed.
+ * moves no release ref and release only fast-forwards to main commits, is
+ * allowed, but not with `author: author`: those commits are unsigned, and
+ * release-integrity requires signatures with no bypass, so none could ever be
+ * promoted.
  */
-export function linearReleaseProblems(y: { queue: { landing?: { mode?: string } }; release: { enabled?: boolean } }): string[] {
+export function linearReleaseProblems(y: { queue: { landing?: { mode?: string; author?: string } }; release: { enabled?: boolean; mode?: unknown } }): string[] {
   if (y.queue.landing?.mode !== "linear" || y.release.enabled !== true) return [];
-  const mode = (y.release as { mode?: unknown }).mode;
+  const mode = y.release.mode;
+  if (mode === "dispatch" && y.queue.landing.author === "author")
+    return [
+      "queue.landing.author author cannot be used with release.mode dispatch: those commits land unsigned, and the release branch requires signed commits with no bypass, so none of them could be promoted (DESIGN.md §7.4, §13). Use author: app",
+    ];
   if (mode !== undefined && mode !== "advance") return [];
   return [
     "queue.landing.mode linear cannot be used with release advance (release.enabled is true): the hotfix protocol's merge-back must land as a real merge commit so that release becomes an ancestor of main again, and linear landing would squash it (DESIGN.md §9, §7.4). Turn release advance off, or keep merge mode",

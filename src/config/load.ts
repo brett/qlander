@@ -199,6 +199,7 @@ interface ConfigYaml {
     priority?: { preempt?: boolean };
     concurrency?: { maxActive?: number; pipelineDepth?: number };
     strategy?: { firstAlone?: boolean; skipSeenRed?: boolean; reuseGreen?: boolean; adaptive?: { greens: number; ceiling: number }; mainBaseline?: boolean };
+    landing?: { mode?: "merge" | "linear"; body?: string; author?: "app" | "author"; maxRefusals?: number };
     controlLabels: { pause: string; mirror: string };
     admission: {
       fastLane: { workflow: string; event: string; job: string };
@@ -334,7 +335,49 @@ function toConfig(y: ConfigYaml, names: Names, runner: RunnerContract): Config {
     ...(q.concurrency ? { concurrency: { maxActive: q.concurrency.maxActive ?? DEFAULT_MAX_ACTIVE, pipelineDepth: q.concurrency.pipelineDepth ?? DEFAULT_PIPELINE_DEPTH } } : {}),
     // Likewise not policy, and absent unless a key is on.
     ...strategyOf(q.strategy),
+    // Policy, but only linear mode adds a key: merge mode (the default) hashes exactly as before.
+    ...(q.landing?.mode === "linear" ? { landing: { mode: "linear" as const, body: q.landing.body ?? DEFAULT_LINEAR_BODY, author: q.landing.author ?? "app", maxRefusals: q.landing.maxRefusals ?? DEFAULT_LAND_REFUSALS } } : {}),
   };
+}
+
+/** queue.landing.maxRefusals when linear mode leaves it out. */
+export const DEFAULT_LAND_REFUSALS = 3;
+
+/** queue.landing.body when linear mode leaves it out: neutral, and naming the admitted head. */
+export const DEFAULT_LINEAR_BODY = "Squashed from #{number} at {head}.\n\nLanded-by: qlander batch {batch}";
+
+/** The placeholders queue.landing.body may use (src/queue.ts linearMessage). */
+export const LINEAR_BODY_PLACEHOLDERS = ["{number}", "{head}", "{batch}"];
+
+/** The longest queue.landing.body, in code points. */
+export const LINEAR_BODY_MAX = 2000;
+
+/**
+ * Linear landing and release advance do not combine (DESIGN.md §7.4, §9): a
+ * hotfix reaches main as a merge-back PR, and only a real merge commit makes
+ * `release` an ancestor of `main` again. Linear landing squashes it, so the
+ * release job would report `diverged` from then on. Refused whenever release
+ * is enabled in advance mode, dry runs included, since a dry run is the step
+ * before a live one. `release.mode` (advance | dispatch) is not in this
+ * schema yet; read defensively so dispatch, which moves no branch by
+ * fast-forward, stays allowed once it is.
+ */
+export function linearReleaseProblems(y: { queue: { landing?: { mode?: string } }; release: { enabled?: boolean } }): string[] {
+  if (y.queue.landing?.mode !== "linear" || y.release.enabled !== true) return [];
+  const mode = (y.release as { mode?: unknown }).mode;
+  if (mode !== undefined && mode !== "advance") return [];
+  return [
+    "queue.landing.mode linear cannot be used with release advance (release.enabled is true): the hotfix protocol's merge-back must land as a real merge commit so that release becomes an ancestor of main again, and linear landing would squash it (DESIGN.md §9, §7.4). Turn release advance off, or keep merge mode",
+  ];
+}
+
+/** Problems with a linear-mode commit body template: unknown placeholders, control characters other than a line break, length. */
+export function linearBodyProblems(body: string): string[] {
+  const out: string[] = [];
+  for (const m of body.match(/\{[^{}]*\}/g) ?? []) if (!LINEAR_BODY_PLACEHOLDERS.includes(m)) out.push(`queue.landing.body: unknown placeholder ${m} (allowed: ${LINEAR_BODY_PLACEHOLDERS.join(", ")})`);
+  if (/[\p{Cc}\p{Zl}\p{Zp}\p{Bidi_Control}]/u.test(body.replace(/\n/g, ""))) out.push("queue.landing.body: control characters other than a line break are not allowed");
+  if ([...body].length > LINEAR_BODY_MAX) out.push(`queue.landing.body: longer than ${LINEAR_BODY_MAX} characters`);
+  return out;
 }
 
 /** queue.strategy as Config carries it: only the keys that are on, and no `strategy` key at all when none is. */
@@ -507,6 +550,7 @@ function semanticProblems(cfg: Config, rel: ReleaseConfig, runner: RunnerContrac
     if (!coversDir(cfg.policyBoundary, dir)) out.push(`queue.policy.paths must cover the whole ${dir} directory (${dir}/**, .github/** or **)`);
   }
   if (cfg.priorityPreempt && !cfg.names.labels.priority) out.push("queue.priority.preempt needs queue.labels.priority");
+  if (cfg.landing) out.push(...linearBodyProblems(cfg.landing.body));
   if (cfg.policyShareBatch && cfg.policyShareBatch.max > cfg.maxBatch) out.push("queue.policy.shareBatch.max must not exceed queue.batch.max");
   if (cfg.concurrency && cfg.concurrency.pipelineDepth > cfg.concurrency.maxActive - 1) out.push("queue.concurrency.pipelineDepth must be less than queue.concurrency.maxActive");
   out.push(...automationProblems(cfg.trustedAutomations ?? [], gates.map(([, file]) => file)));
@@ -665,6 +709,8 @@ export function parseConfig(text: string, source = "qlander.yml"): LoadedConfig 
     ...tokenProblems(tokens),
     ...runsOnProblems(runsOn, runner.mode),
     ...bundleProblems(bundle, y.control.repo),
+    ...(["body", "author", "maxRefusals"] as const).filter((k) => y.queue.landing?.[k] !== undefined && y.queue.landing.mode !== "linear").map((k) => `queue.landing.${k} is set, but queue.landing.mode is not linear`),
+    ...linearReleaseProblems(y),
   ];
   if (meaning.length) throw new ConfigError(source, meaning);
   const comments: CommentSettings = { omit: [...new Set(y.comments?.omit ?? [])] };

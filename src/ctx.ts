@@ -197,7 +197,7 @@ export const speculationRefused = (n: number) => `speculation on batch ${n} refu
 
 /** A parked batch (queue.strategy.reuseGreen) as a running batch, at this depth and lineage: for reading its CI, and for landing it. */
 export function parkedBatch(p: Parked, depth = p.depth, lineage = p.lineage): Active {
-  return { n: p.n, base: p.base, head: p.head, depth, prs: p.pins.map((x) => x.pr), lineage, rerun: null, rerunAt: null, cancels: [], builtAt: p.builtAt };
+  return { n: p.n, base: p.base, head: p.head, depth, prs: p.pins.map((x) => x.pr), lineage, rerun: null, rerunAt: null, cancels: [], builtAt: p.builtAt, ...(p.stack ? { stack: p.stack } : {}) };
 }
 
 /** A main baseline as a running batch with no PRs: for reading its CI. */

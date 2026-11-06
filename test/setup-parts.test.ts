@@ -297,6 +297,16 @@ describe("ruleset reconciliation only tightens", () => {
     const rl = targetRulesets(exampleConfig(), true).find((r) => r.name === "release-landing")!;
     expect(rl.rules.map((r) => r.type)).not.toContain("update");
   });
+
+  test("main-integrity asks for signatures except with linear landing's author mode, whose commits are unsigned", () => {
+    const { targetRulesets } = require("../src/setup/expected") as typeof import("../src/setup/expected");
+    const c = exampleConfig();
+    const integrity = (cfg: typeof c) => targetRulesets(cfg, true).find((r) => r.name === "main-integrity")!.rules.map((r) => r.type);
+    expect(integrity(c)).toEqual(["required_signatures", "non_fast_forward", "deletion"]);
+    const linear = (author: "app" | "author") => ({ ...c, config: { ...c.config, landing: { mode: "linear" as const, body: "b", author, maxRefusals: 3 } } });
+    expect(integrity(linear("app"))).toEqual(["required_signatures", "non_fast_forward", "deletion"]);
+    expect(integrity(linear("author"))).toEqual(["non_fast_forward", "deletion"]);
+  });
 });
 
 describe("key custody and symlinks", () => {

@@ -7,7 +7,7 @@ import type { Account, TargetApi, Commit, Compare, RefActivity, RefUpdate, Label
 import { GitHubError } from "../src/github/http";
 import type { CheckRun, IssueComment, Job, Run } from "../src/types";
 import type { Names } from "../src/config";
-import { isBuildRef, isCommandLabel, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../src/validate";
+import { isBuildRef, isCommandLabel, isForbiddenHeadRef, isGitBranchName, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../src/validate";
 import { APPROVERS, HUMAN, NAMES, sha } from "./sim";
 
 export interface FakePr {
@@ -132,7 +132,41 @@ export class FakeTarget implements TargetApi {
     this.commits.set(s, { sha: s, parents, verified, reason: verified ? "valid" : "unsigned" });
     this.commitFiles.set(s, files);
     if (!this.order.has(s)) this.order.set(s, this.order.size);
+    // A merge's tree is its parents' changes together; any other commit adds its own change.
+    this.setContent(s, new Set([...parents.flatMap((p) => [...(this.content.get(p) ?? [])]), ...(parents.length >= 2 ? [] : [s])]));
     return s;
+  }
+
+  // ---- trees (linear landing): a tree is modelled as the set of changes (non-merge commits) it holds
+  /** Each commit's content: the non-merge commits whose change its tree holds. */
+  content = new Map<string, Set<string>>();
+  /** Tree sha by commit, and content by tree sha. */
+  treeOf = new Map<string, string>();
+  treeContent = new Map<string, Set<string>>();
+  /** Commits made with createCommit (the stack), and their messages in order. */
+  created = new Set<string>();
+  createdMessages: string[] = [];
+  /** createCommit makes commits GitHub does not sign. */
+  unsignedCreated = false;
+  /**
+   * landStack as a GitHub that broke its atomicity promise (DESIGN.md §7.4):
+   * the PR branches move, and then the whole call is rejected with main unmoved.
+   */
+  partialLanding = false;
+  /** The next this-many landStack calls are refused whole, with nothing moved (a refusal GitHub does not explain). */
+  refuseLandings = 0;
+  refusal: () => Error = () => new GitHubError("validation", 422, "Reference update failed");
+
+  private setContent(s: string, c: Set<string>): void {
+    this.content.set(s, c);
+    const t = sha(`tree:${[...c].sort().join(",")}`);
+    this.treeOf.set(s, t);
+    this.treeContent.set(t, c);
+  }
+
+  /** The PR whose head branch is `branch`, if any (a PR branch's value is its head). */
+  private prOnBranch(branch: string): FakePr | undefined {
+    return [...this.prs.values()].find((f) => f.pr.head.ref === branch);
   }
 
   /** Push a commit onto a PR branch (its head moves). */
@@ -219,8 +253,15 @@ export class FakeTarget implements TargetApi {
 
   // ------------------------------------------------------------ TargetApi: reads
 
+  /** The next `reads` reads of main return `value`: a replica that has not seen the latest write. */
+  staleMain: { value: string; reads: number } | null = null;
+
   async getRef(branch: string) {
     this.log(`getRef ${branch}`);
+    if (branch === this.names.main && this.staleMain && this.staleMain.reads > 0) {
+      this.staleMain.reads--;
+      return this.staleMain.value;
+    }
     return this.refs.get(branch) ?? null;
   }
   async listRefs(prefix: string) {
@@ -229,7 +270,37 @@ export class FakeTarget implements TargetApi {
   async getCommit(s: string): Promise<Commit> {
     const c = this.commits.get(s);
     if (!c) throw new GitHubError("not_found", 404, `no commit ${s}`);
-    return c;
+    const tree = this.treeOf.get(s);
+    return tree ? { ...c, tree } : c;
+  }
+  /**
+   * Rulesets as GitHub applies them to branches (linear landing's admission
+   * check): which branches each covers, its rule types, and what
+   * current_user_can_bypass says for the queue App (null: absent).
+   */
+  branchRulesets: { id: number; name: string; covers: (branch: string) => boolean; types: string[]; bypass: string | null }[] = [];
+  /** Branches with classic protection. */
+  protectedBranches = new Set<string>();
+  /** branchRules fails, as a read GitHub could not answer. */
+  branchRulesError: Error | null = null;
+
+  async branchRules(branch: string) {
+    if (!isGitBranchName(branch) || isForbiddenHeadRef(this.names, branch)) throw new GitHubError("validation", null, "reserved branch");
+    if (this.branchRulesError) throw this.branchRulesError;
+    return this.branchRulesets.filter((r) => r.covers(branch)).flatMap((r) => r.types.map((type) => ({ type, rulesetId: r.id })));
+  }
+  async rulesetBypass(id: number) {
+    const r = this.branchRulesets.find((x) => x.id === id);
+    if (!r) throw new GitHubError("not_found", 404, "no ruleset");
+    return { name: r.name, bypass: r.bypass };
+  }
+  async branchProtected(branch: string) {
+    return this.protectedBranches.has(branch);
+  }
+  async getPrBranch(branch: string) {
+    if (!isGitBranchName(branch) || isForbiddenHeadRef(this.names, branch)) throw new GitHubError("validation", null, `'${branch}' is reserved or not a branch name`);
+    this.log(`getPrBranch ${branch}`);
+    return this.prOnBranch(branch)?.pr.head.sha ?? null;
   }
   async compare(base: string, head: string): Promise<Compare> {
     const a = this.ancestors(head);
@@ -483,6 +554,69 @@ export class FakeTarget implements TargetApi {
     this.log(`merge ${base} ${headSha}`);
     return { kind: "merged", sha: m };
   }
+  /** The author each created commit was given (absent: the App). */
+  createdAuthors = new Map<string, { name: string; email: string }>();
+
+  async createCommit(tree: string, parent: string, message: string, author?: { name: string; email: string }): Promise<string> {
+    if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
+    if (!isRealSha(tree) || !isRealSha(parent)) throw new GitHubError("validation", null, "not a real object id");
+    const content = this.treeContent.get(tree);
+    if (!content || !this.commits.has(parent)) throw new GitHubError("validation", 422, "Tree or parent does not exist");
+    // Unique per call, like GitHub (a commit carries its timestamp).
+    const s = sha(`created:${tree}:${parent}:${message}:${nextId()}`);
+    // GitHub signs a git data API commit only when it is its own author: one with another author is unsigned.
+    const verified = !this.unsignedCreated && !author;
+    this.commits.set(s, { sha: s, parents: [parent], verified, reason: verified ? "valid" : "unsigned" });
+    this.commitFiles.set(s, []);
+    this.order.set(s, this.order.size);
+    this.setContent(s, content);
+    this.created.add(s);
+    if (author) this.createdAuthors.set(s, author);
+    this.createdMessages.push(message);
+    this.log(`createCommit ${s} on ${parent}`);
+    return s;
+  }
+
+  /** Every landStack call GitHub accepted: main and the PR branches it moved. */
+  landings: { main: RefUpdate; heads: RefUpdate[] }[] = [];
+
+  async landStack(main: RefUpdate, heads: RefUpdate[], epoch: string | null): Promise<void> {
+    // The client-side guards (as TargetClient.landStack).
+    if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
+    if (main.branch !== this.names.main || heads.length === 0) throw new GitHubError("validation", null, "bad landStack");
+    const all = [main, ...heads];
+    if (all.some((u) => !isRealSha(u.before) || !isRealSha(u.after) || u.before === u.after)) throw new GitHubError("validation", null, "bad oids");
+    if (heads.some((h) => !isGitBranchName(h.branch) || isForbiddenHeadRef(this.names, h.branch) || h.branch === this.epochBranch)) throw new GitHubError("validation", null, "reserved branch");
+    if (new Set(all.map((u) => u.branch)).size !== all.length) throw new GitHubError("validation", null, "a branch twice");
+    if ((epoch === null) !== (this.epochBranch === null)) throw new GitHubError("validation", null, "epoch mismatch");
+    this.log(`landStack ${main.before} -> ${main.after} with ${heads.map((h) => h.branch).join(",")}`);
+    // GitHub, atomically: every entry checked before any moves. A forced entry still needs its beforeOid.
+    const check = () => {
+      if (epoch !== null && this.refs.get(this.epochBranch!) !== epoch) throw new GitHubError("conflict", 200, "beforeOid does not match");
+      this.refCheck(main.branch, main.before, main.after);
+      for (const h of heads) {
+        const f = this.prOnBranch(h.branch);
+        if (!f || f.pr.head.sha !== h.before) throw new GitHubError("conflict", 200, "beforeOid does not match");
+        if (!this.commits.has(h.after)) throw new GitHubError("validation", 200, "Object does not exist");
+      }
+    };
+    const moveHeads = () => {
+      for (const h of heads) this.prOnBranch(h.branch)!.pr.head.sha = h.after;
+    };
+    if (this.refuseLandings > 0) {
+      this.refuseLandings--;
+      throw this.refusal();
+    }
+    if (this.partialLanding) {
+      moveHeads();
+      throw new GitHubError("server", 502, "Bad gateway");
+    }
+    check();
+    moveHeads();
+    this.githubUpdateRefs(main.branch, main.before, main.after); // merge detection sees the moved heads
+    this.landings.push({ main, heads });
+  }
+
   async rerunFailedJobs(id: number) {
     if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
     const r = this.runs.find((x) => x.id === id);

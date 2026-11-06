@@ -10,7 +10,7 @@ GitHub has a built-in [merge queue](https://docs.github.com/en/repositories/conf
 | A CI timeout | Treated as a failure: the PR is removed. | A run past qlander's time limits is cancelled and rerun once, then the queue pauses. It never bounces a PR. A job that hits its own `timeout-minutes` still counts as a failure. |
 | Jumping the queue | Rebuilds every pull request already in progress. | The opt-in priority lane waits for the running batch, unless a concurrency slot is free or you turn on preemption. |
 | PRs that change CI | The docs describe no separate rule. | Need an approval bound to their SHA, unless a trusted bot's narrow waiver covers them. Land alone, or with other approved CI-policy PRs (opt-in). |
-| Merge method | Merge, rebase or squash. | Merge commits only. |
+| Merge method | Merge, rebase or squash. | Merge commits, or with the opt-in linear landing one squashed commit per PR. No rebase. |
 | How your CI is triggered | A `merge_group` event, or a push to `gh-readonly-queue/*` for other CI systems. | A `push` to the `queue/` branches. |
 | Running it | Built into GitHub. | You run a control repo, a scheduled workflow and two Apps, or three with release advance. |
 

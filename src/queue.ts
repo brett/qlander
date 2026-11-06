@@ -23,15 +23,16 @@ import { actives, type Snapshot, type Verdict } from "./ctx";
 import type { TargetApi, StateRefApi, StateRepoApi } from "./github/api";
 import { GitHubError, isGraphqlInternal } from "./github/http";
 import { decide } from "./machine";
-import { applyOpResult, interpretObservation, isObservedOutcome, type OpResult, type Recovery } from "./ops";
+import { applyOpResult, headsVerdict, interpretObservation, isObservedOutcome, type OpResult, type Recovery } from "./ops";
 import { drain, isTransient, openPause, pauseReason } from "./outbox";
 import { buildSnapshot, observe, StaleSnapshotError } from "./snapshot";
 import type { CommentSettings } from "./config/load";
 import { deliverHooks, enqueueHooks, type Hook, type LifecycleEvent } from "./hooks";
-import type { BuildRecord, Executor, Op, State } from "./state";
+import type { BuildRecord, Executor, Op, StackCommit, State } from "./state";
 import { CorruptStateError, LeaseHeldError, LostLockError, mirror, queueCodec, StateStore } from "./store";
 import { buildRef, queueRef } from "./validate";
 import { retickAt, type Wake, wakeFor } from "./wake";
+import { noreplyEmail } from "./github/target";
 
 /** How long a GitHub-internal GraphQL error counts towards a pause (Tick.countInternalError). */
 export const INTERNAL_ERROR_WINDOW_MS = 60 * 60_000;
@@ -41,6 +42,7 @@ export type CrashPoint =
   | "after-intent"
   | "after-build-ref"
   | "after-merges"
+  | "after-stack"
   | "after-checkpoint"
   | "after-queue-ref"
   | "after-effect"
@@ -143,6 +145,32 @@ export function mergeTitle(title: string | undefined): string | null {
 export function mergeMessage(pr: number, head: string, n: number, title?: string): string {
   const t = mergeTitle(title);
   return `Merge pull request #${pr} at ${head}\n\nLanded-by: qlander batch ${n}${t === null ? "" : `\nTitle: ${t}`}`;
+}
+
+/**
+ * The message of a linear stack commit (DESIGN.md §7.4): the subject
+ * `<title> (#<pr>)`, the title flattened and cut as for a merge commit (or
+ * `Pull request #<pr>` when there is none), a blank line, then
+ * queue.landing.body with its placeholders filled in.
+ */
+export function linearMessage(pr: number, head: string, n: number, title: string | undefined, body: string, coAuthor?: { login: string; email: string }): string {
+  const t = mergeTitle(title);
+  const subject = t === null ? `Pull request #${pr}` : `${t} (#${pr})`;
+  const trailer = coAuthor ? `\n\nCo-authored-by: ${coAuthor.login} <${coAuthor.email}>` : "";
+  return `${subject}\n\n${body.replaceAll("{number}", String(pr)).replaceAll("{head}", head).replaceAll("{batch}", String(n))}${trailer}`;
+}
+
+/**
+ * Who a stack commit credits (DESIGN.md §7.4): the PR's author at their
+ * GitHub noreply address, or null when GitHub returned no usable account.
+ * With `author: app` it is a Co-authored-by trailer on an App-authored,
+ * signed commit; with `author: author` it is the commit's author, and the
+ * commit is unsigned. Never a real address.
+ */
+export function prAuthor(live: { author?: string; authorId?: number } | undefined): { login: string; email: string } | null {
+  if (!live?.author || live.authorId === undefined) return null;
+  const email = noreplyEmail(live.author, live.authorId);
+  return email ? { login: live.author, email } : null;
 }
 
 const stableId = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
@@ -302,6 +330,19 @@ class Tick {
       await this.apply({ kind: "built", head: r.head });
       return;
     }
+    // A linear landing is resent only as a fresh one would be sent (DESIGN.md §7.4): main still its base,
+    // the batch's latest CI attempt green on that head (§5.3 rule 5), and every PR revalidated (§4.2).
+    if (r.kind === "retryLand" && op.kind === "land") {
+      const a = this.state.active;
+      if (a?.head !== op.after || snap.ci?.kind !== "green") {
+        await this.apply({ kind: "opDropped", reason: `the batch's CI is ${snap.ci?.kind ?? "unread"} now, not green` });
+        return;
+      }
+      if (snap.main !== op.before || !valid((op.heads ?? []).map((h) => ({ pr: h.pr, head: h.before })))) {
+        await this.apply({ kind: "opDropped", reason: "the batch no longer revalidates on this main" });
+        return;
+      }
+    }
     if (op.kind === "rerun" && !valid((this.state.active?.prs ?? []).map((pr) => ({ pr })))) {
       await this.apply({ kind: "opDropped", reason: "the batch is no longer valid" });
       return;
@@ -353,20 +394,28 @@ class Tick {
         return;
       case "land": {
         let result: OpResult;
+        const main = this.d.cfg.names.main;
         try {
-          await c.updateRef(this.d.cfg.names.main, op.before, op.after); // CAS: beforeOid, force false
+          // CAS: beforeOid, force false. Linear (DESIGN.md §7.4): the same atomic call force-moves each PR branch from its admitted head.
+          if (op.heads) await c.landStack({ branch: main, before: op.before, after: op.after }, op.heads.map((h) => ({ branch: h.ref, before: h.before, after: h.after })), null);
+          else await c.updateRef(main, op.before, op.after);
           this.crash("after-effect");
           result = { kind: "landed" };
         } catch (e) {
           // A crash, or a lost lease at the fence: not a landing outcome. The tick ends quietly.
           if (e instanceof CrashError || e instanceof LostLockError) throw e;
           // Judge by the ref, not the error text: did it move, and where to?
-          const main = await c.getRef(this.d.cfg.names.main);
-          if (main === op.after) result = { kind: "landed" };
-          else if (main !== op.before) result = { kind: "baseMoved" };
+          const now = await c.getRef(main);
+          if (now === op.after) result = { kind: "landed" };
+          else if (now !== op.before) result = { kind: "baseMoved" };
           // The write may have applied and this read may lag: the journal stays, and the next tick judges again.
           else if (isGraphqlInternal(e)) throw e;
-          else result = { kind: "landRejected", retry: isTransient(e), reason: String(e) };
+          else {
+            const heads: Record<string, string | null> = {};
+            for (const h of op.heads ?? []) heads[String(h.pr)] = await c.getPrBranch(h.ref);
+            // Linear (DESIGN.md §7.4): every ref where the batch left it is a refusal the next tick retries; merge mode is unchanged.
+            result = headsVerdict(op.heads, op.heads ? heads : undefined, { since: j.at, now: this.d.now(), reconcileMinutes: this.d.cfg.reconcileMinutes }) ?? (op.heads ? { kind: "landRefused", counted: !isTransient(e), reason: String(e) } : { kind: "landRejected", retry: isTransient(e), reason: String(e) });
+          }
         }
         await this.apply(result);
         this.crash("after-receipt");
@@ -401,15 +450,42 @@ class Tick {
       } else dropped.push({ pr: pin.pr, pin: pin.head, outcome: r.kind });
     }
     this.crash("after-merges");
-    for (const m of merges) {
+    const landing = this.d.cfg.landing;
+    // Linear (DESIGN.md §7.4): the merge chain stays on the build ref; the stack, one commit per PR on its tree, is what is pushed.
+    const stack: StackCommit[] = [];
+    /** Stack commits with the PR's author as author: GitHub does not sign those (queue.landing.author: author). */
+    const authored = new Set<string>();
+    if (landing) {
+      let parent = op.base;
+      for (const [i, m] of merges.entries()) {
+        const pin = survivors[i]!;
+        const tree = (await c.getCommit(m)).tree;
+        if (!tree) {
+          await this.apply({ kind: "buildFailed", reason: `merge commit ${m} for #${pin.pr} came back without a tree` });
+          return;
+        }
+        const live = snap.prs[String(pin.pr)];
+        const who = prAuthor(live);
+        const byAuthor = landing.author === "author" && who !== null;
+        // author mode credits through authorship, so a trailer naming the same person again would add nothing.
+        const message = linearMessage(pin.pr, pin.head, op.n, live?.title, landing.body, !byAuthor && who ? who : undefined);
+        const commit = await c.createCommit(tree, parent, message, byAuthor ? { name: who.login, email: who.email } : undefined);
+        if (byAuthor) authored.add(commit);
+        stack.push({ pr: pin.pr, commit, parent, tree });
+        parent = commit;
+      }
+      this.crash("after-stack");
+    }
+    // What reaches main must be signed: the merge commits in merge mode, the stack commits in linear mode.
+    for (const m of landing ? stack.map((x) => x.commit).filter((x) => !authored.has(x)) : merges) {
       const commit = await c.getCommit(m);
       if (!commit.verified || commit.reason !== "valid") {
-        await this.apply({ kind: "buildFailed", reason: `merge commit ${m} is not signed and verified (${commit.reason})` });
+        await this.apply({ kind: "buildFailed", reason: `${landing ? "stack" : "merge"} commit ${m} is not signed and verified (${commit.reason})` });
         return;
       }
     }
-    const chainHead = merges.at(-1) ?? null;
-    await this.apply({ kind: "checkpoint", record: { survivors, dropped, chainHead } });
+    const chainHead = landing ? (stack.at(-1)?.commit ?? null) : (merges.at(-1) ?? null);
+    await this.apply({ kind: "checkpoint", record: { survivors, dropped, chainHead, ...(landing ? { stack } : {}) } });
     this.crash("after-checkpoint");
     if (!this.state.journal) return; // the record was rejected (and paused)
     if (chainHead === null) {
@@ -443,6 +519,8 @@ class Tick {
       this.log.push(`admission not evaluated this tick: a journalled ${this.state.journal.op.kind} is outstanding`);
       if (paused) return "paused";
       if (outstanding.kind === "rerunReconcile" && (this.state.journal.op.kind !== "rerun" || (this.state.journal.op.requested ?? []).length > 0)) return "waiting";
+      // A linear landing the reads cannot settle yet (DESIGN.md §7.4): never re-sent, only observed again next tick.
+      if (outstanding.kind === "landUnsettled") return "waiting";
       const snap = await this.snapshot(paused);
       await this.resolve(outstanding, snap);
       await this.drainOutbox();

@@ -11,6 +11,7 @@ import { parseQualificationManifest } from "../release";
 import type { Job, Run } from "../types";
 import { appChecks, type AppIdentity } from "./apps";
 import { t12 } from "./policy-coverage";
+import { t13 } from "./linear";
 import { releaseRequiredChecks } from "../setup/expected";
 import { type RepoInfo, RepoView, type Wf, why } from "./repo-view";
 import { branchRulesets, landingRequirements, noBypassRule, prefixRuleset, refsRuleset, type RulesetCtx } from "./ruleset-checks";
@@ -81,7 +82,8 @@ export async function t7(cfg: LoadedConfig, gh: AuditGh, repo: string): Promise<
 
 export function t8(cfg: LoadedConfig, c: RulesetCtx, queueApp: AppIdentity | undefined, release: AppIdentity | undefined, classic: boolean | null): Finding[] {
   const N = cfg.config.names;
-  const out = branchRulesets("T8", N.main, queueApp, c);
+  // queue.landing.author: author commits are unsigned (DESIGN.md §7.4): T13 then requires main not to demand signatures.
+  const out = branchRulesets("T8", N.main, queueApp, c, fail, false, cfg.config.landing?.author === "author" ? ["non_fast_forward", "deletion"] : undefined);
   out.push(...landingRequirements("T8", N.main, c, { contexts: [cfg.config.fastLane.job], strict: false, mergeOnly: false }));
   out.push(...prefixRuleset("T8", "queue refs", N.queuePrefix, queueApp, c), ...prefixRuleset("T8", "build refs", N.buildPrefix, queueApp, c));
   if (cfg.runner.epochFence) {
@@ -266,5 +268,6 @@ export async function auditTarget(gh: AuditGh, cfg: LoadedConfig, apps: AppIdent
   out.push(...(await guard("T10", "T10", () => t10(cfg, view, wfs ?? [], rc, releaseApp))));
   out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11"))));
   out.push(...(await guard("T12", "T12", () => t12(cfg, view))));
+  out.push(...(await guard("T13", "T13", () => t13(cfg, gh, repo, rc, queueApp, admin))));
   return out;
 }

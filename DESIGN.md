@@ -8,7 +8,8 @@ It runs from its own **control repo**, so the credentials that can move the targ
 
 1. **Main only points at tested commits.** Qlander moves `main` to `Q` only when every job in the pre-landing manifest (§6) succeeded on `Q` itself. The evidence must come from a `push` run on `queue/<n>` in the target, from the expected workflow file, on the latest attempt. A result never carries over to another SHA or tree.
 2. **Compare-and-swap, never force.** Every update to `main` and `release` is a GraphQL `updateRefs` with `beforeOid` (the head qlander expects) and `force: false`. If `main` is not exactly the batch's base, the update fails and the batch is rebuilt and retested.
-3. **Only the authorised revision lands.** Every PR in a batch carries an authorisation record for (PR, head SHA, base, policy version) (§4.2). The record is checked again before every sub-batch is built and again immediately before landing.
+   **The one forced write, linear landing only (§7.4).** With `queue.landing.mode: linear`, the `updateRefs` that fast-forwards `main` also moves each landed PR's head branch to that PR's stack commit, which does not contain the old head, so those entries carry `force: true`. Each is bounded four ways: only a branch recorded in the PR's authorisation at admission; only from the head SHA recorded there (`beforeOid`, which GitHub checks on a forced entry too, so a branch someone pushed to is refused, and with it the whole call); only to the commit qlander built for that PR in the batch CI just passed; and only inside that one atomic call, so it moves exactly when `main` does. Nothing else is ever force-moved, `main` and `release` included. Merge mode makes no forced write.
+3. **Only the authorised revision lands.** Every PR in a batch carries an authorisation record for (PR, head SHA, base, policy version) (§4.2). The record is checked again before every sub-batch is built and again immediately before landing. In linear mode what lands is the authorised revision's change, squashed: a commit whose tree is the tree CI tested, and none of the PR's own commits.
 4. **A change to CI policy is never landed on its own CI's word.** Policy PRs run solo (or, opt-in, only with other approved policy PRs, §4.3 (d)) and need an approval from an account listed as an approver, bound to their SHA (§4.3).
 5. **No target code runs with a credential.** Qlander uses the GitHub APIs only. It never checks out or executes anything from the target. It reads target JSON (a qualification manifest) through the contents API, and job logs (flaky tracking §10, the main baseline §5.7) through the Actions API, only as data: a log is matched as text against fixed patterns and nothing else is done with it.
 6. **Effects are journalled.** Before qlander does anything with a side effect, it durably records the intent and reserves the budget. On the next tick it reconciles that intent by looking at the result (§3.2).
@@ -23,6 +24,8 @@ target PR ─ fast lane (+ optional producer-bound review, on head H) ─▶ lab
  queue job (queue App key) ─ admit: auth record (PR,H,base,policy) ─▶ select batch
    ─▶ merges on qlander-build/<n> ─▶ verify signatures ─▶ create queue/<n> (one push)
    ─▶ target CI on queue/<n> ─▶ green: updateRefs main B→Q ─▶ verify PRs merged
+   (linear mode, §7.4: a stack commit per PR on its merge's tree is pushed instead, and the
+    same updateRefs also moves each PR branch H→S, so GitHub marks it merged)
                                  red:   rerun failed once → split (≤ maxSplitDepth) → solo → bounce
 
  release job (release App key) ─ newest qualified main commit C (§8) ─▶ updateRefs release R→C
@@ -83,7 +86,7 @@ Each tick first reconciles a leftover journal, by observation:
 | --- | --- |
 | `build(n, base, pins)` | **Before the checkpoint (§7.1 step 6),** the build is not recorded. With no `queue/<n>`, qlander deletes `qlander-build/<n>` and releases the reservation; no CI was spent. **After the checkpoint,** the record holds `survivors` and `dropped` (a pin plus its outcome, `conflict` or `noop`, for each dropped PR). If `queue/<n>` exists and its chain matches base plus `survivors`, it is adopted as active. If it is absent, qlander creates it from the recorded chain head. Only then are the recorded drop outcomes applied: comment and unready, idempotently. **A `queue/<n>` that exists with no record, or that doesn't match the record,** means CI may have run: the charge stays, the batch is recorded as abandoned, its runs are cancelled, its refs are deleted, and the queue pauses. A record that fails its checks with no `queue/<n>` releases the reservation and pauses. |
 | `rerun(runId, attempt)` | If the run's `run_attempt` is greater than the recorded attempt, it is done. If not, wait with the reservation held. An unconfirmed request is never resent: after `reconcileMinutes` the operation ends and the queue pauses. |
-| `land(B → Q)` | Run this **before any PR-integrity check**. If `Q` is an ancestor of or equal to `main` (compare `Q...main` is `identical` or `ahead`), the batch landed: record a receipt and move its PRs to `verify`. If `main == B`, it was not applied, and `decide` runs again. Anything else means main moved without us, so rebuild. |
+| `land(B → Q)` | Run this **before any PR-integrity check**. If `Q` is an ancestor of or equal to `main` (compare `Q...main` is `identical` or `ahead`), the batch landed: record a receipt and move its PRs to `verify`. If `main == B`, it was not applied, and `decide` runs again. Anything else means main moved without us, so rebuild. **Linear (§7.4),** with `main == B`, each PR branch is read too: one at its stack commit is inconclusive (main's read may lag behind an applied landing), so the journal stays and the next tick observes again, pausing with the journal kept once `reconcileMinutes` have passed; one at anything but its admitted head and its stack commit was pushed to, so nothing moved and the next tick's revalidation drops that PR. |
 | `comment` / `label` / `cancel` | These are idempotent. Every comment carries a hidden marker, `<!-- qlander:<seq>:<pr> -->`, and is skipped if that marker already exists. |
 | `advance(R → C)` (release) | Same as `land`. |
 
@@ -123,7 +126,7 @@ A PR is admitted, and gets its `auth` entry, when all of these hold at once on a
 
 A PR that conflicts with `main` or has an unsigned commit loses `ready` and gets a comment; every other refusal leaves the label on and is reported (below).
 
-The record is (PR, `H`, base ref and repo id, policy hash, label event id, the evidence's run ids and attempts).
+The record is (PR, `H`, base ref and repo id, policy hash, label event id, the evidence's run ids and attempts). In linear mode (§7.4) it also holds the PR's head branch (`headRef`), the only branch the landing may move for it, and revalidation drops the PR if that changes.
 
 **Cutoff.** A label is not bound to a SHA. The evidence binds authorisation to `H`: the fast-lane job, the review (when required) and any policy approval all name `H`. A push after admission changes the head, and then the record no longer matches. A push can still arrive after the final revalidation. The pinned `H` still lands, which is the authorised revision, and §7.3 reports that the later commits did not land.
 
@@ -425,6 +428,8 @@ A run qlander has cancelled is not timed again, but cancellation is a request: `
 
 ### 7.3 Verify (persisted in `state.verify`, independent of later batches)
 
+In linear mode (§7.4) `P` below is the PR's stack commit, and the entry also records the admitted head `H`; a head that reads as `H` is treated like one that reads as `P` (a read that lags behind the landing), and the not-merged notice names both.
+
 For each landed PR with pin `P`:
 
 - Confirm that `P` is reachable from `main` (`GET /compare/P...main`, status `ahead` or `identical`).
@@ -432,6 +437,53 @@ For each landed PR with pin `P`:
 - Open, `head == P`, `P` reachable: wait for GitHub's indirect-merge detection. After `queue.verify.ticks` ticks and at least 15 minutes since landing (`VERIFY_MIN_MINUTES`; chained ticks can be a minute apart, §11.1), post one comment: "`P` is in main at `Q`, but GitHub has not marked this PR merged; a maintainer may close it." **Qlander never closes a PR.**
 - Open and `head != P`: comment "landed revision `P` (in `Q`); later commits are not in main", remove `ready`, and leave it open.
 - Done when it is merged, the comment has been posted, or after `queue.verify.days` days.
+
+### 7.4 Linear landing (opt-in, `queue.landing.mode: linear`)
+
+For a target that requires linear history and one commit per PR. Absent, or `mode: merge`, Config has no `landing` key, the policy hash is unchanged, no new state field is written, and everything above holds exactly. The key is policy: switching it drops every admitted PR (§4.2), so switch with nothing admitted.
+
+**Build (§7.1, changed from step 4).** Steps 1 to 3 are unchanged: the PRs are merged onto `qlander-build/<n>` with the merges API, and a 409 drops a PR with the usual "Not queued" comment. The merge chain then stays on the build ref. For each surviving PR `i` in order, qlander reads the tree of its merge commit `M_i` and creates, with the git data API, a commit `S_i` with that tree and the single parent `S_{i-1}` (`S_0 = B`). Its message is `<PR title> (#<number>)`, the title flattened and cut as in §7.1, or `Pull request #<number>` without one, then a blank line and `queue.landing.body` (placeholders `{number}`, `{head}`, `{batch}`).
+- `tree(S_i) = tree(M_i)`, so each stack commit holds exactly the trees the merge chain did, and `S_k`'s tree is the one merge mode would have tested. Building on the merge chain's trees rather than merging onto the stack keeps a PR stacked on another's branch from re-applying its base, because the merge base the merges API uses is the same as in merge mode.
+- Every `S_i` must be `verified` with reason `valid`, else the build fails and pauses, before any CI. The `M_i` are never pushed anywhere but the build ref, so they are not checked.
+- The checkpoint also records the stack, `{pr, commit, parent, tree}` per survivor. Recovery adopts a `queue/<n>` only if, walking from it, each commit is exactly the recorded one with one parent, ending at `B`. A crash before the checkpoint leaves only unreferenced commits.
+- `queue/<n>` is created at `S_k`. CI, classification, reruns, bisection, splits, solo retests, pipelining and every strategy are unchanged: each rebuild builds a new stack from its pins.
+
+**Land (§7.2, changed from step 2).** One GraphQL `updateRefs`: `main` from `B` to `S_k` with `force: false`, and each PR's recorded `headRef` from its admitted head `H_i` to `S_i` with `force: true`, plus the epoch entry when the fence is on (docs/deployment.md §3.4). GitHub documents `updateRefs` as atomic: if any entry is refused, no ref moves. Qlander already relies on this for the epoch fence (G1/H1), and relies on it here: the half-applied state is treated as a broken promise, not a state to recover through (below). Once `main` is at `S_k`, every PR's head `S_i` is reachable from `main`, and GitHub marks the PR merged, as for any PR whose head reaches its base.
+- **A branch someone pushed to is never overwritten.** Its `beforeOid` no longer holds, so the whole call is refused and nothing moves. The runner re-reads `main` and the branches: `main` unmoved and a branch at neither `H_i` nor `S_i` is `headMoved`, which ends the op without a pause. The next tick's revalidation sees the new head, drops that PR (`ready` removed, the usual "head moved" comment), abandons the batch, and rebuilds and retests the rest (§5.3 rule 3). A refusal GitHub reports as its generic error keeps the journal, and the next tick judges the same way by observation.
+- **A refused landing is classified, never paused on sight.** After any refusal or error the runner re-reads `main` and every PR branch, and each later tick observes them again while the journal stays:
+  - `main` at `S_k`, or `S_k` reachable from it: the landing applied; it is recorded.
+  - `main` anywhere but `B` and `S_k`: `main` moved; the batch is rebuilt.
+  - a branch at neither `H_i` nor `S_i`: an author push; that PR is dropped and the rest rebuilt, no pause.
+  - a branch at `S_i` with `main` at `B`: unsettled (below).
+  - everything at `B` and `H_i`: as far as reads can tell, nothing applied (a lagging read, or a refusal GitHub did not explain). The journal stays, and the next tick resends the same update (`retryLand`), but only as a fresh landing would be sent: with `main` still `B`, the batch's latest CI attempt `green` on `S_k` (§5.3 rule 5; a rerun that has since gone red, or is still running, stops it), and every PR revalidated against a fresh snapshot (§4.2); a PR that no longer revalidates ends the op (`opDropped`) and the next decision handles it. Each refusal that is not a transient error (5xx, network, rate limit) adds one to the op's `refused`; `queue.landing.maxRefusals` (default 3) in a row pause the queue, still with the journal kept, so a landing that did apply is still recorded by the next observation, and closing the pause resends once more.
+  - Resends are bounded by the op's own retry budget (`queue.timeouts.maxOpTries`): past it the queue pauses and the op ends, as for any op re-executed too often (§15).
+  - The guarantees hold: a resend is the same compare-and-swap, so an update that did apply can never apply twice (its `beforeOid`s no longer hold), and no inconclusive observation ever clears the journal. A resend costs no CI run, so no lineage or window budget is charged. Merge mode is unchanged: a refusal with `main` at `B` there still pauses unless it is transient.
+- **`main` moved first.** The call is refused, no branch moves, and the batch is rebuilt as in merge mode.
+- **A branch at `S_i` while `main` reads `B`.** `main` and the branches are read separately, so this is what a main read lagging behind an applied landing looks like, as well as a half-applied update (which atomicity rules out). No read can tell them apart, so it is never terminal (`landUnsettled`): the journal stays, the op is never re-sent, and each tick observes again, paused or not, so a landing that did apply is recorded as soon as `main` reads `S_k`. Only after `reconcileMinutes` since the op was journalled does it also pause, with the journal still kept, naming each branch and the head to restore. Qlander does not restore a branch itself. Once restored, the next observation (`main` at `B`, every branch at its admitted head) ends the op and the batch lands again.
+- **Evidence and approvals stay bound to `H_i`.** Admission, revalidation, the fast lane, the review and a §4.3 approval all name the admitted head, and the last revalidation before the landing is at `H_i`. The rewrite to `S_i` happens only inside the landing, atomically with `main`, after which the PR is no longer admitted: its landing is recorded and it is tracked in `verify` with `pin = S_i` and `admitted = H_i`. So nothing re-evaluates evidence at `S_i`, and no approval is asked for it. `S_i` is recognised as qlander's by its exact sha, which binds its recorded parent (the previous stack commit) and tree (the tested tree); any other head is somebody's push. A head of `S_i` or `H_i` waits for GitHub's merge mark (§7.3); anything else gets "commits pushed after it are not in main".
+- **The rewrite starts CI.** Moving a PR branch is a push to it: GitHub may run `pull_request` (synchronize) and branch `push` workflows on `S_i`, which costs target CI. Nothing reads them. Admission skips a PR whose verify entry names its head, so a red or pending fast lane on `S_i` neither stalls nor bounces anything, and the wait notices are not raised.
+- **The fence.** The landing is one write behind the lease fence like any other, and with the epoch fence on it carries the epoch entry: a successor's epoch refuses the whole call, and the fence reads it as a lost lease.
+
+**Branch names.** A PR head branch is checked with git's own rule (`isGitBranchName`, git check-ref-format) at admission, in the state parser and in the ref client, which encodes each path component. A name that fails it is refused at admission with a "Not queued" comment and `ready` removed, so the state never holds a name it cannot parse or the client cannot move.
+
+**Allowed refs (§11).** Only `landStack` (`src/github/target.ts`) writes a PR branch, only together with `main`, at most 100 branches, each a valid git branch name that is not `main`, `release`, a batch ref or the epoch branch, each a move between two different real SHAs. `getPrBranch` reads them, for recovery only. The state parser refuses a land op whose heads are not exactly the active batch's stack and each PR's recorded branch and admitted head.
+
+**Authorship (`queue.landing.author`).**
+- `app` (default): the queue App is author and committer, so GitHub signs the commit and a main that requires signed commits accepts it. The PR's author is credited with a last trailer, `Co-authored-by: <login> <<id>+<login>@users.noreply.github.com>`, from the PR's `user` as GitHub returns it; a PR with no readable account gets none. Never a real address.
+- `author`: the PR's author is the commit's author at that same noreply address. Qlander passes no committer, and GitHub's documented default makes the committer the author too. GitHub does not sign a git data API commit with another author, so these commits are unsigned: the build's signature check skips exactly the commits it gave another author, and still requires every App-authored one (a PR with no readable author falls back to the App, signed). No trailer: authorship already credits the same person, and a trailer naming them again would add nothing. Unsigned commits on `main` are refused when `main` requires signatures, so `audit` T13 fails `author` when a ruleset on `main` has `required_signatures` (rules are readable without admin) or classic protection requires signed commits (read with an admin token; without one that half is SKIPPED, and a failed read is SKIPPED and inconclusive, never assumed off). T8 then no longer demands `required_signatures` on `main`. Config validation cannot read the target, so the check lives in `audit`, which the rollout gates require clean.
+
+**Force-update compatibility.**
+- **At admission**, with only what the queue App can already read (Metadata and Contents, no new permission), each ready PR's head branch is classified (`src/force-update.ts`): GitHub's rules for the branch (`GET /rules/branches/{branch}`, repository and organization rulesets alike); for each `non_fast_forward` or `update` rule, its ruleset's `current_user_can_bypass` for the App itself; and the branch's `protected` flag. `always` or `exempt` everywhere, and no classic protection: **allowed**. `never` or `pull_requests_only` on any: **denied**, which wins over an unreadable answer on another ruleset (each ruleset's read is judged on its own), which holds the PR (a wait, `ready` kept, a comment naming the rule, once per head and rule), so it is evaluated again every tick and queued once the rule lets the App bypass it; an admitted PR that becomes denied is dropped the same way, keeping `ready`. Anything else, an unreadable answer, a ruleset GitHub does not name, or classic protection (whose settings need Administration read): **unknown**, advisory only, logged at admission; the landing's own refusal classification (above) is the backstop.
+- **In `audit` (T13)**, with the operator's token: rulesets as T8 reads them (repository and organization, include and exclude patterns) with `non_fast_forward` or `update`, against every open same-repo PR into `main` and against the patterns themselves. A ruleset that covers an open PR's branch without the queue App, by id, as a bypass actor in mode `always` FAILs; one whose pattern could cover a future PR branch WARNs; one whose bypass list cannot be read is SKIPPED (inconclusive on a failed read), never guessed. Classic protection on an open PR's branch that does not allow force pushes FAILs. `main`, `release`, the queue and build prefixes and the epoch branches are never PR branches and are left out.
+
+**Release advance (config).** Validation refuses `mode: linear` while `release.enabled` is true in advance mode, dry runs included (a dry run is the step before a live one): the hotfix protocol's merge-back (§9) must land as a real merge commit so that `release` becomes an ancestor of `main` again, and linear landing would squash it. With release advance off, linear is allowed. A `release.mode` key (`advance` | `dispatch`) is not in this schema yet; the check reads it defensively and refuses only when it is absent or `advance`, so dispatch mode, which advances nothing by fast-forward from `main`, is allowed when that key lands.
+
+**Target side.** The queue App must be able to force-update PR branches: a ruleset that blocks non-fast-forward updates on feature branches needs the queue App as a bypass actor in mode `always` (T13 checks it). A main ruleset requiring linear history is satisfied by the stack, and one requiring signed commits by `author: app`. Forks are never admitted, so every branch is in the target.
+
+**Limits.**
+- A hotfix merge-back (§9) would land squashed, so validation refuses linear mode with release advance on (above).
+- The PR's own commits never reach `main`, so a PR that is merged into another branch afterwards, or reopened, needs a person.
+- The new state fields (`auth.headRef`, `active.stack`, `parked.stack`, the checkpoint's `stack`, a land op's `heads`, `verify.admitted`) appear only in linear mode. Run a release that reads them before turning the mode on: an older one refuses them and pauses.
 
 ## 8. Release advance
 
@@ -453,7 +505,7 @@ The release job is a separate job in `tick.yml` (§12.1), run by a separate App,
 2. The target's PR CI runs the **full** pre-landing suite for PRs with base `release` (a target-side requirement, §13).
 3. The release-landing ruleset requires a PR, the full required checks, **strict up-to-date** and merge commits only. A human merges in the GitHub UI. Strict up-to-date means the merge commit's tree equals the tested head's tree, and the commit is signed by GitHub.
 4. The target qualifies the landed release SHA. Ship paths ship only qualified release SHAs.
-5. **Merge-back:** create a branch `merge-back/<slug>` at the release tip and open a PR into `main`. It goes through the normal queue, and it is classified by its **actual diff against main** (`GET /compare/main...<head>` files), like any other PR. Release ancestry confers nothing. A merge-back that touches the policy boundary is a policy PR: it runs solo and needs the §4.3 approval. Qlander lands it as a real merge commit, so `release` becomes an ancestor of `main` again, and the release advance resumes.
+5. **Merge-back** (merge mode only: validation refuses linear landing while release advance is on, §7.4): create a branch `merge-back/<slug>` at the release tip and open a PR into `main`. It goes through the normal queue, and it is classified by its **actual diff against main** (`GET /compare/main...<head>` files), like any other PR. Release ancestry confers nothing. A merge-back that touches the policy boundary is a policy PR: it runs solo and needs the §4.3 approval. Qlander lands it as a real merge commit, so `release` becomes an ancestor of `main` again, and the release advance resumes.
 6. Qlander does not automate steps 1–4.
 
 ## 10. Operator surface
@@ -503,7 +555,7 @@ The one residual: a crash between creating an issue and saving its receipt, with
 | --- | --- |
 | Event | `schedule` or `workflow_dispatch` only. There is **no `repository_dispatch`**. Polling replaces the wake-up credential. |
 | Repository | The target and control repo ids come from `qlander.yml` and are checked against `GET /repos` on connect. Every PR, run, job and status is checked by id, not by name. |
-| Refs | Writes are only allowed to `main` and `queue/<n>`/`qlander-build/<n>` (queue App), or to `release` (release App). `main` and `release` are only moved, never created or deleted; batch refs are only created or deleted through the ref APIs, and `POST /merges` advances build refs. With the epoch fence on, a job also advances its own epoch branch, and `voidEpoch` advances a predecessor's recorded epoch branch, which must not overlap any branch above and must point at an empty-tree commit (docs/deployment.md §3.4). The client wrapper enforces this, and `n` matches `^[1-9][0-9]{0,8}$`. |
+| Refs | Writes are only allowed to `main` and `queue/<n>`/`qlander-build/<n>` (queue App), or to `release` (release App), and, in linear mode only, to a landed PR's recorded head branch inside the landing's one atomic update (§7.4). `main` and `release` are only moved, never created or deleted; batch refs are only created or deleted through the ref APIs, and `POST /merges` advances build refs. With the epoch fence on, a job also advances its own epoch branch, and `voidEpoch` advances a predecessor's recorded epoch branch, which must not overlap any branch above and must point at an empty-tree commit (docs/deployment.md §3.4). The client wrapper enforces this, and `n` matches `^[1-9][0-9]{0,8}$`. |
 | SHAs | `^[0-9a-f]{40}$` on every read and before every write. |
 | PR numbers | Integers from 1 to 10⁷. |
 | URLs | A proof status's `target_url` must match the anchored pattern in §8. |
@@ -576,6 +628,7 @@ Qlander is not enabled on a target until each requirement is in place and verifi
 - main-integrity: **no bypass**; required signatures, non-fast-forward, deletion.
 - release-landing (with release advance): PR required, full checks, strict up-to-date, merge commits only; bypass for the release App, plus the break-glass humans. It doesn't restrict updates, because a person merges a green hotfix PR there (§9).
 - release-integrity: no bypass; signatures, non-fast-forward, deletion.
+- With linear landing (§7.4): any ruleset that blocks non-fast-forward updates on PR head branches lists the queue App as a bypass actor (by App id, mode `always`), since the landing force-moves them, and classic protection on PR branches allows force pushes. With `queue.landing.author: author`, `main` does not require signed commits. `audit` T13 checks both.
 - queue-refs (`queue/**`, `qlander-build/**`): restrict creation, update and deletion; bypass for the queue App only.
 
 A separate integrity ruleset is needed because a bypass actor skips every rule in its ruleset.
@@ -598,6 +651,15 @@ A separate integrity ruleset is needed because a bypass actor skips every rule i
   7. The state App can move both protected state branches with `updateRefs`, and nothing else can, GitHub Actions included.
 
   If step 2 fails, retry with the GraphQL `mergeBranch` mutation. If both fail, stop: the design needs another signing route before anything else.
+
+  With linear landing (§7.4), also, by hand until `verify-sandbox` covers it:
+  8. A commit the App creates with the git data API on a merge commit's tree, with one parent, returns `verified` with reason `valid`.
+  9. One `updateRefs` that fast-forwards `main` and force-moves two PR branches, with correct `beforeOid`s, is accepted, and GitHub marks both PRs merged.
+  10. The same call with one PR branch's `beforeOid` stale (push to it first) is refused, and neither `main` nor the other branch moves; likewise with `main`'s `beforeOid` stale. A forced entry whose `beforeOid` is wrong must be refused, not applied.
+  11. Whether GitHub runs `pull_request` and `push` workflows on the moved branches, and in which order it processes the two kinds of entry, is recorded; a PR must end merged either way.
+  12. A git data API commit with an `author` (a user's noreply address) and no committer comes back unsigned, with that user as committer as well (GitHub's documented default), and GitHub attributes it to that user; with `author: app` the `Co-authored-by` trailer shows the PR author as co-author.
+  13. With the queue App's own installation token: `GET /rules/branches/{branch}` lists repository and organization `non_fast_forward` rules on a PR branch, and `GET /rulesets/{id}?includes_parents=true` returns `current_user_can_bypass` (`always` when the App is a bypass actor in mode `always`, `pull_requests_only` or `never` otherwise, `exempt` where it applies), with only Metadata and Contents read; `GET /branches/{branch}` returns `protected`.
+  14. A landing whose PR branch is covered by a `non_fast_forward` ruleset without the App as bypass actor is refused whole; with the App added in mode `always` it is accepted.
 - **G2:** the target-side requirements (§13) are in place, and GitHub Actions cannot approve PRs in the control repo.
 - **G3:** dry run against the target for at least one day. The tick is live only when the repo variable `QLANDER_MODE` is exactly `live`. Unset, or any other value, means a dry run: it reads state and GitHub, decides, and prints what it would do, with a read-only target client, no lease and no writes anywhere.
 - **G4:** enable the queue (`QLANDER_MODE=live`). Release advance is enabled separately, once its target-side requirements hold, by a reviewed change setting `release.dryRun` to false; until then the release job dry-runs whatever the mode says.
@@ -626,6 +688,12 @@ A separate integrity ruleset is needed because a bypass actor skips every rule i
 | Head changed, PR closed, unready, retargeted, or a policy fact changed | Revalidation (§4.2) drops the PR, abandons the batch and charges the run. |
 | Conflict | Drop the PR, unready it and comment. |
 | PR not marked merged | Report it (§7.3), after `queue.verify.ticks` ticks and at least 15 minutes. Never close it. |
+| Linear: a landing refused with every ref where the batch left it | Retried next tick, after revalidation, with the journal kept (§7.4). `queue.landing.maxRefusals` unexplained refusals in a row pause, journal kept; resends past `maxOpTries` pause and end the op. Transient errors are not counted. |
+| Linear: a PR's branch has a rule the queue App cannot bypass | Held at admission with a comment naming the rule, `ready` kept, re-evaluated every tick (§7.4). `audit` T13 fails it for an open PR's branch. |
+| Linear: a PR branch pushed to between the last revalidation and the landing | Its `beforeOid` fails, so the whole atomic update is refused and nothing moves (§7.4). The next tick drops that PR and rebuilds the rest. The push is never overwritten. |
+| Linear: a PR branch reads at its stack commit while `main` reads at its base | A lagging main read, or (ruled out by atomicity) a half-applied update. The journal stays and later reads settle it; past `reconcileMinutes`, pause with the journal kept, naming each branch and the head to restore. Qlander never moves a branch back by itself. |
+| Linear: an unsigned stack commit | Caught at build time (§7.4), before CI runs. Pause. |
+| Linear: a PR's head branch renamed after admission | Revalidation drops it as a moved head: the landing moves only the branch recorded at admission. |
 | The self-chain breaks (dispatch lost or refused, VM died, hourly cap reached) | The cron runs the next tick; the worst case equals the cron-only queue (§11.1). |
 | A PR weakens CI | §4.3: tested solo, and admitted only with an approval from an account listed as an approver, bound to its SHA. |
 | A key leaks | Integrity rulesets with no bypass still forbid force pushes and unsigned commits. Each key can move only its own refs. Revoke it in the App settings, and rotate keys yearly. |
@@ -641,6 +709,7 @@ These are accepted, and each has a bound:
 - **A comment can be missing** if a post's response is lost and the list never shows it (§15). This is cosmetic.
 - **A list that lags longer than `rerunBarrierMinutes` pauses the queue**, rather than risking a decision on an old attempt.
 - **The state branches' rulesets are unverified until G1** (§14), which checks that the state App can move both protected branches and that GitHub Actions and people cannot.
+- **Linear landing rests on GitHub behaviour the in-memory world only models** (§7.4): that `updateRefs` is atomic across `main` and forced PR-branch entries, that a forced entry still honours its `beforeOid`, that a PR whose rewritten head reaches `main` is marked merged, and that git data API commits by the App are signed. G1 steps 8 to 11 (§14) check them; until then, keep the mode off. A refused landing whose reads still show every ref where the batch left it is resent on later ticks, after revalidation; a read lagging behind an author's push looks the same, and its resend is refused by the same compare-and-swap, so it costs at most `maxRefusals` ticks and a pause, never an overwritten push. A landing paused after `maxOpTries` resends ends its op; had it applied unseen through every one of those reads, the next decision would see `main` at the stack's tip and rebuild rather than record it, which is cosmetic for the PRs (GitHub marks them merged) but leaves a `rebuilt` entry instead of `landed`.
 
 ## 16. Cost
 
@@ -665,6 +734,6 @@ These are accepted, and each has a bound:
 
 - Release-hotfix automation (§9 is manual).
 - `repository_dispatch` wake-ups (promptness comes from self-chaining with the job's own `GITHUB_TOKEN`, §11.1, with no new credential).
-- Squash and rebase landing.
+- Rebase landing (one commit on `main` per PR commit). Squash landing is linear mode (§7.4).
 - Policy option (a), gates from protected main (§4.3).
 - Megabatches that bypass the solo filter.

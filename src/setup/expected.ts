@@ -241,7 +241,8 @@ export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSp
       extraBypass: "keep",
       needsInstalled: ["queue"],
     },
-    { repo, name: "main-integrity", include: [heads(n.main)], rules: INTEGRITY, bypass: [], extraBypass: "none", needsInstalled: [] },
+    // queue.landing.author author lands unsigned commits (DESIGN.md §7.4), so setup does not ask for signatures there; one already on the ruleset is kept (setup only tightens), and audit T13 reports it.
+    { repo, name: "main-integrity", include: [heads(n.main)], rules: c.config.landing?.author === "author" ? INTEGRITY.filter((r) => r.type !== "required_signatures") : INTEGRITY, bypass: [], extraBypass: "none", needsInstalled: [] },
   );
   if (c.release.enabled) {
     const full = releaseRequiredChecks(c).map((context) => ({ context }));

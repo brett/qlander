@@ -3,7 +3,10 @@
 // outbox, and at most one external effect is journalled per tick. The runner
 // performs that op and feeds the outcome to applyOpResult() (ops.ts).
 
-import { admit, type LivePr, NEEDS_APPROVAL, revalidate, waiverFor } from "./admission";
+import { admit, FORCE_DENIED, type LivePr, NEEDS_APPROVAL, revalidate, waiverFor } from "./admission";
+
+/** A short stable key for a comment marker. */
+const stableKey = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
 import { describeWaiver } from "./automation";
 import { baselineResult, mainFailures, NOT_RED, ownFailures } from "./baseline";
 import { flakyItems, GIVE_UP_HOURS, jobId } from "./flaky";
@@ -122,7 +125,7 @@ const heldList = (prs: number[]) => prs.map((p) => `#${p}`).join(" ");
 
 /** Why a PR left the queue, for the `dequeued` hook event. */
 function dequeueKind(reason: string): string {
-  if (reason.startsWith("head moved")) return "head_moved";
+  if (reason.startsWith("head moved") || reason.startsWith("head branch changed")) return "head_moved";
   if (reason === "qlander policy changed" || reason === "policy classification changed") return "policy_changed";
   if (reason === "not labelled ready") return "label_removed";
   if (reason === "not open") return "closed";
@@ -224,6 +227,24 @@ function startBuild(c: Ctx, prs: number[], depth: number, lineage: number, sourc
   journal(c, { kind: "build", n: c.s.seq, base, pins, depth, lineage, source, rebuild }, true);
 }
 
+/**
+ * Journal the landing of a green batch (DESIGN.md §7.2). In linear mode
+ * (§7.4) the same atomic update moves each PR's head branch, the one recorded
+ * at admission, from its admitted head to its own stack commit.
+ */
+function land(c: Ctx, a: Active): void {
+  focus(c.s, a);
+  const heads = a.stack?.map((x) => {
+    const auth = c.s.auth[String(x.pr)]!;
+    return { pr: x.pr, ref: auth.headRef ?? "", before: auth.head, after: x.commit };
+  });
+  if (heads?.some((h) => h.ref === "")) {
+    pause(c, `batch ${a.n}: a PR in its linear stack has no recorded head branch`);
+    return;
+  }
+  journal(c, { kind: "land", before: a.base, after: a.head, ...(heads ? { heads } : {}) }, false);
+}
+
 /** A rerun, cancel or landing concerns `state.active`: the batch moves there before the op is journalled. */
 function rerun(c: Ctx, a: Active, runs: RunRef[]): void {
   focus(c.s, a);
@@ -275,7 +296,7 @@ function abandon(c: Ctx, a: Active, survivors: number[], note: string): void {
   const park = c.cfg.strategy?.reuseGreen && c.pausing && a.on === undefined && survivors.length === a.prs.length;
   if (park) {
     if (c.s.parked) unpark(c, `batch ${a.n} is parked instead`);
-    c.s.parked = { n: a.n, base: a.base, head: a.head, pins: pinsOf(c, a.prs), depth: a.depth, lineage: a.lineage, builtAt: a.builtAt };
+    c.s.parked = { n: a.n, base: a.base, head: a.head, pins: pinsOf(c, a.prs), depth: a.depth, lineage: a.lineage, builtAt: a.builtAt, ...(a.stack ? { stack: a.stack } : {}) };
     c.log.push(`batch ${a.n} parked: it lands without a rebuild if its run on ${a.base} is green when the queue resumes`);
   } else cancelRuns(c, a.n, a.head);
   if (survivors.length > 0 && a.on === undefined) requeuePending(c, [{ prs: survivors, depth: a.depth, lineage: a.lineage }]);
@@ -408,13 +429,16 @@ function processVerify(c: Ctx): void {
       continue;
     }
     if (!pr.open) continue;
-    if (pr.head !== v.pin) {
+    // Linear landing (DESIGN.md §7.4): the branch still reading at its admitted head is not a push; it waits like an unmarked PR.
+    if (pr.head !== v.pin && pr.head !== v.admitted) {
       unready(c, v.pr, tag);
       comment(
         c,
         v.pr,
         tag,
-        `Landed revision \`${v.pin}\` in main (\`${v.landedIn}\`). Commits pushed after it are **not** in main; this PR stays open for them.`,
+        v.admitted
+          ? `Landed revision \`${v.admitted}\` in main as \`${v.pin}\` (\`${v.landedIn}\`). Commits pushed after it are **not** in main; this PR stays open for them.`
+          : `Landed revision \`${v.pin}\` in main (\`${v.landedIn}\`). Commits pushed after it are **not** in main; this PR stays open for them.`,
       );
       continue;
     }
@@ -426,7 +450,9 @@ function processVerify(c: Ctx): void {
         c,
         v.pr,
         `${tag}:unmarked`,
-        `\`${v.pin}\` is in main at \`${v.landedIn}\`, but GitHub has not marked this PR merged. A maintainer may close it.`,
+        v.admitted
+          ? `This PR landed as \`${v.pin}\` (squashed from \`${v.admitted}\`), which is in main at \`${v.landedIn}\`, but GitHub has not marked this PR merged${pr.head === v.admitted ? `, and its branch still reads at \`${v.admitted}\`` : ""}. A maintainer may close it.`
+          : `\`${v.pin}\` is in main at \`${v.landedIn}\`, but GitHub has not marked this PR merged. A maintainer may close it.`,
       );
       next.notified = true;
     }
@@ -488,7 +514,8 @@ function admitAndRevalidate(c: Ctx): void {
       because(c, live.number, "removed from the queue this tick");
       continue;
     }
-    if (c.s.verify.some((v) => v.pr === live.number && v.pin === live.head)) {
+    // Linear landing (DESIGN.md §7.4): the pin is qlander's stack commit; a read showing the admitted head may lag behind the landing.
+    if (c.s.verify.some((v) => v.pr === live.number && (v.pin === live.head || v.admitted === live.head))) {
       because(c, live.number, "landed at this head; waiting for GitHub to mark it merged");
       continue;
     }
@@ -506,10 +533,14 @@ function admitAndRevalidate(c: Ctx): void {
         reviewRun: live.review.run?.runId ?? null,
         ...(live.author ? { author: live.author } : {}),
         ...(c.cfg.names.labels.priority && live.priority ? { priority: { by: live.priority.actorLogin, at: live.priority.at } } : {}),
+        // Linear landing (DESIGN.md §7.4): the only branch the landing may move for this PR.
+        ...(c.cfg.landing ? { headRef: live.headRef } : {}),
       };
       const waiver = waiverFor(live, c.cfg);
       if (waiver) c.s.auth[key] = { ...c.s.auth[key]!, waiver };
       c.log.push(`admit #${live.number} at ${live.head}${waiver ? ` (${describeWaiver(waiver)})` : ""}`);
+      // Advisory only: a landing GitHub refuses is classified and retried (DESIGN.md §7.4).
+      if (live.forceUpdate?.kind === "unknown") c.log.push(`#${live.number}: whether the queue App may force-update ${live.headRef} is unknown: ${live.forceUpdate.why}`);
       const au = c.s.auth[key]!;
       emit(c, { event: "admitted", key: `admitted:${key}:${au.head}:${au.admittedAt}`, batch: null, prs: [hookPr(c, live.number)], details: { policyPr: au.policyPr, ...(au.priority ? { priority: { by: au.priority.by } } : {}), ...(au.waiver ? { waiver: { rule: au.waiver.rule, login: au.waiver.login, readyByBot: au.waiver.readyByBot, policyWaived: au.waiver.policyWaived } } : {}) } });
       const e = c.s.eligibleSince?.[key];
@@ -521,6 +552,10 @@ function admitAndRevalidate(c: Ctx): void {
       comment(c, live.number, `adm:${live.head}`, `Not queued: ${a.reason}. Fix it and re-add \`ready\`.`);
     } else if (a.kind === "wait") {
       c.log.push(`#${live.number} waits: ${a.reason}`);
+      // Linear landing (DESIGN.md §7.4): said at once, once per head and rule; `ready` stays, so it is evaluated again every tick.
+      if (live.forceUpdate?.kind === "denied" && a.reason.startsWith(FORCE_DENIED)) {
+        comment(c, live.number, `force:${live.head}:${stableKey(live.forceUpdate.rule)}`, `Labelled \`ready\` but not queued: this queue lands linear, which moves the PR's head branch \`${live.headRef}\` to its squashed commit, and that branch has ${live.forceUpdate.rule}. Let the queue App bypass that rule for this branch (bypass mode "always"), or push the change from a branch it does not cover. \`ready\` stays on: the PR is queued once the rule allows it.`);
+      }
       if (live.mergeable === null) waitNotice(c, live, "merge", hold(c, live.number, live.head));
       else if (live.fastLane.red) waitNotice(c, live, "fast", Date.parse(live.ready!.at), live.fastLane.why);
       if (a.reason.startsWith(NEEDS_APPROVAL)) {
@@ -671,8 +706,7 @@ function handleActive(c: Ctx, a: Active): void {
         }
         return;
       }
-      focus(c.s, a);
-      journal(c, { kind: "land", before: a.base, after: a.head }, false);
+      land(c, a);
       return;
     }
     case "red":
@@ -933,7 +967,7 @@ function reuseParked(c: Ctx): boolean {
   delete c.s.parked;
   setActives(c.s, [a], a.n);
   c.log.push(`batch ${a.n} reused: its run on this main went green while it was parked; landing it without a rebuild`);
-  journal(c, { kind: "land", before: a.base, after: a.head }, false);
+  land(c, a);
   return true;
 }
 

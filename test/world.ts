@@ -103,6 +103,7 @@ export class World {
 
   /** The PRs a queue head merged, from its chain: second parent = a PR head. */
   batchPrs(sha: string): number[] {
+    if (this.target.created.has(sha)) return this.stackPrs(sha);
     const out: number[] = [];
     let cur = sha;
     for (;;) {
@@ -113,6 +114,23 @@ export class World {
       cur = c.parents[0]!;
     }
     return out;
+  }
+
+  /**
+   * Linear landing: the PRs a stack holds, from the build's own record (the
+   * checkpoint's survivors, persisted before the queue ref is pushed), never
+   * guessed from trees: a PR based on another's branch adds both heads' changes.
+   */
+  private stacks = new Map<string, number[]>();
+  stackPrs(sha: string): number[] {
+    let prs = this.stacks.get(sha);
+    if (!prs) {
+      const cp = this.stateRef.current ? parseState(this.stateRef.current.text, this.config.names).journal?.checkpoint : null;
+      if (!cp?.stack || cp.chainHead !== sha) throw new Error(`world: no recorded build for stack head ${sha}`);
+      prs = cp.survivors.map((p) => p.pr);
+      this.stacks.set(sha, prs);
+    }
+    return prs;
   }
 
   private mainHas(): number[] {

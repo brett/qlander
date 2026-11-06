@@ -4,8 +4,9 @@
 import type { AutomationTrust } from "./automation";
 import type { Config } from "./config";
 import type { Proof } from "./evidence";
+import type { ForceUpdate } from "./force-update";
 import type { Auth, Waiver } from "./state";
-import { isForbiddenHeadRef, isSha } from "./validate";
+import { isForbiddenHeadRef, isGitBranchName, isSha } from "./validate";
 
 export interface LivePr {
   number: number;
@@ -29,6 +30,8 @@ export interface LivePr {
   policyApproval: boolean;
   /** The PR author's login, for hook payloads only. */
   author?: string;
+  /** The PR author's account id: with `author`, their noreply address for a linear stack commit (DESIGN.md §7.4). */
+  authorId?: number;
   /** The PR's title (untrusted), for the merge commit message only. Admission never reads it. */
   title?: string;
   /** Set when a configured trusted automation opened the PR (src/automation.ts); absent otherwise. */
@@ -41,6 +44,12 @@ export interface LivePr {
   priority?: { actorLogin: string; at: string };
   /** Why a priority label on this PR does not count (for the log); absent when there is none or it counts. */
   priorityIgnored?: string;
+  /**
+   * Linear landing only (DESIGN.md §7.4): whether the queue App may
+   * force-update the head branch (src/force-update.ts). `denied` holds the
+   * PR; `unknown` is advisory. Absent in merge mode.
+   */
+  forceUpdate?: ForceUpdate;
   /** Why `ready` is null although the PR carries the label (for the tick's verdict only); admission never reads it. */
   readyUnreadable?: string;
 }
@@ -51,6 +60,9 @@ export type Admission =
 
 /** The wait reason of a policy PR that has everything but its §4.3 approval (emits approval_needed). */
 export const NEEDS_APPROVAL = "CI-policy change needs a SHA-bound approval";
+
+/** The wait reason of a PR whose head branch the linear landing could not move (DESIGN.md §7.4). */
+export const FORCE_DENIED = "linear landing cannot move its head branch";
 
 export const WRITERS = new Set(["write", "maintain", "admin"]);
 
@@ -65,6 +77,8 @@ export function admit(pr: LivePr, cfg: Config): Admission {
   if (pr.baseRef !== n.main || pr.baseRepoId !== n.target.id) return ignore(`base is not ${n.target.name} ${n.main}`);
   if (pr.headRepoId !== n.target.id) return ignore(`head is not in ${n.target.name} (fork)`);
   if (isForbiddenHeadRef(n, pr.headRef)) return ignore(`head branch '${pr.headRef}' is reserved`);
+  // Linear landing moves this branch (DESIGN.md §7.4): one rule for admission, the state and the ref client.
+  if (cfg.landing && !isGitBranchName(pr.headRef)) return unready(`its head branch name ${JSON.stringify(pr.headRef)} is not one linear landing can move`);
   if (!isSha(pr.head)) return ignore("head is not a sha");
   if (!pr.labels.includes(n.labels.ready)) return ignore("not labelled ready");
   if (!pr.ready) return ignore("who applied ready is not readable");
@@ -82,6 +96,7 @@ export function admit(pr: LivePr, cfg: Config): Admission {
   if (!pr.commitsVerified) return unready("has unsigned commits");
   if (!pr.fastLane.ok) return wait(`fast lane: ${pr.fastLane.why}`);
   if (!pr.review.ok) return wait(`review: ${pr.review.why}`);
+  if (cfg.landing && pr.forceUpdate?.kind === "denied") return wait(`${FORCE_DENIED}: ${pr.forceUpdate.rule}`);
   if (pr.policyPr && !pr.policyApproval && !trusted) {
     const why = pr.automation && !pr.automation.ok ? ` (trusted automation: ${pr.automation.why})` : "";
     return wait(`${NEEDS_APPROVAL}${why}`);
@@ -119,6 +134,8 @@ export type Revalidation =
 export function revalidate(auth: Auth, pr: LivePr | undefined, cfg: Config, policyHash: string): Revalidation {
   if (!pr) return { ok: false, hold: false, headMoved: false, reason: "PR not readable" };
   if (pr.head !== auth.head) return { ok: false, hold: false, headMoved: true, reason: `head moved from ${auth.head} to ${pr.head}` };
+  // Linear landing (DESIGN.md §7.4): the landing moves the branch recorded at admission, so it must still be the PR's head branch.
+  if (auth.headRef !== undefined && pr.headRef !== auth.headRef) return { ok: false, hold: false, headMoved: true, reason: `head branch changed from ${auth.headRef} to ${pr.headRef}` };
   if (policyHash !== auth.policy) return { ok: false, hold: false, headMoved: true, reason: "qlander policy changed" };
   if (pr.policyPr !== auth.policyPr) return { ok: false, hold: false, headMoved: true, reason: "policy classification changed" };
   // Admitted under a trusted-automation waiver: it must still hold, for the same bot.

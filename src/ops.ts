@@ -35,6 +35,17 @@ export type OpResult =
   | { kind: "opAbandoned"; reason: string }
   | { kind: "landed" }
   | { kind: "landRejected"; retry: boolean; reason: string }
+  /** Linear landing (DESIGN.md §7.4): refused because these PRs' branches moved since admission; nothing moved. */
+  | { kind: "headMoved"; prs: number[] }
+  /** Linear landing (DESIGN.md §7.4): reads disagree on whether it applied. The journal stays; `overdue` also pauses. */
+  | { kind: "landUnsettled"; overdue: boolean; reason: string }
+  /**
+   * Linear landing (DESIGN.md §7.4): refused with main and every PR branch
+   * reading where the batch left them. The journal stays and the next tick
+   * resends it after revalidating; `counted` (not a transient error) adds one
+   * to the op's `refused`, and maxRefusals in a row pause.
+   */
+  | { kind: "landRefused"; counted: boolean; reason: string }
   | { kind: "baseMoved" }
   | { kind: "cancelled" }
   | { kind: "retryOp" };
@@ -116,6 +127,18 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
     return withEvents(c, { state: s, log: [...c.log, line] });
   };
   if (result.kind === "retryOp") return { state: s, log: [`retry ${op.kind}`] };
+  if (result.kind === "landRefused" && op.kind === "land") {
+    const refused = (op.refused ?? 0) + (result.counted ? 1 : 0);
+    s.journal = { ...j, op: { ...op, ...(refused > 0 ? { refused } : {}) } };
+    const max = cfg.landing?.maxRefusals ?? 1;
+    if (refused >= max) pause(c, `batch ${s.active?.n ?? "?"}: the linear landing was refused ${refused} times in a row with main and every PR branch where the batch left them: ${result.reason}`);
+    return withEvents(c, { state: s, log: [...c.log, `landing refused (${refused} of ${max} in a row): ${result.reason}; retried next tick`] });
+  }
+  if (result.kind === "landUnsettled" && op.kind === "land") {
+    // Never terminal: the journal stays, so the next tick observes again, paused or not.
+    if (result.overdue) pause(c, `batch ${s.active?.n ?? "?"}: ${result.reason}`);
+    return withEvents(c, { state: s, log: [...c.log, `landing unsettled: ${result.reason}`] });
+  }
 
   if (op.kind === "build") {
     const rec = j.checkpoint;
@@ -182,6 +205,7 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
           cancels: [],
           builtAt: c.now,
           ...(under ? { on: under.n } : {}),
+          ...(rec.stack ? { stack: rec.stack } : {}),
         };
         setActives(s, [...actives(s), batch]);
         notify(c, { id: `db:${op.n}`, kind: "deleteRef", ref: buildRef(cfg.names, op.n) });
@@ -306,9 +330,12 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
       for (const pr of a.prs) {
         const auth = s.auth[String(pr)];
         if (!auth) continue;
-        s.verify.push({ pr, pin: auth.head, landedIn: op.after, since: c.now, ticks: 0, notified: false });
+        // Linear landing (DESIGN.md §7.4): the PR's branch now points at its stack commit, which is what main contains.
+        const moved = op.heads?.find((h) => h.pr === pr);
+        s.verify.push({ pr, pin: moved?.after ?? auth.head, landedIn: op.after, since: c.now, ticks: 0, notified: false, ...(moved ? { admitted: auth.head } : {}) });
         const waived = auth.waiver ? `\n\nLanded under a ${describeWaiver(auth.waiver)}. It ran the full pre-landing suite in a batch of its own.` : "";
-        if (!comments.omit.includes("landed")) comment(c, pr, `landed:${a.n}`, `Landed in ${cfg.names.main} at \`${op.after}\` (batch ${a.n}, pin \`${auth.head}\`).${prioritised(auth)}${waived}`);
+        const as = moved ? `, squashed as \`${moved.after}\`, which its branch now points at` : "";
+        if (!comments.omit.includes("landed")) comment(c, pr, `landed:${a.n}`, `Landed in ${cfg.names.main} at \`${op.after}\` (batch ${a.n}, pin \`${auth.head}\`${as}).${prioritised(auth)}${waived}`);
         delete s.auth[String(pr)];
       }
       record(c, { n: a.n, outcome: "landed", prs: a.prs, head: op.after, note: `main ${op.before} -> ${op.after}` });
@@ -323,9 +350,48 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
       return finish(`landing not applied: ${result.reason}`);
     }
     if (result.kind === "baseMoved") return finish("main moved before landing; the next tick rebuilds");
+    // Linear (DESIGN.md §7.4): resent too often (maxOpTries), or no longer valid to resend: the next decision starts afresh.
+    if (result.kind === "opAbandoned") {
+      pause(c, `batch ${a?.n ?? "?"}: ${result.reason}`);
+      return finish(`landing abandoned: ${result.reason}`);
+    }
+    if (result.kind === "opDropped") return finish(`landing not resent: ${result.reason}`);
+    // Nothing moved: the next tick's revalidation sees the new head, drops that PR and rebuilds the rest (§5.3 rule 3).
+    if (result.kind === "headMoved") return finish(`landing not applied: ${result.prs.map((p) => `#${p}`).join(" ")} moved since admission; the next tick drops ${result.prs.length > 1 ? "them" : "it"} and rebuilds the rest`);
   }
 
   throw new Error(`applyOpResult: ${result.kind} does not fit op ${op.kind}`);
+}
+
+/**
+ * Linear landing (DESIGN.md §7.4), with main reading at its base after the
+ * update failed or its outcome was lost. GitHub applies the update
+ * atomically, so a PR branch at its stack commit means the update applied and
+ * the main read lags, or (never expected) GitHub broke its promise. Reads
+ * cannot tell these apart, so that is never terminal: the journal stays and
+ * later reads settle it (`landUnsettled`); past `reconcileMinutes` it also
+ * pauses, still keeping the journal, naming the branches. A branch at
+ * anything but its admitted head and its stack commit was pushed to: the
+ * update was refused for it, and the next tick drops it. Null: every branch
+ * is untouched.
+ */
+export function headsVerdict(
+  heads: Extract<Op, { kind: "land" }>["heads"],
+  now: Record<string, string | null> | undefined,
+  timing: { since: string; now: Date; reconcileMinutes: number },
+): OpResult | null {
+  if (!heads || !now) return null;
+  const half = heads.filter((h) => now[String(h.pr)] === h.after);
+  if (half.length > 0) {
+    const overdue = timing.now.getTime() - Date.parse(timing.since) >= timing.reconcileMinutes * 60_000;
+    return {
+      kind: "landUnsettled",
+      overdue,
+      reason: `the linear landing's PR branches ${half.map((h) => `${h.ref} (#${h.pr})`).join(", ")} read at their stack commits while main still reads at its base. Either main's read lags (the landing applied, and the next read settles it) or GitHub applied only part of an atomic update. If main still does not move, restore ${half.map((h) => `#${h.pr} to ${h.before}`).join(", ")} before resuming; the journal is kept, so a landing that did apply is still recorded`,
+    };
+  }
+  const moved = heads.filter((h) => now[String(h.pr)] !== h.before).map((h) => h.pr);
+  return moved.length > 0 ? { kind: "headMoved", prs: moved } : null;
 }
 
 export interface Observation {
@@ -342,13 +408,15 @@ export interface Observation {
   /** land: current main, and whether op.after is main or an ancestor of it. */
   main?: string;
   afterReachable?: boolean;
+  /** land, linear (DESIGN.md §7.4): each moved PR branch's current commit (null: absent), by PR; read only while main is still op.before. */
+  heads?: Record<string, string | null>;
 }
 
-export type Recovery = OpResult | { kind: "resumeBuild"; head: string };
+export type Recovery = OpResult | { kind: "resumeBuild"; head: string } | { kind: "retryLand" };
 
 /** Recovery results that only record effects that already happened (allowed while paused). */
 export function isObservedOutcome(r: Recovery): boolean {
-  return !(r.kind === "resumeBuild" || r.kind === "retryOp");
+  return !(r.kind === "resumeBuild" || r.kind === "retryOp" || r.kind === "retryLand");
 }
 
 /**
@@ -403,7 +471,8 @@ export function interpretObservation(
     }
     case "land":
       if (o.afterReachable === true) return { kind: "landed" };
-      if (o.main === op.before) return { kind: "landRejected", retry: true, reason: "not applied" };
+      // Linear (DESIGN.md §7.4): every ref where the batch left it is resent, after revalidation, by the runner (retryLand); merge mode decides again.
+      if (o.main === op.before) return headsVerdict(op.heads, o.heads, { since: j.at, now: timing?.now ?? new Date(0), reconcileMinutes: timing?.reconcileMinutes ?? 0 }) ?? (op.heads ? { kind: "retryLand" } : { kind: "landRejected", retry: true, reason: "not applied" });
       return { kind: "baseMoved" };
     case "cancel":
       return { kind: "retryOp" };

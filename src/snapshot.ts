@@ -12,9 +12,10 @@ import { appCheck, isPolicyChange, jobAtMain, jobAtSubject, policyApproval, type
 import type { TargetApi, Compare } from "./github/api";
 import { GitHubError } from "./github/http";
 import type { Observation } from "./ops";
+import { type BypassRead, forceUpdateOf } from "./force-update";
 import type { Active, Journal, State } from "./state";
 import type { FailedJob, JobsByRun, Run } from "./types";
-import { type Command, COMMAND_KINDS, queueRef } from "./validate";
+import { type Command, COMMAND_KINDS, isForbiddenHeadRef, isGitBranchName, queueRef } from "./validate";
 
 export interface SnapshotInput {
   api: TargetApi;
@@ -57,6 +58,8 @@ class Lookups {
   private jobs: JobsByRun = {};
   readonly incomplete = new Set<number>();
   private search: { runs: Run[]; truncated: boolean } | null = null;
+  /** Linear landing's force-update check: each ruleset read once per snapshot. */
+  readonly bypass = new Map<number, Promise<BypassRead>>();
 
   constructor(
     private readonly api: TargetApi,
@@ -165,7 +168,7 @@ async function describePr(i: SnapshotInput, n: number, l: Lookups): Promise<Live
     fastLane: notEvaluated,
     review: notEvaluated,
     policyApproval: false,
-    ...(pr.user ? { author: pr.user.login } : {}),
+    ...(pr.user ? { author: pr.user.login, authorId: pr.user.id } : {}),
     ...(pr.title !== undefined ? { title: pr.title } : {}),
   };
   if (!open || !pr.labels.includes(i.cfg.names.labels.ready)) return live;
@@ -190,6 +193,8 @@ async function describePr(i: SnapshotInput, n: number, l: Lookups): Promise<Live
   const bot = automationFor(i.cfg.trustedAutomations, pr.user);
   if (bot) live.automation = await trustOf(i, bot, pr.head.ref, head, diff);
   live.fastLane = await fastLaneProof(i, head, l);
+  // Linear landing (DESIGN.md §7.4): can the landing move this branch? Never fails the snapshot.
+  if (i.cfg.landing && isGitBranchName(pr.head.ref) && !isForbiddenHeadRef(i.cfg.names, pr.head.ref)) live.forceUpdate = await forceUpdateOf(i.api, pr.head.ref, l.bypass);
   const auth = i.state.auth[String(n)];
   live.review = i.cfg.reviewRequired
     ? await reviewProof(i, head, l, auth && auth.head === head ? auth.reviewRun : null)
@@ -450,10 +455,20 @@ export async function observe(api: TargetApi, j: Journal, names: Names): Promise
       const ref = queueRef(names, op.n);
       const queueHead = await api.getRef(ref);
       if (queueHead === null || !j.checkpoint || !j.checkpoint.chainHead) return { queueHead, queueRef: ref, queueChainMatches: false };
-      // Walk back from the queue head: one merge commit per survivor, second
-      // parent = its pin, first parents ending at the recorded base.
       let cur = queueHead;
       let matches = queueHead === j.checkpoint.chainHead;
+      if (j.checkpoint.stack) {
+        // Linear (DESIGN.md §7.4): one commit per survivor, each exactly the recorded stack commit, on one parent, ending at the base.
+        for (const x of [...j.checkpoint.stack].reverse()) {
+          if (!matches) break;
+          const c = await api.getCommit(cur);
+          matches = c.sha === x.commit && c.parents.length === 1 && c.parents[0] === x.parent;
+          cur = c.parents[0] ?? "";
+        }
+        return { queueHead, queueRef: ref, queueChainMatches: matches && cur === op.base };
+      }
+      // Walk back from the queue head: one merge commit per survivor, second
+      // parent = its pin, first parents ending at the recorded base.
       for (const pin of [...j.checkpoint.survivors].reverse()) {
         if (!matches) break;
         const c = await api.getCommit(cur);
@@ -479,7 +494,14 @@ export async function observe(api: TargetApi, j: Journal, names: Names): Promise
       if (main === null) return { afterReachable: false };
       if (main === op.after) return { main, afterReachable: true };
       const c = await api.compare(op.after, main);
-      return { main, afterReachable: c.status === "ahead" || c.status === "identical" };
+      const afterReachable = c.status === "ahead" || c.status === "identical";
+      // Linear (DESIGN.md §7.4): main unmoved, so how did each PR branch end up?
+      if (!afterReachable && main === op.before && op.heads) {
+        const heads: Record<string, string | null> = {};
+        for (const h of op.heads) heads[String(h.pr)] = await api.getPrBranch(h.ref);
+        return { main, afterReachable, heads };
+      }
+      return { main, afterReachable };
     }
   }
 }

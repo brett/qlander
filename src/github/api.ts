@@ -9,6 +9,14 @@ export interface Commit {
   parents: string[];
   verified: boolean;
   reason: string;
+  /** The commit's tree (absent when the read did not return one). Linear landing (DESIGN.md §7.4) builds each stack commit on a merge commit's tree. */
+  tree?: string;
+}
+
+/** A commit's author as the git data API takes it (linear landing, `queue.landing.author: author`). No committer is passed, so GitHub makes the author the committer too. */
+export interface CommitAuthor {
+  name: string;
+  email: string;
 }
 
 /** A GitHub account as the API resolves it (a commit's author is null when its email maps to no account). */
@@ -187,11 +195,45 @@ export interface TargetApi {
    */
   epochHeld(epoch: string): Promise<boolean>;
 
+  /**
+   * A PR's head branch, read only for linear landing (DESIGN.md §7.4): the
+   * commit it points at, or null if it does not exist. Refused for main,
+   * release, the batch refs and anything else qlander reserves.
+   */
+  getPrBranch(branch: string): Promise<string | null>;
+  /**
+   * Linear landing's admission check (src/force-update.ts): the rules GitHub
+   * applies to a PR branch (GET /rules/branches/{branch}, repository and
+   * organization rulesets alike), each with its ruleset id (null if GitHub
+   * names none). Metadata read; never a reserved branch.
+   */
+  branchRules(branch: string): Promise<{ type: string; rulesetId: number | null }[]>;
+  /** A ruleset that applies to the repo (its own or its organization's): its name and `current_user_can_bypass` for this App (null when absent). */
+  rulesetBypass(id: number): Promise<{ name: string; bypass: string | null }>;
+  /** A PR branch's `protected` flag (classic branch protection); false if the branch does not exist. */
+  branchProtected(branch: string): Promise<boolean>;
+
   // writes (each refused unless the client's role allows it)
   createRef(branch: string, sha: string): Promise<void>;
   deleteRef(branch: string): Promise<void>;
   updateRef(branch: string, before: string, after: string): Promise<void>;
   merge(base: string, headSha: string, message: string): Promise<MergeResult>;
+  /**
+   * Linear landing (DESIGN.md §7.4): a new commit with this tree and exactly
+   * one parent, through the git data API, with GitHub's own author and
+   * signature. Returns its sha. Queue only.
+   */
+  createCommit(tree: string, parent: string, message: string, author?: CommitAuthor): Promise<string>;
+  /**
+   * Linear landing (DESIGN.md §7.4): one atomic GraphQL updateRefs that moves
+   * main by fast-forward (`force: false`, beforeOid `main.before`) and every
+   * PR head branch in `heads` from its admitted head to its stack commit
+   * (`force: true`, so a non-fast-forward, but still with beforeOid: a branch
+   * someone pushed to is refused, and with it the whole call). `epoch` is the
+   * epoch entry's commit with the epoch fence on, and null with it off; the
+   * fenced client (src/fenced.ts) fills it in, so callers pass null.
+   */
+  landStack(main: RefUpdate, heads: RefUpdate[], epoch: string | null): Promise<void>;
   rerunFailedJobs(runId: number): Promise<void>;
   cancelRun(runId: number): Promise<void>;
   /** Post a comment; returns its id (the delivery receipt). */

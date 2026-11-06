@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Linear landing, opt in with `queue.landing.mode: linear`, for repos that require linear history and squash-style commits. Each batch is built as a stack of single-parent commits on main, one per PR, on the same tree merge mode tests, and lands in one compare-and-swap update that also moves each PR's head branch to its stack commit, so GitHub marks the PR merged. An author push since admission refuses the whole update; that PR is dropped and the rest rebuild. `queue.landing.author` picks the commit author, admission and audit T13 check that the head branches can be force-updated, and a refused landing is retried before it pauses (`queue.landing.maxRefusals`). Linear mode can't be combined with release advance mode. Merge mode is unchanged, and so are its state and policy hash.
+
 ## 0.2.3
 
 One fix and a documentation update. State is unchanged, so this release reads what 0.2.2 wrote, and the policy hash is unchanged, so no admitted PR loses its place.

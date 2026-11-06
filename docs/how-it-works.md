@@ -20,7 +20,7 @@ Qlander reaches the target only through the GitHub API, using GitHub Apps. It ne
 1. **Qualify.** The PR's fast lane, the check named in [`queue.admission.fastLane`](configuration.md#queueadmissionfastlane), passes on its current head. Someone with write access then adds `ready`.
 2. **Admit.** On the next tick, qlander admits the PR and records its head SHA. If the head changes later, the PR leaves the queue and has to qualify again.
 3. **Batch.** Ready PRs are batched first in, first out. Each batch is merged onto `queue/<n>`, and the target's CI runs the full suite there.
-4. **Land.** When every required job passes, `main` moves to that exact commit with a compare-and-swap. GitHub then marks the PRs merged, and qlander removes `ready`.
+4. **Land.** When every required job passes, `main` moves to that exact commit with a compare-and-swap. GitHub then marks the PRs merged, and qlander removes `ready`. With [linear landing](#linear-landing-opt-in), each PR lands as one squashed commit instead of a merge.
 
 Who can add `ready`:
 
@@ -133,6 +133,22 @@ These results come from the test suite's simulator (`test/strategy.test.ts`), ne
 The queue is strictly first in, first out, by the time each PR was admitted. Split halves and solo retests always come before new PRs. `qlander:solo` changes how a PR is tested, not its place.
 
 The opt-in priority lane lets a human put an urgent PR first. See [Operating it](operating.md#bouncing-isolating-and-landing-prs).
+
+## Linear landing (opt-in)
+
+By default each PR lands as a merge commit. For a repo that requires linear history, set [`queue.landing.mode`](configuration.md#queuelanding) to `linear`:
+
+- **One commit per PR.** Each batch is built as a stack on `main`: one commit per PR, holding that PR's changes on top of the commit before it, with the message `<PR title> (#<number>)` and a body from `queue.landing.body`. Qlander still builds it through the GitHub API only, and a PR that conflicts gets the usual "Not queued" comment.
+- **CI is unchanged.** It runs on `queue/<n>` at the top of the stack. Splits and retests build new stacks.
+- **Landing.** One atomic update fast-forwards `main` to the tested commit and moves each PR's branch to its own commit in the stack, so GitHub sees the PR's head in `main` and marks it merged. Moving a PR branch is a force update, but only of the branch recorded when the PR was admitted, and only from the head it was admitted at.
+- **A push is never overwritten.** If someone pushed to a PR's branch, the whole update is refused and nothing moves. That PR leaves the queue with the usual comment, and the rest are rebuilt and retested.
+- **The rewrite isn't a push by the author.** The fast lane, review and CI-policy approval stay bound to the head that was admitted. GitHub may run your PR workflows on the moved branches; qlander ignores those runs.
+- **Authorship.** By default the queue App authors each commit, so GitHub signs it, and the PR's author is credited with a `Co-authored-by` trailer at their GitHub noreply address. With [`queue.landing.author`](configuration.md#queuelanding) set to `author`, the PR's author is the commit's author instead; those commits are unsigned, so `audit` fails it if `main` requires signed commits.
+- **Branch rules.** The queue App must be able to force-update PR branches. A PR whose branch has a rule the App can't bypass waits with a comment naming the rule and keeps `ready`; `audit` (T13) checks your rulesets and branch protection for this.
+- **A refused landing is retried.** If GitHub refuses the landing and nothing has moved, qlander retries it on the next tick, and pauses only after `queue.landing.maxRefusals` refusals in a row.
+- **Release advance.** It can't be combined with linear landing: a hotfix merge-back would land squashed, so `release` would never rejoin `main`. Validation refuses the combination.
+
+The setting is policy, so changing it takes `ready` off admitted PRs. Qlander's tests can only model GitHub's side of this (the atomic update and the merged mark), so check it in a sandbox repo first ([DESIGN.md §14](../DESIGN.md#14-rollout-gates-in-order-each-is-mandatory), G1). See [DESIGN.md, Linear landing](../DESIGN.md#74-linear-landing-opt-in-queuelandingmode-linear).
 
 ## After landing
 

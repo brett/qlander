@@ -65,6 +65,23 @@ export function isWritableRef(names: Names, ref: string, app: "queue" | "release
 /** Every target branch qlander reads or writes: main, release and the batch refs. */
 export const isQlanderBranch = (names: Names, ref: string) => ref === names.main || ref === names.release || isQueueRef(names, ref) || isBuildRef(names, ref);
 
+/**
+ * A branch name as git itself accepts it (git check-ref-format, applied to
+ * `refs/heads/<name>`), which is what GitHub allows for a PR's head branch:
+ * no control characters, space, `~ ^ : ? * [ \\`, `..`, `@{` or `//`; not
+ * `@`; no component that starts with `.` or ends with `.lock`; no leading or
+ * trailing `/`, no trailing `.`, no leading `-`; at most 255 bytes. Linear
+ * landing (DESIGN.md §7.4) uses this one rule at admission, in the state
+ * parser and in the ref client, so a name that is admitted is always one the
+ * state can hold and the client can move.
+ */
+export function isGitBranchName(x: unknown): x is string {
+  if (typeof x !== "string" || x.length === 0 || new TextEncoder().encode(x).length > 255) return false;
+  if (/[\x00-\x20\x7f~^:?*[\\]/.test(x) || x.includes("..") || x.includes("@{") || x.includes("//") || x === "@") return false;
+  if (x.startsWith("/") || x.endsWith("/") || x.endsWith(".") || x.startsWith("-")) return false;
+  return x.split("/").every((c) => !c.startsWith(".") && !c.endsWith(".lock"));
+}
+
 /** Head branches that are never admitted (DESIGN.md §4.2). */
 export function isForbiddenHeadRef(names: Names, ref: string): boolean {
   return ref === names.main || ref === names.release || ref.startsWith(names.queuePrefix) || ref.startsWith(names.buildPrefix);

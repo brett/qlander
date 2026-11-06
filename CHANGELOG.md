@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- A batch no longer waits forever when GitHub reports its CI run `completed` but still lists one of its jobs as `in_progress` (or `queued`), even with that job's conclusion and `completed_at` set. Before, the in-progress timeout skipped completed runs, so the batch stayed pending until someone bounced the PR. Such a job still never counts as a pass. Once it is past `queue.timeouts.inProgressMinutes` from its own start, or the attempt is past the usual caps, the queue pauses with a configuration problem that names the run and the job, and the batch's PRs go back to the front of the queue with `ready` kept. Close the pause to retest them. A failure conclusion on such a job is still red at once.
+- A batch no longer waits forever when GitHub reports its CI run `completed` but still lists one of its jobs as `in_progress` (or `queued`), even with that job's conclusion and `completed_at` set. Before, the in-progress timeout skipped completed runs, so the batch stayed pending until someone bounced the PR. Such a job still never counts as a pass. Once it is past `queue.timeouts.inProgressMinutes` from its own start, or the attempt is past the usual caps, the queue pauses with a configuration problem that names the run and the job, and the batch's PRs go back to the front of the queue with `ready` kept (or are parked, with `queue.strategy.reuseGreen`). Close the pause to carry on. A failure conclusion on such a job is still red at once.
 
 ## 0.2.2
 

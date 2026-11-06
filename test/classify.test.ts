@@ -330,12 +330,19 @@ describe("a completed run whose job list still shows a job running", () => {
     expect(c.kind).toBe("red");
   });
 
-  test("a job still queued in a completed run hits the hard cap too", () => {
+  test("a job still queued in a completed run is bounded by queuedHours (nothing running)", () => {
     const queued = { ...staleJob(null, "queued"), started_at: null, completed_at: null };
-    const wait = classify(input([doneRun(), scanRun()], { "100": ci(queued), "200": okScan }, { now: new Date(at(21, 15)), builtAt: at(21, 10) }));
-    expect(wait.kind).toBe("pending");
-    const c = classify(input([doneRun(), scanRun()], { "100": ci(queued), "200": okScan }, { now: new Date(at(22, 10)), builtAt: at(21, 10) }));
-    expect(c.kind).toBe("config");
+    const at6h = (m: number) => classify(input([doneRun(), scanRun()], { "100": ci(queued), "200": okScan }, { now: new Date(at(21, 16, m)), builtAt: at(21, 10) }));
+    expect(at6h(0).kind).toBe("pending");
+    expect(at6h(1)).toMatchObject({ kind: "config", reason: "CI run 100 completed, but job 'Test' still shows queued past its time limit" });
+  });
+
+  test("whatever its jobs show, a completed run's stale job is bounded by queuedHours + inProgressMinutes", () => {
+    // A job restarted at 18:00 is under its own limit and is in_progress, so only the hard cap (18:30) applies.
+    const restarted = { ...staleJob(), started_at: at(21, 18) };
+    const run = (h: number, m: number) => classify(input([doneRun(), scanRun()], { "100": ci(restarted), "200": okScan }, { now: new Date(at(21, h, m)), builtAt: at(21, 10) }));
+    expect(run(18, 30).kind).toBe("pending");
+    expect(run(18, 31).kind).toBe("config");
   });
 
   test("a run qlander already cancelled for time that then completed this way is not exempt", () => {

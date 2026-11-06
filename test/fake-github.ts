@@ -3,7 +3,7 @@
 // and data-file allowlists), and keeps a call log. The Sim and the snapshot
 // tests use it; step 4's runner tests will too.
 
-import type { Account, TargetApi, Commit, Compare, RefActivity, RefUpdate, LabelEvent, Listed, MergeResult, PullRequest, Review, StateIssue, StateRefApi, StateRepoApi, Status, StatusEntry } from "../src/github/api";
+import { type Account, type TargetApi, type Commit, type Compare, type RefActivity, type RefUpdate, type LabelEvent, type Listed, type MergeResult, type PullRequest, RELEASE_REPORT_MARKER, type Review, type StateIssue, type StateRefApi, type StateRepoApi, type Status, type StatusEntry } from "../src/github/api";
 import { GitHubError } from "../src/github/http";
 import type { CheckRun, IssueComment, Job, Run } from "../src/types";
 import type { Names } from "../src/config";
@@ -115,7 +115,7 @@ export class FakeTarget implements TargetApi {
 
   /** The config's identities: the control repo's by default; the target repo id, main, release, prefixes and labels all come from it. */
   constructor(
-    public role: "queue" | "release" | "read" = "queue",
+    public role: "queue" | "release" | "dispatch" | "read" = "queue",
     readonly names: Names = NAMES,
   ) {
     this.repoId = names.target.id;
@@ -169,7 +169,8 @@ export class FakeTarget implements TargetApi {
     return f;
   }
 
-  addRun(r: Partial<Run> & { head_sha: string }, jobs: Job[] = []): Run {
+  /** `visibleAfter`: ticks before it shows up in run lists (default listLag). */
+  addRun(r: Partial<Run> & { head_sha: string }, jobs: Job[] = [], visibleAfter = this.listLag): Run {
     const run: Run = {
       id: nextId(),
       run_attempt: 1,
@@ -187,7 +188,7 @@ export class FakeTarget implements TargetApi {
     } as Run;
     this.runs.push(run);
     this.jobs.set(run.id, jobs);
-    this.runVisibleAt.set(run.id, this.clock + this.listLag);
+    this.runVisibleAt.set(run.id, this.clock + visibleAfter);
     return run;
   }
 
@@ -214,7 +215,8 @@ export class FakeTarget implements TargetApi {
   }
 
   private write(branch: string): void {
-    if (this.role === "read" || !isWritableRef(this.names, branch, this.role)) throw new GitHubError("validation", null, `role ${this.role} may not write ${branch}`);
+    // The dispatch role (release.mode dispatch) writes no ref at all, as the real client.
+    if (this.role === "read" || this.role === "dispatch" || !isWritableRef(this.names, branch, this.role)) throw new GitHubError("validation", null, `role ${this.role} may not write ${branch}`);
   }
 
   // ------------------------------------------------------------ TargetApi: reads
@@ -292,8 +294,11 @@ export class FakeTarget implements TargetApi {
     const cap = this.runListLimit ?? all.length;
     return { items: all.slice(0, cap), truncated: all.length > cap };
   }
-  async listWorkflowRuns(path: string, q: { branch?: string; event?: string; maxPages?: number }): Promise<Listed<Run>> {
-    const all = this.listed(this.runs).filter((r) => r.path === path && (!q.branch || r.head_branch === q.branch) && (!q.event || r.event === q.event)).sort((a, b) => b.id - a.id);
+  async listWorkflowRuns(path: string, q: { branch?: string; event?: string; maxPages?: number; created?: Date }): Promise<Listed<Run>> {
+    this.log(`listWorkflowRuns ${path}`);
+    const all = this.listed(this.runs)
+      .filter((r) => r.path === path && (!q.branch || r.head_branch === q.branch) && (!q.event || r.event === q.event) && (!q.created || Date.parse(r.created_at) >= q.created.getTime()))
+      .sort((a, b) => b.id - a.id);
     const cap = (q.maxPages ?? 2) * this.pageSize;
     return { items: all.slice(0, cap), truncated: all.length > cap };
   }
@@ -336,6 +341,7 @@ export class FakeTarget implements TargetApi {
   epochRejections: { writes: RefUpdate[]; epoch: string }[] = [];
 
   private epochOnly(): string {
+    // The dispatch role holds an epoch branch too: it fences its dispatches, and writes no other ref.
     if (this.role === "read") throw new GitHubError("validation", null, "read-only");
     return this.epochBranch ?? (() => { throw new GitHubError("validation", null, "the epoch fence is off"); })();
   }
@@ -512,6 +518,35 @@ export class FakeTarget implements TargetApi {
     f.pr.labels = f.pr.labels.filter((l) => l !== label);
     this.log(label === this.names.labels.ready ? `unlabel ${n}` : `unlabel ${n} ${label}`);
   }
+  // ------------------------------------------------------------ the release dispatch mode
+
+  /** Every workflow_dispatch GitHub accepted, in order (a "lost" one included: GitHub did it). */
+  workflowDispatches: { workflow: string; ref: string; inputs: Record<string, string>; clock: number }[] = [];
+  /** The next dispatch calls' failures, in order: an error is thrown before anything happens; "lost" does it and then fails as a lost response. */
+  workflowDispatchErrors: (GitHubError | "lost")[] = [];
+  /** Called for each accepted dispatch: the world's model of the target workflow. */
+  onWorkflowDispatch: ((d: { workflow: string; ref: string; inputs: Record<string, string> }) => void) | null = null;
+  async dispatchWorkflow(workflow: string, ref: string, inputs: Record<string, string>) {
+    if (this.role !== "dispatch") throw new GitHubError("validation", null, "dispatch role only");
+    const e = this.workflowDispatchErrors.shift();
+    if (e instanceof GitHubError) throw e;
+    const d = { workflow, ref, inputs: { ...inputs } };
+    this.workflowDispatches.push({ ...d, clock: this.clock });
+    this.log(`dispatchWorkflow ${workflow}@${ref} ${JSON.stringify(inputs)}`);
+    this.onWorkflowDispatch?.(d);
+    if (e === "lost") throw new GitHubError("network", null, "the response was lost");
+  }
+  /** Repository variables; absent: not set (404). */
+  variables = new Map<string, string>();
+  variableErrors = new Map<string, GitHubError>();
+  async readVariable(name: string) {
+    if (this.role !== "dispatch") throw new GitHubError("validation", null, "reads no variables");
+    const e = this.variableErrors.get(name);
+    if (e) throw e;
+    this.log(`readVariable ${name}`);
+    return this.variables.get(name) ?? null;
+  }
+
   /** repository_dispatch events accepted, in order. */
   dispatches: { eventType: string; payload: Record<string, unknown> }[] = [];
   /** Set to make the next dispatches fail (each call shifts one error off). */
@@ -568,6 +603,30 @@ export class FakeStateRepo implements StateRepoApi {
     const number = this.issues.length + 1;
     this.issues.push({ number, title, body, labels, open: true });
     return number;
+  }
+  /** Comments by issue number, oldest first. */
+  comments = new Map<number, IssueComment[]>();
+  commentsTruncated = false;
+  commentError: GitHubError | null = null;
+  /** Comment ids handed out; human comments in tests take them too. */
+  private commentIds = 5000;
+  /** A person's comment on a control-repo issue (an approval, say). */
+  addComment(n: number, user: { login: string; id: number }, body: string, at = "2026-10-22T12:00:00Z", editedAt = at): number {
+    const id = ++this.commentIds;
+    this.comments.set(n, [...(this.comments.get(n) ?? []), { id, user, body, created_at: at, updated_at: editedAt }]);
+    return id;
+  }
+  async listIssueComments(n: number) {
+    return { items: structuredClone(this.comments.get(n) ?? []), truncated: this.commentsTruncated };
+  }
+  /** Bodies the job posted, by issue. */
+  posted: { issue: number; body: string }[] = [];
+  async commentIssue(n: number, body: string) {
+    if (!body.startsWith(RELEASE_REPORT_MARKER)) throw new GitHubError("validation", null, "only a release-candidate report");
+    if (this.commentError) throw this.commentError;
+    if (!this.issues.some((i) => i.number === n)) throw new GitHubError("not_found", 404, "no issue");
+    this.posted.push({ issue: n, body });
+    return this.addComment(n, { login: "github-actions[bot]", id: 41898282 }, body);
   }
   async updateIssueBody(n: number, body: string) {
     await this.beforeUpdate?.(n);

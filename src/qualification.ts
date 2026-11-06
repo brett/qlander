@@ -17,7 +17,7 @@
 
 import { readFileSync } from "node:fs";
 import type { Manifest, Names } from "./config";
-import type { TargetApi } from "./github/api";
+import type { TargetReads } from "./github/api";
 import { parseQualificationManifest, proofChain, type ProofTarget, type QualificationManifest, type ReleaseCandidate, reevaluate, type ReceiptEvidence } from "./release";
 import type { JobsByRun, Run } from "./types";
 import { runIdFromTargetUrl } from "./validate";
@@ -69,7 +69,7 @@ export function blobSha(text: string): string {
 }
 
 /** Push runs of sha for the listed workflows, with complete job lists for the runs verdict() judges; or why not. */
-async function gather(c: TargetApi, sha: string, m: QualificationManifest): Promise<{ runs: Run[]; jobs: JobsByRun } | Refusal> {
+async function gather(c: TargetReads, sha: string, m: QualificationManifest): Promise<{ runs: Run[]; jobs: JobsByRun } | Refusal> {
   const patterns = (m.evidence_branch_patterns ?? ["^main$"]).map((p) => new RegExp(p));
   const paths = new Set(m.required.map((w) => w.path));
   const listed = await c.listRuns({ headSha: sha, event: "push" });
@@ -95,7 +95,7 @@ async function gather(c: TargetApi, sha: string, m: QualificationManifest): Prom
 }
 
 /** A candidate with only the proof fields filled, for proofChain. */
-async function proofCandidate(c: TargetApi, at: ProofTarget, sha: string, status: { state: string; target_url: string | null } | null): Promise<ReleaseCandidate> {
+async function proofCandidate(c: TargetReads, at: ProofTarget, sha: string, status: { state: string; target_url: string | null } | null): Promise<ReleaseCandidate> {
   const cand: ReleaseCandidate = { sha, firstParent: true, fromRelease: "diverged", status, proofRun: null, proofJobs: null, runs: [], jobs: {} };
   const runId = status?.state === "success" ? runIdFromTargetUrl(at.target, status.target_url) : null;
   if (runId !== null) {
@@ -109,7 +109,7 @@ async function proofCandidate(c: TargetApi, at: ProofTarget, sha: string, status
 }
 
 /** Re-evaluation of a parsed manifest for sha, shared by `manifest` and `checks-green`. */
-function evaluator(c: TargetApi, current: () => QualificationManifest) {
+function evaluator(c: TargetReads, current: () => QualificationManifest) {
   return async (sha: string): Promise<{ ok: true; evidence: ReceiptEvidence[] } | Refusal> => {
     const m = current();
     const g = await gather(c, sha, m);
@@ -120,7 +120,7 @@ function evaluator(c: TargetApi, current: () => QualificationManifest) {
 }
 
 export interface ProviderDeps {
-  target: TargetApi;
+  target: TargetReads;
   /** The target repo's name and main branch (the config's names). */
   names: Pick<Names, "target" | "main">;
   /** Reads a control-repo file (source: control), or null when it is missing. */

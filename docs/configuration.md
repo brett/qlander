@@ -565,7 +565,7 @@ Time limits on CI runs and on reconciling effects.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `queue.timeouts.noRunMinutes` | integer | required | A when: always preLanding workflow with no run this long after the queue branch was pushed pauses the queue as a configuration problem. In a batch with a CI-policy PR it counts as red instead. |
-| `queue.timeouts.inProgressMinutes` | integer | required | A job running longer than this is cancelled as a timeout. |
+| `queue.timeouts.inProgressMinutes` | integer | required | A job running longer than this is cancelled as a timeout. In a run GitHub already reports completed, a job still shown running this long pauses the queue as a configuration problem. |
 | `queue.timeouts.queuedHours` | integer | required | A run attempt older than this with no job running is cancelled as starved. |
 | `queue.timeouts.rerunBarrierMinutes` | integer | required | How long to wait for a rerun to show its new attempt before pausing. |
 | `queue.timeouts.reconcileMinutes` | integer | required | How long an unconfirmed effect, such as a rerun request, is reconciled before it pauses. At least twice runner.cronMinutes. |

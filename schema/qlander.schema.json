@@ -378,7 +378,7 @@
               "description": "A when: always preLanding workflow with no run this long after the queue branch was pushed pauses the queue as a configuration problem. In a batch with a CI-policy PR it counts as red instead.",
               "$ref": "#/$defs/positive"
             },
-            "inProgressMinutes": { "description": "A job running longer than this is cancelled as a timeout.", "$ref": "#/$defs/positive" },
+            "inProgressMinutes": { "description": "A job running longer than this is cancelled as a timeout. In a run GitHub already reports completed, a job still shown running this long pauses the queue as a configuration problem.", "$ref": "#/$defs/positive" },
             "queuedHours": { "description": "A run attempt older than this with no job running is cancelled as starved.", "$ref": "#/$defs/positive" },
             "rerunBarrierMinutes": { "description": "How long to wait for a rerun to show its new attempt before pausing.", "$ref": "#/$defs/positive" },
             "reconcileMinutes": {

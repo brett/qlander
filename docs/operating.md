@@ -232,7 +232,11 @@ If a batch shows a job still running long after its run finished, look at the ru
 gh api "repos/<target>/actions/runs/<run id>/jobs" --jq '.jobs[] | {name, status, conclusion, completed_at}'
 ```
 
-If a job has a `conclusion` and a `completed_at` but its `status` isn't `completed`, bounce one PR in the batch: add `qlander:bounce`, run `remove <pr>`, or remove `ready`. The batch is rebuilt without that PR, on a new CI run. Then add `ready` back to it (`requeue <pr>`). Its fast lane must still be green on the same head.
+If a job has a `conclusion` and a `completed_at` but its `status` isn't `completed`, bounce one PR in the batch: add `qlander:bounce`, run `remove <pr>`, or remove `ready`. The batch is abandoned, and any other PRs in it are rebuilt on a new CI run.
+
+1. Wait for a tick to take the PR out: `status --json` no longer lists it, and the bounce label, if you used one, is gone. Adding `ready` back sooner can leave its admission, and the stuck batch, in place.
+2. Add `ready` back to it (`requeue <pr>`). Its fast lane must still be green on the same head.
+3. Check the batch's other PRs. If its retry budget had run out, they lose `ready` instead of being rebuilt, so add it back to each.
 
 ### Renaming the control repo, an App or a label
 
@@ -241,18 +245,18 @@ Rename with nothing admitted and both jobs stopped. GitHub redirects an old repo
 | You rename | What uses the old name |
 | --- | --- |
 | The control repo | `control.repo`, which is in the policy hash. The rendered `tick.yml`, which mints the state App's token for that repo name. `setup`, whose default App prefix is the control repo's name, and `audit`, whose default App slugs are `<control repo name>-queue`, `-release` and `-state`. In `self-hosted-kill` mode, the runner group's workflow restriction. |
-| An App | Its slug: `audit`'s default slugs, and the key `setup` reads (`<keys-dir>/<slug>.pem`, or `--key-cmd` run with the slug). The App id, client id, installations and keys stay the same, so the tick and the ruleset bypasses keep working. |
+| An App | Its slug: `audit`'s default slugs, and `setup`, which finds each App and its key (`<keys-dir>/<slug>.pem`, or `--key-cmd` run with the slug) by `<prefix>-queue`, `-release` and `-state`. So rename all the Apps to one new prefix, or `setup` can't find them. The App id, client id, installations and keys stay the same, so the tick and the ruleset bypasses keep working. |
 | A label | Its name in `qlander.yml` (`queue.labels`, `queue.controlLabels`, `release.labels`, `watchdog.labels`), most of which are in the policy hash. Qlander reads `ready`, each operator label and the priority label from the PR's latest `labeled` event with exactly that name, and a renamed label's old events keep the old name. The watchdog finds the status issue by its label. |
 
 Renaming a GitHub App is done in a browser only: in the App's settings, on **General**, change **GitHub App name** and save. Its slug and its bot's login change.
 
 1. **Let the queue empty.** Ask people to stop adding `ready`, and wait until `status --json` exits 0 with `active` null and `concurrent`, `pending`, `solo` and `queued` empty. `queued` lists the admitted PRs, which would all lose `ready` when the policy hash changes.
 2. **Stop both jobs.** Run `quiesce`, then `status --json` again. `quiesce` doesn't check for admitted PRs, so if `queued` isn't empty, run `unquiesce`, wait, and start again.
-3. **Stop the watchdog:** `gh workflow disable watchdog.yml -R "$R"`. A watchdog run that reads one label name while the issue has the other opens a second status issue.
+3. **Stop the watchdog:** `gh workflow disable watchdog.yml -R "$R"`. A watchdog run that reads one label name while the issue has the other opens a second status issue. Disabling doesn't stop a run already started, so wait until `gh run list -R "$R" --workflow watchdog.yml --status in_progress` and `--status queued` both print nothing.
 4. **Rename on GitHub.** The repo (`gh repo rename <new name> -R "$R"`), the labels on the target and the control repo (`gh label edit <old> --name <new>`), and the Apps. Environments, secrets, variables, rulesets and App installations survive a repo rename. To rename a state branch too, rename the branch first and then point its ruleset at the new name: GitHub refuses to rename a branch into a name a ruleset covers.
 5. **Change the config to match.** Update `qlander.yml`, run `validate` and `render`, and merge both in one PR on the renamed repo. In `self-hosted-kill` mode, check that the runner group's workflow restriction names the new repo, and update it if it doesn't.
 6. **Put labels back on.** On every open PR that had a renamed label, remove it and add it again. Until then, a renamed `ready` doesn't count, and a renamed operator or priority label does nothing.
-7. **Fix your own copies.** Point your clone at the new name (`git remote set-url`). If an App was renamed, rename its key file or secret-store entry to the new slug. Until the Apps carry the new prefix, pass `--name <old prefix>` to `setup` and `--queue-app`, `--release-app` and `--state-app` to `audit`.
+7. **Fix your own copies.** Point your clone at the new name (`git remote set-url`). If the Apps were renamed, rename each key file or secret-store entry to the new slug. Unless the Apps' prefix is the control repo's new name, pass `--name <their prefix>` to `setup` and `--queue-app`, `--release-app` and `--state-app` to `audit`.
 8. **Start again.** A workflow disabled by hand stays disabled through a rename and a merge, so enable the watchdog yourself: `gh workflow enable watchdog.yml -R "$R"`, then `gh workflow run watchdog.yml -R "$R"`, and check that there is still one status issue. Run `unquiesce`, which enables `tick.yml`, then `audit`.
 
 ## Monitoring

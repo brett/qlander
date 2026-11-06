@@ -9,7 +9,7 @@ import type { App, Installation, SetupApi } from "./client";
 import { type AppSpec, appSpecs, full, type Permissions, type Repo, type Role, type RulesetSpec } from "./expected";
 import { appJwt } from "./jwt";
 import type { AppRecord, KeyStore } from "./keys";
-import { rulesetBody, rulesetDiff } from "./rulesets";
+import { qlanderAppsAsExtra, rulesetBody, rulesetDiff } from "./rulesets";
 
 /** The App manifest (GitHub's "registering a GitHub App from a manifest"). */
 export interface Manifest {
@@ -201,6 +201,9 @@ export class Ctx {
 
   async ensureRuleset(spec: RulesetSpec, appIds: Partial<Record<Role, number>>): Promise<void> {
     const where = `${full(spec.repo)}: ruleset ${spec.name}`;
+    // Refused before any read or write, in --plan too: a promoterApps entry that is one of qlander's own Apps.
+    const clash = qlanderAppsAsExtra(spec, appIds);
+    if (clash.length) this.fail(`${where}: ${clash.join("; ")}`);
     const found = (await this.d.api.rulesets(spec.repo)).filter((r) => r.name === spec.name);
     if (found.length > 1) this.fail(`${where}: ${found.length} rulesets have this name; delete all but one`);
     if (found.length === 0) {

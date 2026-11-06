@@ -106,7 +106,7 @@ export const echoesId = (title: string, id: string) => new RegExp(`(^|[^A-Za-z0-
 const runUrl = (cfg: ReleaseDeps["cfg"], id: number) => `https://github.com/${cfg.names.target.owner}/${cfg.names.target.name}/actions/runs/${id}`;
 
 /** Concluded by qlander, not by GitHub: the run could not be followed. A real run left like this may still be promoting, so it pauses. */
-const UNFOLLOWED = new Set(["never-appeared", "stuck", "ambiguous", "missing", "foreign-attempt"]);
+const UNFOLLOWED = new Set(["never-appeared", "stuck", "ambiguous", "missing", "foreign-attempt", "unauthenticated"]);
 
 /** Untrusted target text for an issue comment: one line, no markdown that could break out of a code span, bounded. */
 const plain = (s: string, max = 100) => s.replace(/[\s`<>]+/g, " ").trim().slice(0, max);
@@ -285,6 +285,10 @@ export class DispatchTick extends ReleaseTickBase {
     const auth = this.authenticate(listed, run);
     if (auth === "foreign") return done("foreign-attempt", `run ${run.id}'s attempt ${run.run_attempt} was started by ${run.actor?.login ?? "nobody known"}, triggered by ${run.triggering_actor?.login ?? "nobody known"}, not ${this.cfg.actor.login}`);
     if (now - Date.parse(run.created_at) > this.cfg.runHours * 3_600_000 && run.status !== "completed") return done("stuck", `run ${run.id} still ${run.status} after ${this.cfg.runHours} hours`);
+    if (auth === "wait" && now - Date.parse(run.created_at) > this.cfg.runHours * 3_600_000) {
+      // Bounded: a run that has stayed unauthenticated for longer than any run may take is not followed any further.
+      return done("unauthenticated", `run ${run.id}'s attempt ${run.run_attempt} could not be matched to an authenticated listing within ${this.cfg.runHours} hours of its start (the listing showed ${listed ? `attempt ${listed.run_attempt}` : "no authenticated run"})`);
+    }
     if (auth === "wait") {
       this.log.push(`${r.kind} run ${run.id}: attempt ${run.run_attempt} cannot be authenticated yet (the listing shows ${listed ? `attempt ${listed.run_attempt}` : "no authenticated run"}); waiting`);
       return r;

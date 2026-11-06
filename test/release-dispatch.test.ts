@@ -946,3 +946,35 @@ describe("dispatch mode: re-arm", () => {
     expect((await w.ok()).outcome).toBe("dispatched");
   });
 });
+
+describe("dispatch mode: third review", () => {
+  test("[t1] an adopted real run that cannot be authenticated any more is bounded: closed and paused in one write, then re-armable", async () => {
+    const { w, a } = await greenDry({ runHours: 1 });
+    w.behave = ({ kind }) => (kind === "real" ? { conclusion: "failure", runTicks: 2 } : {});
+    w.approve(a);
+    await w.ok(); // real dispatched
+    await w.ok(); // real run adopted, still running
+    expect(w.candidate()!.real!.run).not.toBeNull();
+    w.target.pageSize = 0; // from now on every listing is incomplete; getRun reports the failure
+    const writes: { candidate: unknown; pausePending: unknown }[] = [];
+    const cas = w.stateRef.cas.bind(w.stateRef);
+    w.stateRef.cas = async (before, text) => {
+      const s = JSON.parse(text);
+      writes.push({ candidate: s.dispatch?.candidate, pausePending: s.pausePending });
+      return cas(before, text);
+    };
+    const rs = await w.until((r) => r.outcome === "paused", 12);
+    w.stateRef.cas = cas;
+    expect(rs.slice(0, -1).every((r) => r.outcome === "waiting")).toBe(true);
+    expect(rs.length).toBeLessThanOrEqual(1 + Math.ceil(60 / w.cfg.runner.cronMinutes));
+    expect(writes.find((x) => x.candidate === null)!.pausePending).not.toBeNull();
+    expect(w.candidate()).toBeNull();
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "real-failed", note: expect.stringContaining("unauthenticated") });
+    // The incident is closed, so it can be re-armed once the pause is lifted and listings recover.
+    w.target.pageSize = 100;
+    w.resume();
+    w.behave = () => ({});
+    w.approve(a, APPROVER, { body: `/qlander rearm-release ${a} ${w.dispatched[1]!.id}` });
+    expect((await w.ok()).outcome).toBe("dispatched");
+  });
+});

@@ -11,7 +11,7 @@ import { policyHash } from "../src/queue";
 import { releaseTokenPermissions } from "../src/release-permissions";
 import { renderTick } from "../src/render";
 import { appSpecs, targetRulesets } from "../src/setup/expected";
-import { rulesetBody, rulesetDiff } from "../src/setup/rulesets";
+import { qlanderAppsAsExtra, rulesetBody, rulesetDiff } from "../src/setup/rulesets";
 import { branchRulesets } from "../src/audit/ruleset-checks";
 import { EXAMPLE } from "./setup-world";
 
@@ -192,5 +192,16 @@ describe("the release App's permissions in dispatch mode: least privilege", () =
     // Advance mode is unchanged: the release App must be there.
     const adv = branchRulesets("T10", "release", app, rs([{ actor_id: 444, actor_type: "Integration" }]), undefined, true);
     expect(adv.some((f) => f.status === "FAIL" && f.message.includes("does not list the release App"))).toBe(true);
+  });
+  test("[t2] setup refuses a promoterApps entry that is the release App (or any qlander App), in --plan too", () => {
+    const d = parseConfig(withRelease([...DISPATCH, "    promoterApps:", "      - 2"]));
+    const spec = targetRulesets(d, true).find((r) => r.name === "release-landing")!;
+    expect(spec.needsInstalled).toEqual(["release"]); // so its id is known when setup checks
+    const ids = { queue: 1, release: 2, state: 3 };
+    expect(qlanderAppsAsExtra(spec, ids)).toEqual(["release.dispatch.promoterApps lists 2, which is the release App: in release.mode dispatch it must not bypass release-landing"]);
+    expect(() => rulesetBody(spec, null, ids)).toThrow("which is the release App");
+    const live = { id: 9, name: "release-landing", target: "branch", enforcement: "active", conditions: { ref_name: { include: spec.include, exclude: [] } }, rules: spec.rules, bypass_actors: [{ actor_id: 2, actor_type: "Integration", bypass_mode: "always" }] } as never;
+    expect(rulesetDiff(spec, live, ids)).toContain("release.dispatch.promoterApps lists 2, which is the release App: in release.mode dispatch it must not bypass release-landing");
+    expect(qlanderAppsAsExtra(spec, { queue: 1, release: 5, state: 3 })).toEqual([]);
   });
 });

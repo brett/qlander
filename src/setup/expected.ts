@@ -264,7 +264,8 @@ export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSp
         // (release.dispatch.promoterApps) and named break-glass users are the only bypass actors kept.
         ...(releaseAppBypassesRelease(c.release)
           ? { bypass: ["release"] as Role[], extraBypass: "keep" as const, needsInstalled: ["release"] as Role[] }
-          : { bypass: [] as Role[], extraBypass: "keep" as const, needsInstalled: [] as Role[], apps: [...(c.release.dispatch?.promoterApps ?? [])] }),
+          : // The release App's id is resolved too, so that a promoterApps entry naming it is refused (src/setup/rulesets.ts).
+            { bypass: [] as Role[], extraBypass: "keep" as const, needsInstalled: ["release"] as Role[], apps: [...(c.release.dispatch?.promoterApps ?? [])] }),
       },
       { repo, name: "release-integrity", include: [heads(n.release)], rules: INTEGRITY, bypass: [], extraBypass: "none", needsInstalled: [] },
     );

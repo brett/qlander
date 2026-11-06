@@ -190,3 +190,33 @@ export function isPolicyChange(files: string[], boundary: string[]): boolean {
   const globs = boundary.map((g) => new Bun.Glob(g));
   return files.some((f) => globs.some((g) => g.match(f)));
 }
+
+export const REARM_RELEASE = "/qlander rearm-release";
+
+/**
+ * A release re-arm (DESIGN.md §8.1): one more attempt for `sha`, after the
+ * incident whose dispatch id is `incident`. The status issue comment's whole
+ * body is `/qlander rearm-release <sha> <incident>`, by an account in
+ * release.dispatch.approvers (id and login), unedited, and posted strictly
+ * after `notBefore` (when that incident's candidate closed). Bound to the
+ * incident, it authorises exactly one attempt: the next one's dispatch id
+ * replaces the incident. `refused` says why every other re-arm comment does not count.
+ */
+export function releaseRearm(comments: IssueComment[], approvers: Human[], sha: string, incident: string, notBefore: Date): { rearm: IssueComment | null; refused: string[] } {
+  const refused: string[] = [];
+  if (!isSha(sha)) return { rearm: null, refused: [`${String(sha)} is not a sha`] };
+  const want = `${REARM_RELEASE} ${sha} ${incident}`;
+  for (const c of comments) {
+    const body = c.body.trim();
+    if (!body.startsWith(REARM_RELEASE)) continue;
+    const who = `comment ${c.id} by ${c.user.login}`;
+    const [named, inc] = body.slice(REARM_RELEASE.length).trim().split(/\s+/);
+    if (named !== sha) refused.push(`${who} re-arms ${String(named ?? "nothing").slice(0, 40)}, not ${sha}, the last sha dispatched`);
+    else if (body !== want) refused.push(`${who} names incident ${String(inc ?? "none").slice(0, 60)}, not the last attempt ${incident}`);
+    else if (!approvers.some((h) => h.id === c.user.id && h.login === c.user.login)) refused.push(`${who}: not in release.dispatch.approvers (login and id)`);
+    else if (c.created_at !== c.updated_at) refused.push(`${who} was edited`);
+    else if (!(Date.parse(c.created_at) > notBefore.getTime())) refused.push(`${who} predates the end of that attempt`);
+    else if (isExactApproval(c, approvers, want)) return { rearm: c, refused };
+  }
+  return { rearm: null, refused };
+}

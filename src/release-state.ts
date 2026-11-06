@@ -67,9 +67,11 @@ export interface DispatchCandidate {
   real: DispatchRecord | null;
   /** Dispatches GitHub refused outright (a 4xx: nothing was started); retried while below DISPATCH_REFUSALS. */
   refused: number;
+  /** A re-arm (DESIGN.md §8.1): one more attempt for a sha already dispatched, granted by an approver for the incident `incident` (that attempt's dispatch id). */
+  rearm: { comment: number; login: string; id: number; incident: string; at: string } | null;
 }
 
-export type DispatchOutcome = "released" | "superseded" | "dry-failed" | "expired" | "real-failed" | "not-observed" | "released-elsewhere";
+export type DispatchOutcome = "released" | "superseded" | "dry-failed" | "expired" | "real-failed" | "not-observed" | "incomplete" | "released-elsewhere";
 
 export interface DispatchHistoryItem {
   at: string;
@@ -89,6 +91,13 @@ export interface DispatchState {
    * twice however much of `history` is pruned (main only moves forward).
    */
   highWater: string | null;
+  /**
+   * The last dispatch made (its sha and dispatch id, set in its intent) and
+   * when its candidate closed. A re-arm names this id, so it authorises one
+   * new attempt after exactly this incident; the new attempt's intent
+   * replaces it, which spends the re-arm.
+   */
+  last: { sha: string; id: string; closedAt: string | null } | null;
   /** When each dispatch was reserved, for release.dispatch.budget. */
   window: string[];
   history: DispatchHistoryItem[];
@@ -101,10 +110,10 @@ export function candidateStage(c: DispatchCandidate): string {
   if (!c.dry) return c.refused > 0 ? `dry run refused ${c.refused} time(s); retrying` : "dry run not dispatched yet";
   if (c.dry.conclusion === null) return `dry run in flight (${run(c.dry)})`;
   if (c.dry.conclusion !== "success") return `dry run ${c.dry.conclusion}; waiting for a newer candidate`;
-  return c.approval ? `approved by ${c.approval.login}; real run not dispatched yet` : "dry run green; waiting for an approval";
+  return c.approval ? `approved by ${c.approval.login}; real run not dispatched yet` : `dry run green; waiting for an approval${c.rearm ? ` (re-armed by ${c.rearm.login})` : ""}`;
 }
 
-export const emptyDispatchState = (): DispatchState => ({ candidate: null, highWater: null, window: [], history: [] });
+export const emptyDispatchState = (): DispatchState => ({ candidate: null, highWater: null, last: null, window: [], history: [] });
 
 export type ReleaseHistoryOutcome = "advanced" | "not-applied" | "moved" | "rejected";
 
@@ -202,7 +211,7 @@ function receipt(x: unknown, w: string): Receipt {
 }
 
 const KINDS = ["dry", "real"] as const;
-const OUTCOMES = ["released", "superseded", "dry-failed", "expired", "real-failed", "not-observed", "released-elsewhere"] as const;
+const OUTCOMES = ["released", "superseded", "dry-failed", "expired", "real-failed", "not-observed", "incomplete", "released-elsewhere"] as const;
 /** The dispatch id format (src/release-dispatch.ts dispatchIdFor). */
 export const DISPATCH_ID_RE = /^qlr-(dry|real)-[0-9a-f]{12}-[0-9a-f]{12}$/;
 const dispatchId = (x: unknown, w: string): string => (typeof x === "string" && DISPATCH_ID_RE.test(x) ? x : fail(`${w}: not a dispatch id`));
@@ -226,10 +235,10 @@ function dispatchRecord(x: unknown, w: string): DispatchRecord {
 }
 
 function dispatchState(x: unknown): DispatchState {
-  const o = obj(x, "dispatch", ["candidate", "highWater", "window", "history"]);
+  const o = obj(x, "dispatch", ["candidate", "highWater", "last", "window", "history"]);
   const candidate = nullable(o.candidate, (c) => {
     const w = "dispatch.candidate";
-    const co = obj(c, w, ["sha", "receipt", "since", "dry", "reported", "approval", "real", "refused"]);
+    const co = obj(c, w, ["sha", "receipt", "since", "dry", "reported", "approval", "real", "refused", "rearm"]);
     const out: DispatchCandidate = {
       sha: sha(co.sha, `${w}.sha`),
       receipt: receipt(co.receipt, `${w}.receipt`),
@@ -245,6 +254,10 @@ function dispatchState(x: unknown): DispatchState {
       }),
       real: nullable(co.real, (d) => dispatchRecord(d, `${w}.real`)),
       refused: int(co.refused, `${w}.refused`),
+      rearm: nullable(co.rearm, (a) => {
+        const ao = obj(a, `${w}.rearm`, ["comment", "login", "id", "incident", "at"]);
+        return { comment: posInt(ao.comment, `${w}.rearm.comment`), login: str(ao.login, `${w}.rearm.login`), id: posInt(ao.id, `${w}.rearm.id`), incident: dispatchId(ao.incident, `${w}.rearm.incident`), at: time(ao.at, `${w}.rearm.at`) };
+      }),
     };
     if (out.receipt.to !== out.sha) fail(`${w}: receipt does not match the candidate`);
     if (out.dry && out.dry.kind !== "dry") fail(`${w}.dry: not a dry run`);
@@ -268,8 +281,13 @@ function dispatchState(x: unknown): DispatchState {
     };
   });
   const highWater = nullable(o.highWater, (h) => sha(h, "dispatch.highWater"));
+  const last = nullable(o.last, (l) => {
+    const lo = obj(l, "dispatch.last", ["sha", "id", "closedAt"]);
+    return { sha: sha(lo.sha, "dispatch.last.sha"), id: dispatchId(lo.id, "dispatch.last.id"), closedAt: nullable(lo.closedAt, (t) => time(t, "dispatch.last.closedAt")) };
+  });
+  if (last && last.sha !== highWater) fail("dispatch: the last dispatch is not the high-water mark");
   if (candidate && (candidate.dry || candidate.real) && highWater !== candidate.sha) fail("dispatch: a dispatched candidate that is not the high-water mark");
-  return { candidate, highWater, window, history };
+  return { candidate, highWater, last, window, history };
 }
 
 /** Strict: unknown fields, wrong types, a bad sha or another version are refused. */

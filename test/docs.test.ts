@@ -8,7 +8,7 @@ import { dirname, join, normalize } from "node:path";
 import { DOC_PATH, renderFromRepo, ROOT, slug, yaml } from "../scripts/config-doc";
 import { USAGE } from "../src/cli";
 import { parseConfig } from "../src/config/load";
-import { policyApproval, releaseApproval } from "../src/evidence";
+import { policyApproval, releaseApproval, releaseRearm } from "../src/evidence";
 import type { IssueComment } from "../src/types";
 import { yamlTextProblems } from "../src/config/yaml";
 
@@ -201,6 +201,11 @@ describe("the agent docs", () => {
       const comment = { body: `/qlander ${c} ${head}`, created_at: "2026-10-22T12:00:00Z", updated_at: "2026-10-22T12:00:00Z", user: alice } as IssueComment;
       // approve-release is the release dispatch mode's approval (DESIGN.md §8.1); every other one is a CI-policy approval.
       if (c === "approve-release") expect(releaseApproval([comment], [alice], head, new Date("2026-10-22T11:00:00Z")).approval, c).toBe(comment);
+      else if (c === "rearm-release") {
+        const incident = `qlr-real-${head.slice(0, 12)}-${"0".repeat(12)}`;
+        const rearm = { ...comment, body: `/qlander ${c} ${head} ${incident}` };
+        expect(releaseRearm([rearm], [alice], head, incident, new Date("2026-10-22T11:00:00Z")).rearm, c).toBe(rearm);
+      }
       else expect(policyApproval([comment], [alice], head), c).toBe(comment);
     }
   });

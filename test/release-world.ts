@@ -291,6 +291,10 @@ export class DispatchWorld extends ReleaseWorld {
   candidate() {
     return this.state().dispatch?.candidate ?? null;
   }
+  /** A person closes every open release-pause issue (resume). */
+  resume(): void {
+    for (const i of this.repo.issues) if (i.open && i.labels.includes(this.cfg.names.releaseLabels.pause)) i.open = false;
+  }
   dispatchHistory() {
     return this.state().dispatch?.history ?? [];
   }

@@ -7,6 +7,7 @@
 //   bun src/cli.ts remove|requeue|prioritise <pr>
 //   bun src/cli.ts approve-policy <pr> <sha>
 //   bun src/cli.ts approve-release <sha>
+//   bun src/cli.ts rearm-release <sha>
 //
 // Each takes --dry-run (read what it would check, print every step, change
 // nothing) and --config <file>. The token is the operator's own, from
@@ -93,6 +94,7 @@ export function parseControlArgs(cmd: ControlCommand, args: string[], defaultCon
   if ((cmd === "remove" || cmd === "requeue" || cmd === "prioritise") && (p.length !== 1 || !isPr(p[0]))) throw `${cmd} needs one PR number`;
   if (cmd === "approve-policy" && (p.length !== 2 || !isPr(p[0]) || !/^[0-9a-f]{40}$/.test(p[1]!))) throw "approve-policy needs a PR number and its full 40-character head sha";
   if (cmd === "approve-release" && (p.length !== 1 || !/^[0-9a-f]{40}$/.test(p[0]!))) throw "approve-release needs the release candidate's full 40-character sha";
+  if (cmd === "rearm-release" && (p.length !== 1 || !/^[0-9a-f]{40}$/.test(p[0]!))) throw "rearm-release needs the full 40-character sha to re-arm";
   return a;
 }
 
@@ -329,6 +331,32 @@ async function approveRelease(r: Run, me: { login: string; id: number }, sha: st
   await r.step(`comment on #${status.number}: ${body}`, () => r.api.comment(status.number, body));
 }
 
+/**
+ * The release re-arm (DESIGN.md §8.1): `/qlander rearm-release <sha> <incident>`
+ * on the status issue, naming the last attempt's dispatch id, so it grants
+ * exactly one more attempt after exactly that one. Refused, changing nothing,
+ * unless the dispatch mode is on, the account is a listed approver, `sha` is
+ * the last sha dispatched, its attempt has ended, and no candidate is open.
+ * It never resumes a pause or lifts a freeze; the job still needs `sha` to be
+ * the newest qualified commit, a fresh dry run and a fresh approval.
+ */
+async function rearmRelease(r: Run, me: { login: string; id: number }, sha: string): Promise<void> {
+  const d = r.cfg.releaseDispatch ?? r.refuse("release.mode is not dispatch, so there is no release to re-arm");
+  if (!d.approvers.some((h) => h.login === me.login && h.id === me.id)) r.refuse(`${me.login} is not on release.dispatch.approvers, so the release job would not count this re-arm`);
+  const N = r.cfg.names;
+  const rel = (await readStateDocs(r.api, N)).release;
+  if (rel.kind !== "ok") r.refuse(`${N.releaseStateBranch} could not be read (${rel.kind}${"reason" in rel ? `: ${rel.reason}` : ""}), so the last attempt is unknown`);
+  const ds = rel.state.dispatch;
+  const last = ds?.last ?? r.refuse("nothing has been dispatched yet, so there is nothing to re-arm");
+  if (last.sha !== sha) r.refuse(`the last sha dispatched is ${last.sha}, not ${sha}: only it can be re-armed (a newer commit gets its own attempt anyway)`);
+  if (ds?.candidate) r.refuse(`${ds.candidate.sha} is the open candidate; re-arm once its attempt has ended`);
+  if (last.closedAt === null) r.refuse(`${sha}'s last attempt has not ended yet`);
+  const label = N.watchdogLabels.status;
+  const status = (await r.api.listOpenIssues(label)).issues[0] ?? r.refuse(`no open ${label} issue to post the re-arm on`);
+  const body = `/qlander rearm-release ${sha} ${last.id}`;
+  await r.step(`comment on #${status.number}: ${body}`, () => r.api.comment(status.number, body));
+}
+
 /** Run one control command; resolves to the exit code (2: usage, 1: refused or failed, 0: done). */
 export async function controlCommand(cmd: ControlCommand, args: string[], io: OperatorIo, deps: ControlDeps, defaultConfig: string, resolvePath: (p: string) => string): Promise<number> {
   let a: ControlArgs;
@@ -395,6 +423,9 @@ export async function controlCommand(cmd: ControlCommand, args: string[], io: Op
         break;
       case "approve-release":
         await approveRelease(r, me, p[0]!);
+        break;
+      case "rearm-release":
+        await rearmRelease(r, me, p[0]!);
         break;
     }
   } catch (e) {

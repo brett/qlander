@@ -24,7 +24,7 @@
 
 import { RELEASE_REPORT_MARKER, type Listed, type TargetApi, type TargetReads } from "./github/api";
 import { GitHubError } from "./github/http";
-import { APPROVE_RELEASE, releaseApproval } from "./evidence";
+import { APPROVE_RELEASE, REARM_RELEASE, releaseApproval, releaseRearm } from "./evidence";
 import { CrashError } from "./queue";
 import type { ReleaseDecision } from "./release";
 import type { DispatchConfig } from "./release-config";
@@ -363,7 +363,7 @@ export class DispatchTick extends ReleaseTickBase {
     const until = new Date(Date.parse(c.dry!.concludedAt!) + this.cfg.dryRunValidMinutes * 60_000).toISOString();
     const listed = jobs.slice(0, REPORT_JOBS).map((j) => `- ${plain(j.name)}: ${plain(j.conclusion ?? "unknown", 20)}`);
     return [
-      `${RELEASE_REPORT_MARKER}${c.sha} -->`,
+      `${RELEASE_REPORT_MARKER}${c.sha} ${c.dry!.id} -->`,
       `Release candidate \`${c.sha}\` passed its dry run: ${c.dry!.run!.url}`,
       "",
       ...(listed.length ? ["Jobs of the dry run:", ...listed, ...(jobs.length > REPORT_JOBS ? [`- and ${jobs.length - REPORT_JOBS} more`] : []), ""] : []),
@@ -382,7 +382,8 @@ export class DispatchTick extends ReleaseTickBase {
     if (c.reported) return c;
     const issue = await this.status();
     if (!issue) return c;
-    const marker = `${RELEASE_REPORT_MARKER}${c.sha} -->`;
+    // One report per attempt: a re-armed attempt's green dry run is reported afresh.
+    const marker = `${RELEASE_REPORT_MARKER}${c.sha} ${c.dry!.id} -->`;
     try {
       const posted = (await this.d.repo.listIssueComments(issue.number)).items.find((x) => x.body.startsWith(marker));
       let id = posted?.id;
@@ -459,9 +460,13 @@ export class DispatchTick extends ReleaseTickBase {
     if (c.refused >= DISPATCH_REFUSALS) return "alert"; // its alert is already open; a newer candidate starts again
     // The durable once-per-sha guard (DESIGN.md §8.1), whatever history has been pruned: a dry run only for a strict
     // descendant of the last dispatched sha, a real run only for the sha whose dry run was the last dispatch.
+    // A re-armed candidate may have one more dry run of the last sha dispatched, only while its re-arm still names that
+    // sha's last attempt, now closed: the new intent replaces `last`, so the same re-arm can never authorise another.
     const hw = this.ds().highWater;
-    if (kind === "real" ? hw !== c.sha : hw !== null && (hw === c.sha || (await this.target.compare(hw, c.sha)).status !== "ahead")) {
-      this.log.push(`not dispatching the ${kind} run for ${c.sha}: ${hw} was dispatched last, and a sha is dispatched at most once`);
+    const prevLast = this.ds().last;
+    const rearmed = kind === "dry" && c.rearm !== null && hw === c.sha && prevLast?.sha === c.sha && prevLast.id === c.rearm.incident && prevLast.closedAt !== null;
+    if (kind === "real" ? hw !== c.sha : !rearmed && hw !== null && (hw === c.sha || (await this.target.compare(hw, c.sha)).status !== "ahead")) {
+      this.log.push(`not dispatching the ${kind} run for ${c.sha}: ${hw} was dispatched last, and a sha is dispatched once per authorised attempt`);
       return "none";
     }
     const seq = this.state.seq + 1;
@@ -471,7 +476,7 @@ export class DispatchTick extends ReleaseTickBase {
     const cand: DispatchCandidate = { ...c, ...also };
     // The intent, its budget reservation and the candidate it is for: one write, before anything is sent.
     // highWater rides in the same write: once this intent is durable, no sha at or behind it is ever dispatched again.
-    this.setDs({ ...this.ds(), candidate: cand, highWater: c.sha, window: [...window, at] }, { seq, journal: j });
+    this.setDs({ ...this.ds(), candidate: cand, highWater: c.sha, last: { sha: c.sha, id, closedAt: null }, window: [...window, at] }, { seq, journal: j });
     await this.save();
     this.crash("after-intent");
     const i = this.cfg.inputs;
@@ -489,7 +494,7 @@ export class DispatchTick extends ReleaseTickBase {
         // GitHub answered and refused (or the client refused before sending): nothing started, so no record. The reservation stays spent.
         const refused = e.kind === "rate_limit" ? cand.refused : cand.refused + 1;
         // Nothing started, so the high-water mark goes back to what it was: this sha may be dispatched again.
-        this.setDs({ ...this.ds(), candidate: { ...cand, refused }, highWater: hw }, { journal: null });
+        this.setDs({ ...this.ds(), candidate: { ...cand, refused }, highWater: hw, last: prevLast }, { journal: null });
         await this.save();
         this.log.push(`dispatch ${kind} ${c.sha.slice(0, 8)} refused: ${String(e)}`);
         if (e.kind === "rate_limit") return "retry-later";
@@ -511,7 +516,9 @@ export class DispatchTick extends ReleaseTickBase {
     const ds = this.ds();
     const item: DispatchHistoryItem = { at: this.nowIso(), sha: c.sha, outcome, note, dryRun: c.dry?.run?.id ?? null, realRun: c.real?.run?.id ?? null };
     this.log.push(`candidate ${c.sha.slice(0, 8)}: ${outcome} (${note})`);
-    this.setDs({ ...ds, candidate: null, history: [...ds.history, item].slice(-this.deps.cfg.historyLimit) }, also);
+    // The attempt's end, which a re-arm must postdate; only for the candidate the last dispatch was for.
+    const last = ds.last && ds.last.sha === c.sha && (c.dry || c.real) && ds.last.closedAt === null ? { ...ds.last, closedAt: this.nowIso() } : ds.last;
+    this.setDs({ ...ds, candidate: null, last, history: [...ds.history, item].slice(-this.deps.cfg.historyLimit) }, also);
     await this.save();
   }
 
@@ -523,43 +530,69 @@ export class DispatchTick extends ReleaseTickBase {
     return s === "ahead" || s === "identical";
   }
 
-  /** A real run, once dispatched, is followed to its end: it is never superseded, and the release ref decides. */
+  /**
+   * A real run, once dispatched, is followed to its end: it is never
+   * superseded. Only a green run with release seen at the commit (or past it)
+   * is a release. Every other ending is an incomplete promotion, and pauses
+   * the release job (never the queue): a red or cancelled run, a green run
+   * that never moved release, a red run although release moved (the ref alone
+   * proves nothing about the rest of the promotion), and a run that could not
+   * be followed. The candidate's close and the pending pause are one state
+   * write, so no interruption can drop the pause.
+   */
   private async followReal(c: DispatchCandidate): Promise<ReleaseOutcome> {
     const r = c.real!;
-    const run = r.run ? ` (run ${r.run.url})` : "";
+    const url = r.run?.url ?? `no run found (dispatch id ${r.id})`;
     if (r.conclusion === null) {
-      this.log.push(`waiting: the real run for ${c.sha.slice(0, 8)} is in flight${run}`);
+      this.log.push(`waiting: the real run for ${c.sha.slice(0, 8)} is in flight (${url})`);
       return "waiting";
     }
     const cur = await this.target.getRef(this.deps.cfg.names.release);
-    if (await this.reached(cur, c.sha)) {
-      const note = `release seen at ${cur}${cur === c.sha ? "" : ", a descendant"} after the real run concluded ${r.conclusion}${run}`;
+    const reached = await this.reached(cur, c.sha);
+    const seen = `release is ${cur ?? "absent"}${reached ? (cur === c.sha ? ", at it" : ", past it") : ", not at it"}`;
+    if (r.conclusion === "success" && reached) {
+      const note = `release seen at ${cur}${cur === c.sha ? "" : ", a descendant"} after the real run concluded success (${url})`;
       const history = [...this.state.history, { at: this.nowIso(), outcome: "advanced" as const, from: c.receipt.from, to: c.sha, note, receipt: c.receipt }].slice(-this.deps.cfg.historyLimit);
       await this.close(c, "released", note, { history });
-      if (r.conclusion !== "success") await this.alert(`release reached ${c.sha}, but its real run concluded ${r.conclusion}${run}: check the promotion`);
       return "advanced";
     }
-    if (r.conclusion === "success") {
-      if (this.now() - Date.parse(r.concludedAt!) < this.cfg.observeMinutes * 60_000) {
-        this.log.push(`waiting: the real run for ${c.sha.slice(0, 8)} is green; release is ${cur ?? "absent"}, not at it yet`);
-        return "waiting";
-      }
-      await this.close(c, "not-observed", `the real run was green but release is ${cur ?? "absent"}`);
-      await this.alert(`release-blocked: the real run for ${c.sha} was green${run}, but release is ${cur ?? "absent"}, not at it, ${this.cfg.observeMinutes} minutes later. It is never dispatched again for this commit`);
-      return "alert";
+    if (r.conclusion === "success" && this.now() - Date.parse(r.concludedAt!) < this.cfg.observeMinutes * 60_000) {
+      this.log.push(`waiting: the real run for ${c.sha.slice(0, 8)} is green; ${seen} yet`);
+      return "waiting";
     }
-    if (UNFOLLOWED.has(r.conclusion)) {
-      // Nobody knows whether a promotion is running: stop until a person has looked. Closing the
-      // candidate and the pending pause are one state write, so no interruption can drop the pause.
-      const reason = `the real run for ${c.sha} could not be followed (${r.conclusion}, dispatch id ${r.id})${run}; it may still be promoting. Check the target's ${this.cfg.workflow} runs before closing this issue`;
-      this.log.push(`pause: ${reason}`);
-      await this.close(c, "real-failed", `the real run concluded ${r.conclusion}`, { pausePending: this.pending(reason) });
-      await this.applyPause();
-      return "paused";
+    const outcome: DispatchOutcome = r.conclusion === "success" ? "not-observed" : reached ? "incomplete" : "real-failed";
+    const what =
+      r.conclusion === "success"
+        ? `was green but ${seen} ${this.cfg.observeMinutes} minutes later`
+        : UNFOLLOWED.has(r.conclusion)
+          ? `could not be followed (${r.conclusion}); it may still be promoting, and ${seen}`
+          : `concluded ${r.conclusion}, and ${seen}${reached ? ", which alone does not show the promotion finished" : ""}`;
+    const reason = `the real run for ${c.sha} (${url}) ${what}. Production may have changed: check the promotion, and the target's ${this.cfg.workflow} runs, before closing this issue. Closing it resumes the release job toward the newest qualified commit; ${REARM_RELEASE} ${c.sha} ${r.id} on the status issue grants this commit one more attempt`;
+    this.log.push(`pause: ${reason}`);
+    // A release ref that moved is still recorded, as release history, but not as a release of ours.
+    const history = reached ? { history: [...this.state.history, { at: this.nowIso(), outcome: "moved" as const, from: c.receipt.from, to: c.sha, note: `release reached it, but the real run concluded ${r.conclusion}`, receipt: null }].slice(-this.deps.cfg.historyLimit) } : {};
+    await this.close(c, outcome, `the real run concluded ${r.conclusion}; ${seen}`, { ...history, pausePending: this.pending(reason) });
+    await this.applyPause();
+    return "paused";
+  }
+
+  /** A re-arm on the status issue for the last sha dispatched, bound to its last attempt; refusals are logged. */
+  private async findRearm(sha: string): Promise<IssueComment | null> {
+    const last = this.ds().last;
+    if (!last || last.sha !== sha || last.closedAt === null) return null;
+    const issue = await this.status();
+    if (!issue) return null;
+    let comments: IssueComment[];
+    try {
+      comments = (await this.d.repo.listIssueComments(issue.number)).items;
+    } catch (e) {
+      if (!(e instanceof GitHubError)) throw e;
+      this.log.push(`re-arms not read: ${String(e)}`);
+      return null;
     }
-    await this.close(c, "real-failed", `the real run concluded ${r.conclusion}`);
-    await this.alert(`release-blocked: the real run for ${c.sha} concluded ${r.conclusion}${run}. It is never dispatched again for this commit; a newer qualified commit gets its own dry run`);
-    return "alert";
+    const { rearm, refused } = releaseRearm(comments, this.cfg.approvers, sha, last.id, new Date(Date.parse(last.closedAt)));
+    for (const r of refused) this.log.push(`re-arm refused: ${r}`);
+    return rearm;
   }
 
   // ---------------------------------------------------------------- the tick
@@ -606,11 +639,25 @@ export class DispatchTick extends ReleaseTickBase {
       const seen = this.ds().history.find((h) => h.sha === decision.to);
       const hw = this.ds().highWater;
       const behind = hw !== null && (hw === decision.to || (await this.target.compare(hw, decision.to)).status !== "ahead");
-      if (seen || behind) {
-        this.log.push(`${decision.to.slice(0, 8)} is not newer than ${behind ? `${hw}, the last sha dispatched` : `its own earlier dry run (${seen!.outcome})`}; waiting for a newer commit`);
+      // A re-arm applies only while this sha is still the newest qualified commit, a strict descendant of release
+      // (the decision rechecks both), and the last sha dispatched; a newer commit takes its place instead.
+      const rearm = hw === decision.to ? await this.findRearm(decision.to) : null;
+      if ((seen || behind) && !rearm) {
+        this.log.push(`${decision.to.slice(0, 8)} is not newer than ${behind ? `${hw}, the last sha dispatched` : `its own earlier dry run (${seen!.outcome})`}; waiting for a newer commit, or \`${REARM_RELEASE} ${decision.to} <incident>\``);
         return "none";
       }
-      c = { sha: decision.to, receipt: decision.receipt, since: this.nowIso(), dry: null, reported: null, approval: null, real: null, refused: 0 };
+      if (rearm) this.log.push(`re-armed: ${decision.to.slice(0, 8)} gets one more attempt (comment ${rearm.id} by ${rearm.user.login}), from a fresh dry run`);
+      c = {
+        sha: decision.to,
+        receipt: decision.receipt,
+        since: this.nowIso(),
+        dry: null,
+        reported: null,
+        approval: null,
+        real: null,
+        refused: 0,
+        rearm: rearm ? { comment: rearm.id, login: rearm.user.login, id: rearm.user.id, incident: this.ds().last!.id, at: rearm.created_at } : null,
+      };
       this.setCandidate(c);
       await this.save();
     } else if (!Bun.deepEquals(c.receipt, decision.receipt, true)) {

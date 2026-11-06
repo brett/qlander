@@ -171,15 +171,14 @@ describe("dispatch mode: once per sha", () => {
     expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `dry ${b.slice(0, 8)}`]);
   });
 
-  test("a failed real run is never dispatched again for that commit, approval or not", async () => {
+  test("a failed real run is never dispatched again for that commit, approval or not, even after resuming", async () => {
     const { w, a } = await greenDry();
     w.behave = ({ kind }) => (kind === "real" ? { conclusion: "failure" } : {});
     w.approve(a);
     expect((await w.ok()).outcome).toBe("dispatched");
-    expect((await w.ok()).outcome).toBe("alert");
+    expect((await w.ok()).outcome).toBe("paused");
     expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "real-failed" });
-    expect(w.issues(ALERT).some((i) => i.title.includes("real run"))).toBe(true);
-    expect(w.issues("release-pause")).toHaveLength(0); // a run that concluded is known: no pause
+    w.resume();
     w.approve(a);
     for (let i = 0; i < 3; i++) await w.ok();
     expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`]);
@@ -361,7 +360,7 @@ describe("dispatch mode: runs that go wrong", () => {
     v.behave = ({ kind }) => (kind === "real" ? { conclusion: "cancelled" } : {});
     v.approve(b);
     await v.ok();
-    expect((await v.ok()).outcome).toBe("alert");
+    expect((await v.ok()).outcome).toBe("paused");
     expect(v.dispatchHistory().at(-1)).toMatchObject({ outcome: "real-failed", note: expect.stringContaining("cancelled") });
   });
 
@@ -374,27 +373,30 @@ describe("dispatch mode: runs that go wrong", () => {
     expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "dry-failed", note: expect.stringContaining("stuck") });
   });
 
-  test("a green real run that never moves release is release-blocked after observeMinutes, and never dispatched again", async () => {
+  test("a green real run that never moves release pauses after observeMinutes, and is never dispatched again", async () => {
     const { w, a } = await greenDry();
     w.behave = ({ kind }) => (kind === "real" ? { moveRelease: false } : {});
     w.approve(a);
     await w.ok();
     expect((await w.ok()).outcome).toBe("waiting");
-    await w.until((r) => r.outcome === "alert");
+    await w.until((r) => r.outcome === "paused");
     expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "not-observed" });
+    expect(w.issues("release-pause")[0]!.body).toContain("Production may have changed");
+    w.resume();
     await w.ok();
     expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`]);
   });
 
-  test("a real run that failed although release reached the commit counts as released, with an alert", async () => {
+  test("a real run that failed although release reached the commit is an incomplete promotion: it pauses, and is not a release of ours", async () => {
     const { w, a } = await greenDry();
     w.behave = ({ kind }) => (kind === "real" ? { conclusion: "failure" } : {});
     w.approve(a);
     await w.ok();
     w.target.githubUpdateRefs("release", w.R, a); // the workflow moved release, then a later step failed
-    expect((await w.ok()).outcome).toBe("advanced");
-    expect(w.dispatchHistory().at(-1)).toMatchObject({ outcome: "released" });
-    expect(w.issues(ALERT).some((i) => i.body.includes("check the promotion"))).toBe(true);
+    expect((await w.ok()).outcome).toBe("paused");
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ outcome: "incomplete" });
+    expect(w.state().history.at(-1)).toMatchObject({ outcome: "moved", to: a, receipt: null });
+    expect(w.issues("release-pause")[0]!.body).toContain("which alone does not show the promotion finished");
   });
 });
 
@@ -675,7 +677,8 @@ describe("dispatch mode: review regressions", () => {
     await w.ok();
     w.approve(a);
     await w.ok();
-    expect((await w.ok()).outcome).toBe("alert"); // a: real-failed
+    expect((await w.ok()).outcome).toBe("paused"); // a: real-failed
+    w.resume();
     const b = w.land();
     w.qualified(b);
     await w.ok();
@@ -804,5 +807,142 @@ describe("dispatch mode: second review", () => {
     expect(r.outcome).toBe("waiting");
     expect(r.log.some((l) => l.includes("does not match the authenticated listing"))).toBe(true);
     expect((await w.ok()).outcome).toBe("dispatched"); // the listing caught up
+  });
+});
+
+describe("dispatch mode: an incomplete promotion pauses the release job", () => {
+  test("a failed real run with release unmoved: closed and paused in one write; the text names sha, run, conclusion and release; resume moves on", async () => {
+    const { w, a } = await greenDry();
+    w.behave = ({ kind }) => (kind === "real" ? { conclusion: "failure" } : {});
+    w.approve(a);
+    await w.ok();
+    const writes: { candidate: unknown; pausePending: unknown }[] = [];
+    const cas = w.stateRef.cas.bind(w.stateRef);
+    w.stateRef.cas = async (before, text) => {
+      const s = JSON.parse(text);
+      writes.push({ candidate: s.dispatch?.candidate, pausePending: s.pausePending });
+      return cas(before, text);
+    };
+    expect((await w.ok()).outcome).toBe("paused");
+    w.stateRef.cas = cas;
+    // The write that closes the candidate already carries the pause.
+    const closing = writes.find((x) => x.candidate === null)!;
+    expect(closing.pausePending).not.toBeNull();
+    const body = w.issues("release-pause")[0]!.body;
+    for (const part of [a, w.dispatched[1]!.run!.id.toString(), "concluded failure", `release is ${w.R}`, "Production may have changed"]) expect(body).toContain(part);
+    expect(w.issues(w.cfg.names.controlLabels.pause)).toHaveLength(0); // the queue is not paused
+    expect((await w.ok()).outcome).toBe("paused");
+    w.resume();
+    expect((await w.ok()).outcome).toBe("none"); // a is not dispatched again
+    const b = w.land();
+    w.qualified(b);
+    expect((await w.ok()).outcome).toBe("dispatched");
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`, `dry ${b.slice(0, 8)}`]);
+  });
+
+  test("the dry-run window is not extended by a pause", async () => {
+    const { w, a } = await greenDry({ dryRunValidMinutes: 30 });
+    w.repo.issues.push({ number: 77, title: "hold", body: "", labels: [w.cfg.names.releaseLabels.pause], open: true });
+    expect((await w.ok()).outcome).toBe("paused");
+    w.now = new Date(w.now.getTime() + 31 * 60_000);
+    w.resume();
+    w.approve(a);
+    expect((await w.ok()).outcome).toBe("alert");
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "expired" });
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`]);
+  });
+});
+
+describe("dispatch mode: re-arm", () => {
+  /** a's real run failed and paused the job; the pause is closed. */
+  async function failedOnce() {
+    const { w, a } = await greenDry();
+    w.behave = ({ kind }) => (kind === "real" ? { conclusion: "failure" } : {});
+    const oldApproval = w.approve(a);
+    await w.ok();
+    expect((await w.ok()).outcome).toBe("paused");
+    w.resume();
+    w.behave = () => ({});
+    const incident = w.dispatched[1]!.id;
+    expect(w.state().dispatch!.last).toMatchObject({ sha: a, id: incident, closedAt: expect.any(String) });
+    return { w, a, incident, oldApproval };
+  }
+  const rearm = (w: DispatchWorld, a: string, incident: string, by = APPROVER, o: { at?: Date; edited?: boolean } = {}) => w.approve(a, by, { ...o, body: `/qlander rearm-release ${a} ${incident}` });
+
+  test("grants one attempt: a fresh dry run, then a fresh approval (the old one no longer counts), then the real run", async () => {
+    const { w, a, incident, oldApproval } = await failedOnce();
+    rearm(w, a, incident);
+    const r = await w.ok();
+    expect(r.outcome).toBe("dispatched");
+    expect(r.log.some((l) => l.startsWith("re-armed"))).toBe(true);
+    expect(w.candidate()).toMatchObject({ sha: a, rearm: { incident, login: APPROVER.login }, approval: null });
+    const t = await w.ok(); // the new dry run is green and reported afresh
+    expect(t.outcome).toBe("waiting");
+    expect(t.log.some((l) => l.includes(`comment ${oldApproval}`) && l.includes("predates"))).toBe(true);
+    expect(w.repo.posted).toHaveLength(2);
+    w.approve(a);
+    expect((await w.ok()).outcome).toBe("dispatched");
+    expect((await w.ok()).outcome).toBe("advanced");
+    expect(w.release).toBe(a);
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`, `dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`]);
+    // History is kept, and the high-water mark never went backwards.
+    expect(w.dispatchHistory().map((h) => h.outcome)).toEqual(["real-failed", "released"]);
+    expect(w.state().dispatch!.highWater).toBe(a);
+  });
+
+  test("is spent by the attempt it grants: after that attempt fails, the same comment re-arms nothing", async () => {
+    const { w, a, incident } = await failedOnce();
+    rearm(w, a, incident);
+    w.behave = () => ({ conclusion: "failure" });
+    await w.ok();
+    expect((await w.ok()).outcome).toBe("alert"); // the re-armed dry run fails
+    const r = await w.ok();
+    expect(r.outcome).toBe("none");
+    expect(r.log.some((l) => l.includes(`names incident ${incident}, not the last attempt`))).toBe(true);
+    expect(w.kinds()).toHaveLength(3);
+  });
+
+  test("refused: a stranger, another incident, an edited comment, one posted before the attempt ended, and another sha", async () => {
+    const { w, a, incident } = await failedOnce();
+    const closedAt = new Date(w.state().dispatch!.last!.closedAt!);
+    rearm(w, a, incident, STRANGER);
+    rearm(w, a, w.dispatched[0]!.id);
+    rearm(w, a, incident, APPROVER, { edited: true });
+    rearm(w, a, incident, APPROVER, { at: new Date(closedAt.getTime() - 60_000) });
+    rearm(w, sha("other"), incident);
+    const r = await w.ok();
+    expect(r.outcome).toBe("none");
+    const refused = r.log.filter((l) => l.startsWith("re-arm refused"));
+    expect(refused).toHaveLength(5);
+    for (const part of ["not in release.dispatch.approvers", `not the last attempt ${incident}`, "was edited", "predates the end of that attempt", "the last sha dispatched"]) expect(refused.some((l) => l.includes(part))).toBe(true);
+    expect(w.kinds()).toHaveLength(2);
+  });
+
+  test("refused once a newer commit is the newest qualified candidate: that commit gets the attempt instead", async () => {
+    const { w, a, incident } = await failedOnce();
+    rearm(w, a, incident);
+    const b = w.land();
+    w.qualified(b);
+    await w.ok();
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`, `dry ${b.slice(0, 8)}`]);
+  });
+
+  test("never lifts a freeze, never resumes a pause, and the budget still applies", async () => {
+    const { w, a, incident } = await failedOnce();
+    w.cfg = { ...w.cfg, dispatch: { ...w.dcfg, freeze: [{ variable: "RELEASE_FREEZE", value: "true" }] } };
+    w.target.variables.set("RELEASE_FREEZE", "true");
+    rearm(w, a, incident);
+    expect((await w.ok()).outcome).toBe("waiting");
+    expect(w.target.variables.get("RELEASE_FREEZE")).toBe("true");
+    w.repo.issues.push({ number: 88, title: "hold", body: "", labels: [w.cfg.names.releaseLabels.pause], open: true });
+    w.target.variables.delete("RELEASE_FREEZE");
+    expect((await w.ok()).outcome).toBe("paused");
+    expect(w.kinds()).toHaveLength(2);
+    w.resume();
+    w.cfg = { ...w.cfg, dispatch: { ...w.dcfg, budget: { window: 2, windowHours: 24 } } };
+    expect((await w.ok()).outcome).toBe("alert");
+    expect(w.issues(ALERT).some((i) => i.title.includes("budget"))).toBe(true);
+    w.cfg = { ...w.cfg, dispatch: { ...w.dcfg, budget: { window: 8, windowHours: 24 } } };
+    expect((await w.ok()).outcome).toBe("dispatched");
   });
 });

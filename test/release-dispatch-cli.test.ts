@@ -49,12 +49,13 @@ function candidate(over: Partial<DispatchCandidate> = {}): DispatchCandidate {
     approval: null,
     real: null,
     refused: 0,
+    rearm: null,
     ...over,
   };
 }
 
 function world(c: DispatchCandidate | null = candidate(), configPath = dispatchConfig()): ControlWorld {
-  const s: ReleaseState = { ...emptyReleaseState(), dispatch: { candidate: c, highWater: c?.dry ? c.sha : null, window: [], history: [] } };
+  const s: ReleaseState = { ...emptyReleaseState(), dispatch: { candidate: c, highWater: c?.dry ? c.sha : null, last: c?.dry ? { sha: c.sha, id: c.dry.id, closedAt: null } : null, window: [], history: [] } };
   const w = new ControlWorld(undefined, s);
   w.configPath = configPath;
   return w;
@@ -108,5 +109,42 @@ describe("approve-release", () => {
     const w = world();
     w.status.open = false;
     expect((await w.run("approve-release", [A])).err).toContain(`no open ${STATUS} issue`);
+  });
+});
+
+describe("rearm-release", () => {
+  const INCIDENT = `qlr-real-${A.slice(0, 12)}-111111111111`;
+  function ended(over: Partial<{ sha: string; closedAt: string | null; candidate: DispatchCandidate | null }> = {}): ControlWorld {
+    const s: ReleaseState = {
+      ...emptyReleaseState(),
+      dispatch: { candidate: over.candidate ?? null, highWater: over.sha ?? A, last: { sha: over.sha ?? A, id: INCIDENT, closedAt: over.closedAt === undefined ? "2026-10-22T12:30:00.000Z" : over.closedAt }, window: [], history: [] },
+    };
+    const w = new ControlWorld(undefined, s);
+    w.configPath = dispatchConfig();
+    return w;
+  }
+
+  test("posts the re-arm bound to the last attempt's dispatch id, as a release approver", async () => {
+    const w = ended();
+    const r = await w.run("rearm-release", [A]);
+    expect(r.err).toBe("");
+    expect(w.status.comments).toContain(`/qlander rearm-release ${A} ${INCIDENT}`);
+  });
+
+  test.each([
+    ["another sha", ended(), sha("other"), "only it can be re-armed"],
+    ["an open candidate", ended({ candidate: candidate() }), A, "is the open candidate"],
+    ["an attempt that has not ended", ended({ closedAt: null }), A, "has not ended yet"],
+  ] as const)("refuses %s, changing nothing", async (_, w, s, msg) => {
+    const r = await w.run("rearm-release", [s]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain(msg);
+    expect(w.writes()).toEqual([]);
+  });
+
+  test("refuses an operator who is not a release approver", async () => {
+    const w = ended();
+    w.me = { login: `${ME.login}-other`, id: ME.id + 1 };
+    expect((await w.run("rearm-release", [A])).err).toContain("not on release.dispatch.approvers");
   });
 });

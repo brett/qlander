@@ -69,6 +69,8 @@ export interface RunnerDeps {
   /** The Actions job running this tick; recorded in the lease (DESIGN.md §15). Always set in production. */
   executor?: Executor | null;
   crash?: (point: CrashPoint) => void;
+  /** How a landing waits between reads of its PRs (default: the real clock); tests pass their own. */
+  sleep?: (ms: number) => Promise<void>;
   /** Lifecycle hooks (qlander.yml `hooks`, src/hooks.ts). Not policy: not in cfg, so not in the policy hash. */
   hooks?: Hook[];
   /** PR comments to leave out (qlander.yml `comments`). Not policy: not in cfg. Absent: every comment is posted. */
@@ -196,6 +198,10 @@ export function prAuthor(live: { author?: string; authorId?: number } | undefine
   const email = noreplyEmail(live.author, live.authorId);
   return email ? { login: live.author, email } : null;
 }
+
+/** How long, and how often, a landing waits for GitHub to process its PR branch moves (DESIGN.md §7.4). */
+export const LAND_HEAD_WAIT_MS = 120_000;
+export const LAND_HEAD_POLL_MS = 500;
 
 const stableId = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
 
@@ -328,6 +334,11 @@ class Tick {
    */
   async resolve(r: Recovery, snap: Snapshot): Promise<void> {
     const j = this.state.journal!;
+    // A PR's own read still at its stack commit, with its branch read back at the admitted head: GitHub has not processed the move back (DESIGN.md §7.4). Not a push, so nothing is dropped.
+    if (r.kind === "retryLand" && j.op.kind === "land" && j.op.heads?.some((h) => snap.prs[String(h.pr)]?.head === h.after)) {
+      await this.apply(this.unsettled(j.op, j.at, "a PR still reads at its stack commit"));
+      return;
+    }
     if (j.tries >= this.d.cfg.maxOpTries) {
       await this.endLinear(j.op, { kind: "opAbandoned", reason: `${j.op.kind} re-executed ${j.tries} times without completing` });
       return;
@@ -374,6 +385,15 @@ class Tick {
     await this.perform(snap);
   }
 
+  private unsettled(op: Extract<Op, { kind: "land" }>, since: string, why: string): OpResult {
+    const heads = op.heads ?? [];
+    return {
+      kind: "landUnsettled",
+      overdue: this.d.now().getTime() - Date.parse(since) >= this.d.cfg.reconcileMinutes * 60_000,
+      reason: `the linear landing could not settle its PR branches (${why}). Qlander retries each tick; each should read at its admitted head: ${heads.map((h) => `${h.ref} (#${h.pr}) ${h.before}`).join(", ")}, and ${heads.map((h) => h.after).join(", ")} are its stack commits. The journal is kept, so a landing that did apply is still recorded`,
+    };
+  }
+
   /**
    * Linear landing (DESIGN.md §7.4), on every way out that is not a landing:
    * is it on main, and if not, prove where everything is with one guarded write
@@ -390,11 +410,7 @@ class Tick {
     const main = await c.getRef(name);
     if (main === op.after) return { kind: "landed" };
     const heads = op.heads ?? [];
-    const unsettled = (why: string): OpResult => ({
-      kind: "landUnsettled",
-      overdue: this.d.now().getTime() - Date.parse(since) >= this.d.cfg.reconcileMinutes * 60_000,
-      reason: `the linear landing could not settle its PR branches (${why}). Qlander retries each tick; each should read at its admitted head: ${heads.map((h) => `${h.ref} (#${h.pr}) ${h.before}`).join(", ")}, and ${heads.map((h) => h.after).join(", ")} are its stack commits. The journal is kept, so a landing that did apply is still recorded`,
-    });
+    const unsettled = (why: string) => this.unsettled(op, since, why);
     if (main === null) return unsettled(`${name} did not read`);
     const seen = await c.compare(op.after, main);
     if (seen.status === "ahead" || seen.status === "identical") return { kind: "landed" };
@@ -413,6 +429,24 @@ class Tick {
     if (main !== op.before) return { kind: "baseMoved" };
     const pushed = heads.filter((h) => now.get(h.pr) !== h.before && now.get(h.pr) !== h.after).map((h) => h.pr);
     return pushed.length > 0 ? { kind: "headMoved", prs: pushed } : null;
+  }
+
+  /**
+   * Linear landing (DESIGN.md §7.4): main moves only once GitHub has processed each
+   * PR branch's move, which a PR's own read shows. A main push that overtakes that
+   * closes the PR without the merged mark, for good. Too slow, or a push: the error
+   * takes it to settle, and a head that was pushed to refuses landStack anyway.
+   */
+  private async headsProcessed(op: Extract<Op, { kind: "land" }>): Promise<void> {
+    let left = op.heads ?? [];
+    for (let i = 0; left.length > 0; i++) {
+      if (i > 0) await (this.d.sleep ?? ((ms) => this.store.sleep(ms)))(LAND_HEAD_POLL_MS);
+      const seen = await Promise.all(left.map((h) => this.d.target.getPr(h.pr)));
+      // Somebody's push: no reason to wait for a head that will not come, and landStack refuses it.
+      if (left.some((h, k) => seen[k]!.head.sha !== h.after && seen[k]!.head.sha !== h.before)) return;
+      left = left.filter((h, k) => seen[k]!.head.sha !== h.after);
+      if (left.length > 0 && i * LAND_HEAD_POLL_MS >= LAND_HEAD_WAIT_MS) throw new GitHubError("server", null, `GitHub has not processed the move of ${left.map((h) => `${h.ref} (#${h.pr})`).join(", ")} after ${LAND_HEAD_WAIT_MS / 1000} seconds`);
+    }
   }
 
   /** End a journalled op with `result`; a linear landing settles first, and only a clean result lets it end this way. */
@@ -472,6 +506,7 @@ class Tick {
             // Linear (DESIGN.md §7.4): GitHub marks a PR merged only if its head already reads where the main push reaches, so the branches move first, each write guarding the other's refs.
             await c.moveBranches({ branch: main, at: op.before }, op.heads.map((h) => ({ branch: h.ref, before: h.before, after: h.after })), null);
             this.crash("after-branches");
+            await this.headsProcessed(op);
             await c.landStack({ branch: main, before: op.before, after: op.after }, op.heads.map((h) => ({ branch: h.ref, at: h.after })), null);
           } else await c.updateRef(main, op.before, op.after); // CAS: beforeOid, force false
           this.crash("after-effect");

@@ -248,13 +248,24 @@ describe("the record", () => {
 });
 
 describe("carrySeenRed", () => {
+  const STRATEGY: Partial<Config> = { strategy: { firstAlone: true, skipSeenRed: true } };
+  const oracle = (b: BatchCi): CiOutcome => (b.prs.length > 1 && b.prs.includes(2) ? "fail" : "pass");
+  const splitOnInference = (w: World) => w.state().history.some((h) => h.note?.includes("already seen red"));
+
   test("not carried across a linear landing: the rest is built, not split on an inference about its tree", async () => {
-    const w = linearWorld((b) => (b.prs.length > 1 && b.prs.includes(2) && b.attempt === 1 ? "fail" : "pass"), { strategy: { firstAlone: true, skipSeenRed: true } });
+    const w = linearWorld(oracle, STRATEGY);
     for (const n of [1, 2, 3, 4]) pr(w, n);
     await w.runUntilIdle();
     expect(w.landed().flat().sort()).toEqual([1, 2, 3, 4]);
     expect(w.state().seenRed).toBeUndefined();
-    expect(w.state().history.some((h) => h.note?.includes("already seen red"))).toBe(false);
+    expect(splitOnInference(w)).toBe(false);
+  });
+
+  test("merge mode: still carried", async () => {
+    const w = new World(oracle, STRATEGY);
+    for (const n of [1, 2, 3, 4]) w.readyPr(n);
+    await w.runUntilIdle();
+    expect(splitOnInference(w)).toBe(true);
   });
 });
 

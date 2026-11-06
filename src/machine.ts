@@ -229,8 +229,8 @@ function startBuild(c: Ctx, prs: number[], depth: number, lineage: number, sourc
 
 /**
  * Journal the landing of a green batch (DESIGN.md §7.2). In linear mode
- * (§7.4) the same atomic update moves each PR's head branch, the one recorded
- * at admission, from its admitted head to its own stack commit.
+ * (§7.4) the landing also moves each PR's head branch, the one recorded at
+ * admission, from its admitted head to its own stack commit, just before main.
  */
 function land(c: Ctx, a: Active): void {
   focus(c.s, a);

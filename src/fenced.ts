@@ -52,7 +52,7 @@ export function fenced(
   /** One atomic call with the epoch entry. A rejection after the epoch moved is a lost lease, not a GitHub error. */
   const epochWrite = (writes: RefUpdate[]): Promise<void> => epochCall((e) => target.epochUpdateRefs(writes, e));
 
-  /** `send` makes one atomic ref write carrying epoch `e` (epochUpdateRefs, or a linear landing). */
+  /** `send` makes one atomic ref write carrying epoch `e` (epochUpdateRefs, or either write of a linear landing). */
   const epochCall = async (send: (e: string) => Promise<void>): Promise<void> => {
     const e = epoch!();
     if (e === null) throw new LostLockError("no epoch taken this tick; not writing refs");

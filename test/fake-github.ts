@@ -152,6 +152,18 @@ export class FakeTarget implements TargetApi {
   refuseLandings = 0;
   /** The next this-many moveBranches calls are refused whole. */
   refuseBranchMoves = 0;
+  /**
+   * GitHub processes a PR branch's move in the background: a PR's read shows
+   * its old head for this many reads after a move, and a main push that
+   * overtakes it closes the PR without the merged mark, as measured live.
+   */
+  headProcessingReads = 0;
+  private unprocessed = new Map<number, { before: string; reads: number }>();
+  /** GitHub catches up with every branch move. */
+  processAll(): void {
+    this.headProcessingReads = 0;
+    this.unprocessed.clear();
+  }
   refusal: () => Error = () => new GitHubError("validation", 422, "Reference update failed");
 
   private setContent(s: string, c: Set<string>): void {
@@ -320,6 +332,11 @@ export class FakeTarget implements TargetApi {
   async getPr(n: number) {
     this.log(`getPr ${n}`);
     const out = structuredClone(this.pr(n).pr);
+    const late = this.unprocessed.get(n);
+    if (late) {
+      out.head.sha = late.before;
+      if (--late.reads <= 0) this.unprocessed.delete(n);
+    }
     const calls = (this.getPrCalls.get(n) ?? 0) + 1;
     this.getPrCalls.set(n, calls);
     this.afterGetPr?.(n, calls);
@@ -612,7 +629,11 @@ export class FakeTarget implements TargetApi {
       if (!f || f.pr.head.sha !== m.before) throw new GitHubError("conflict", 200, "beforeOid does not match");
       if (!this.commits.has(m.after)) throw new GitHubError("validation", 200, "Object does not exist");
     }
-    for (const m of moves) this.prOnBranch(m.branch)!.pr.head.sha = m.after;
+    for (const m of moves) {
+      const f = this.prOnBranch(m.branch)!;
+      f.pr.head.sha = m.after;
+      if (this.headProcessingReads > 0 && m.before !== m.after) this.unprocessed.set(f.pr.number, { before: m.before, reads: this.headProcessingReads });
+    }
     this.branchMoves.push({ guard, moves });
   }
 
@@ -631,6 +652,8 @@ export class FakeTarget implements TargetApi {
     for (const b of pinned) {
       if (this.prOnBranch(b.branch)?.pr.head.sha !== b.at) throw new GitHubError("conflict", 200, "beforeOid does not match");
     }
+    for (const n of this.unprocessed.keys()) Object.assign(this.pr(n).pr, { state: "closed", merged: false });
+    this.unprocessed.clear();
     this.githubUpdateRefs(main.branch, main.before, main.after); // merge detection sees the branches the earlier call moved
     this.landings.push({ main, pinned });
   }

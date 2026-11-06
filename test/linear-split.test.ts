@@ -43,6 +43,52 @@ describe("the two writes", () => {
   });
 });
 
+describe("GitHub processes a branch move in the background", () => {
+  test("main waits until every PR reads at its stack commit, so each ends merged", async () => {
+    const w = linearWorld();
+    for (const n of [1, 2]) pr(w, n);
+    w.target.headProcessingReads = 4;
+    await w.runUntilIdle();
+    expect(w.landed()).toEqual([[1, 2]]);
+    for (const n of [1, 2]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
+    expect(w.target.branchMoves).toHaveLength(1);
+  });
+
+  test("not processed in time: main does not move, the branches go back, and a later try lands", async () => {
+    const w = linearWorld();
+    const before = pr(w, 1).pr.head.sha;
+    w.target.headProcessingReads = 100_000;
+    await w.tick();
+    for (let i = 0; i < 10 && w.target.branchMoves.length < 2; i++) await w.tick();
+    expect(w.target.landings).toEqual([]);
+    expect(w.target.prs.get(1)!.pr.head.sha).toBe(before);
+    // The PR's read lags behind the move back too: that is not a push, so nothing is dropped.
+    for (let i = 0; i < 2; i++) await w.tick();
+    expect(w.state().journal?.op.kind).toBe("land");
+    expect(w.paused()).toBe(false);
+    expect(w.comments(1).some((c) => c.startsWith("Removed from"))).toBe(false);
+    w.target.processAll();
+    await w.runUntilIdle();
+    expect(w.landed()).toEqual([[1]]);
+    expect(w.target.prs.get(1)!.pr.merged).toBe(true);
+  });
+
+  test("a push while it waits: the wait ends at once, landStack refuses, and the push stays", async () => {
+    const w = linearWorld();
+    for (const n of [1, 2]) pr(w, n);
+    const move = w.target.moveBranches.bind(w.target);
+    let pushed = "";
+    w.target.moveBranches = async (g, m, e) => {
+      await move(g, m, e);
+      if (!pushed && m.some((x) => x.before !== x.after)) pushed = w.target.push(2);
+    };
+    await w.runUntilIdle();
+    expect(w.target.prs.get(2)!.pr.head.sha).toBe(pushed);
+    expect(w.target.prs.get(2)!.pr.merged).toBe(false);
+    expect(w.landed()).toEqual([[1]]);
+  });
+});
+
 describe("between the writes", () => {
   /** Run `act` after the branches moved and before main does, once. */
   function between(w: World, act: () => void): void {
@@ -251,7 +297,7 @@ describe("lost responses and lagging reads", () => {
     await crashBetween(w);
     const op = w.state().journal!.op as { heads: { before: string; after: string }[] };
     const read = w.target.getPrBranch.bind(w.target);
-    let stale = 2; // observation, then settle
+    let stale = 1; // the observation
     w.target.getPrBranch = async (b) => (stale-- > 0 ? op.heads[0]!.before : read(b));
     w.config = { ...w.config, maxBatch: w.config.maxBatch + 1 }; // the policy changes: the resend does not revalidate
     const t = await w.tick();

@@ -144,11 +144,11 @@ export type BuildSource =
 export type Op =
   | { kind: "build"; n: number; base: string; pins: Pin[]; depth: number; lineage: number; source: BuildSource; rebuild: boolean }
   | { kind: "rerun"; runs: RunRef[]; done?: RunRef[]; requested?: RerunRequest[]; everSent?: boolean }
-  /** `heads`: linear landing only (DESIGN.md §7.4), each PR branch the same atomic update moves from its admitted head to its stack commit. */
+  /** `heads`: linear landing only (DESIGN.md §7.4), each PR branch the landing moves from its admitted head to its stack commit, just before main. */
   | { kind: "land"; before: string; after: string; heads?: HeadMove[]; refused?: number }
   | { kind: "cancel"; runs: RunRef[]; cause: "timeout" | "starved" };
 
-/** One PR head branch a linear landing moves (DESIGN.md §7.4): `ref` from `before` (the admitted head) to `after` (its stack commit). */
+/** One PR head branch a linear landing moves (DESIGN.md §7.4): `ref` from `before` (the admitted head) to `after` (its stack commit), and back if the landing does not complete. */
 export interface HeadMove {
   pr: number;
   ref: string;

@@ -12,7 +12,7 @@ import type { RepoView } from "./repo-view";
 import { fail, type Finding, pass, readFailed, unread, warn } from "./types";
 import { executedPaths, jobs, localUses, normalisePath, parseWorkflow, steps, type Yaml } from "./workflow";
 
-/** The files the config names as gates: pre-landing and fast-lane workflows, the review producer, the release provider's inputs. */
+/** The files the config names as gates: pre-landing and fast-lane workflows, the review producer, the release provider's inputs, the dispatched promote workflow. */
 export function policySet(cfg: LoadedConfig): string[] {
   const c = cfg.config;
   const set = new Set<string>(c.preLanding.map((e) => e.path));
@@ -29,6 +29,8 @@ export function policySet(cfg: LoadedConfig): string[] {
       if (q.proof) set.add(q.proof.workflow);
     }
   }
+  // release.mode dispatch: the promote workflow decides what a dry run and a real run do, so what it runs is policy too.
+  if (cfg.release.dispatch) set.add(cfg.release.dispatch.workflow);
   return [...set];
 }
 

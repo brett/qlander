@@ -16,7 +16,7 @@
 // Never the mirror issues, the status issue or PR comments.
 
 import type { Names } from "./config";
-import type { ReleaseState } from "./release-state";
+import { candidateStage, type ReleaseState } from "./release-state";
 import type { HistoryItem, State } from "./state";
 import type { Run } from "./types";
 import { type IssueInfo, isTickRun, type TickRun } from "./watchdog-core";
@@ -156,6 +156,8 @@ export interface Status {
         seq: number;
         lease: { owner: string; until: string; expiresInMs: number } | null;
         op: null | { before: string; after: string; at: string; ageMs: number | null };
+        /** release.mode dispatch: a dispatch in flight (its journal), and the candidate's stage; absent otherwise. */
+        dispatch?: { op: null | { kind: string; sha: string; at: string; ageMs: number | null }; candidate: null | { sha: string; stage: string } };
         pausePending: string | null;
         last: null | { at: string; ageMs: number | null; kind: string; reason: string; release: string | null; main: string | null };
         lastHistory: null | { at: string; outcome: string; from: string; to: string; note: string };
@@ -236,7 +238,15 @@ function projectRelease(r: DocRead<ReleaseState>, now: number): Status["release"
     kind: "ok",
     seq: s.seq,
     lease: s.lease ? { owner: s.lease.owner, until: s.lease.until, expiresInMs: (ms(s.lease.until) ?? now) - now } : null,
-    op: s.journal ? { before: s.journal.before, after: s.journal.after, at: s.journal.at, ageMs: since(now, s.journal.at) } : null,
+    op: s.journal?.op === "advance" ? { before: s.journal.before, after: s.journal.after, at: s.journal.at, ageMs: since(now, s.journal.at) } : null,
+    ...(s.dispatch || s.journal?.op === "dispatch"
+      ? {
+          dispatch: {
+            op: s.journal?.op === "dispatch" ? { kind: s.journal.kind, sha: s.journal.sha, at: s.journal.at, ageMs: since(now, s.journal.at) } : null,
+            candidate: s.dispatch?.candidate ? { sha: s.dispatch.candidate.sha, stage: candidateStage(s.dispatch.candidate) } : null,
+          },
+        }
+      : {}),
     pausePending: s.pausePending?.reason ?? null,
     last: s.last ? { at: s.last.at, ageMs: since(now, s.last.at), kind: s.last.kind, reason: s.last.reason, release: s.last.release, main: s.last.main } : null,
     lastHistory: h ? { at: h.at, outcome: h.outcome, from: h.from, to: h.to, note: h.note } : null,

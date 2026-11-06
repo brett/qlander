@@ -14,6 +14,8 @@
 import type { Names } from "./config";
 import type { Bundle, LoadedConfig } from "./config/load";
 import { CONTROL_BRANCH, QUEUE_JOB_NAME, RELEASE_JOB_NAME } from "./job-names";
+import type { ReleaseConfig } from "./release-config";
+import { releaseTokenPermissions } from "./release-permissions";
 
 /** The workflow files, relative to the control repo's root. */
 export const TICK_WORKFLOW = ".github/workflows/tick.yml";
@@ -30,7 +32,7 @@ const CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 const APP_TOKEN = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0";
 
 /** What the renderer reads from the config: names, the runner contract, the token variables and whether release advance runs. */
-export type RenderInput = Pick<LoadedConfig, "runner" | "tokens" | "runsOn" | "bundle"> & { config: { names: Names }; release: { enabled: boolean } };
+export type RenderInput = Pick<LoadedConfig, "runner" | "tokens" | "runsOn" | "bundle"> & { config: { names: Names }; release: { enabled: boolean } & Partial<Pick<ReleaseConfig, "mode" | "dispatch">> };
 
 export class RenderError extends Error {
   constructor(message: string) {
@@ -327,13 +329,8 @@ export function renderTick(c: RenderInput): string {
       "    steps:",
       ...checkoutStep(n),
       "",
-      ...targetTokenStep(n, "release", "RELEASE_APP", [
-        ["contents", "write"],
-        ["workflows", "write"],
-        ["actions", "read"],
-        ["checks", "read"],
-        ["statuses", "read"],
-      ]),
+      // release.mode dispatch: actions: write (dispatching the target's release workflow), contents: read (write only for the epoch fence), no workflows, and, with a freeze, actions-variables: read.
+      ...targetTokenStep(n, "release", "RELEASE_APP", Object.entries(releaseTokenPermissions({ mode: c.release.mode ?? "advance", dispatch: c.release.dispatch ?? null }, r.epochFence)).map(([k, v]) => [k.replace(/_/g, "-"), v])),
       "",
       ...stateTokenStep(n),
       "",

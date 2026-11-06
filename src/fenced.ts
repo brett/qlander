@@ -199,6 +199,19 @@ export function fenced(
     comment: guard((n: number, body: string) => target.comment(n, body)),
     removeLabel: guard((n: number, l: string) => target.removeLabel(n, l)),
     dispatch: guard((t: string, p: object) => target.dispatch(t, p)),
+    readVariable: (n) => target.readVariable(n),
+    // A workflow dispatch is not a ref write, so GitHub cannot reject it with
+    // the epoch atomically. With the fence on, the epoch is asked on the write
+    // path just before it (epochHeld), which narrows the window to that one
+    // request; DESIGN.md §8.1 says why the journal makes the rest safe.
+    dispatchWorkflow: guard(async (w: string, ref: string, inputs: Record<string, string>) => {
+      if (epoch !== null) {
+        const e = epoch();
+        if (e === null) throw new LostLockError("no epoch taken this tick; not dispatching");
+        if (!(await target.epochHeld(e))) throw new LostLockError(`the epoch is no longer ${e}: a successor took over; not dispatching`);
+      }
+      return target.dispatchWorkflow(w, ref, inputs);
+    }),
   };
 }
 
@@ -210,7 +223,7 @@ export function fenced(
  * `target` must be the lease-fenced client. If the epoch moved while we read
  * it, a conflict is thrown (the tick retries later).
  */
-export async function takeEpoch(target: TargetApi, runId: string): Promise<string> {
+export async function takeEpoch(target: Pick<TargetApi, "readEpoch" | "advanceEpoch">, runId: string): Promise<string> {
   const before = await target.readEpoch();
   try {
     return await target.advanceEpoch(before, `qlander epoch ${runId}`);

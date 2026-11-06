@@ -99,6 +99,8 @@ export function renderStatusText(s: Status): string {
     const pend = r.pausePending ? `, pause pending: ${plain(r.pausePending, 100)}` : "";
     add(`release: seq ${r.seq}${lease}${pend}`);
     if (r.op) add(`  advancing ${short(r.op.before)} -> ${short(r.op.after)} since ${age(r.op.ageMs)} ago`);
+    if (r.dispatch?.op) add(`  dispatching the ${plain(r.dispatch.op.kind, 10)} run for ${short(r.dispatch.op.sha)} since ${age(r.dispatch.op.ageMs)} ago`);
+    if (r.dispatch?.candidate) add(`  candidate ${short(r.dispatch.candidate.sha)}: ${plain(r.dispatch.candidate.stage, 120)}`);
     if (r.last) add(`  last check ${age(r.last.ageMs)} ago: ${r.last.kind}: ${plain(r.last.reason, 120)} (release ${short(r.last.release)}, main ${short(r.last.main)})`);
     if (r.lastHistory) add(`  last change ${plain(r.lastHistory.at, 30)}: ${r.lastHistory.outcome} ${short(r.lastHistory.from)} -> ${short(r.lastHistory.to)}`);
   }

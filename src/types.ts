@@ -19,6 +19,9 @@ export interface Run {
   display_title: string;
   /** Start of the current attempt (GitHub resets it on a rerun). */
   run_started_at: string;
+  /** Who started the run, and who triggered its latest attempt (absent when not read; null when GitHub gave none). */
+  actor?: { login: string; id: number } | null;
+  triggering_actor?: { login: string; id: number } | null;
 }
 
 export interface Job {

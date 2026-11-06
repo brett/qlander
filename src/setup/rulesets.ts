@@ -85,12 +85,21 @@ function ruleParams(want: Rule, got: Rule | undefined): { params: Record<string,
 
 const appActor = (id: number): BypassActor => ({ actor_id: id, actor_type: "Integration", bypass_mode: "always" });
 
-/** Bypass actors kept from the live ruleset: individual people on a landing ruleset, nobody else. */
+/** Bypass actors kept from the live ruleset: individual people on a landing ruleset, nobody else (never a role, team or other App). */
 const keptActor = (spec: RulesetSpec, a: BypassActor) => spec.extraBypass === "keep" && a.actor_type === "User";
+
+/**
+ * An extra bypass App (release.dispatch.promoterApps) that is one of qlander's
+ * own Apps, the release App above all, would recreate the bypass dispatch mode
+ * forbids (DESIGN.md §8.1): refused, before anything is written.
+ */
+export function qlanderAppsAsExtra(spec: RulesetSpec, appIds: Partial<Record<Role, number>>): string[] {
+  return (spec.apps ?? []).flatMap((id) => (Object.entries(appIds) as [Role, number | undefined][]).filter(([, v]) => v === id).map(([role]) => `release.dispatch.promoterApps lists ${id}, which is the ${role} App: in release.mode dispatch it must not bypass ${spec.name}`));
+}
 
 /** Every way `have` falls short of `spec`, one line each; empty when it matches. */
 export function rulesetDiff(spec: RulesetSpec, have: Ruleset, appIds: Partial<Record<Role, number>>): string[] {
-  const out: string[] = [];
+  const out: string[] = [...qlanderAppsAsExtra(spec, appIds)];
   if (have.enforcement !== "active") out.push(`enforcement is ${have.enforcement}, not active`);
   if (have.target !== "branch") out.push(`target is ${have.target}, not branch`);
   const include = have.conditions?.ref_name?.include ?? [];
@@ -103,11 +112,15 @@ export function rulesetDiff(spec: RulesetSpec, have: Ruleset, appIds: Partial<Re
     else out.push(...ruleParams(want, got).weaker);
   }
   const wantIds = spec.bypass.map((r) => appIds[r]);
+  for (const id of spec.apps ?? []) {
+    if (!have.bypass_actors.some((a) => a.actor_type === "Integration" && a.actor_id === id && a.bypass_mode === "always")) out.push(`bypass actor missing: App ${id} (release.dispatch.promoterApps)`);
+  }
   for (const [i, id] of wantIds.entries()) {
     if (!have.bypass_actors.some((a) => a.actor_type === "Integration" && a.actor_id === id && a.bypass_mode === "always")) out.push(`bypass actor missing: the ${spec.bypass[i]} App (${id ?? "unknown id"})`);
   }
   for (const a of have.bypass_actors) {
     if (a.actor_type === "Integration" && wantIds.includes(a.actor_id ?? -1)) continue;
+    if (a.actor_type === "Integration" && (spec.apps ?? []).includes(a.actor_id ?? -1) && a.bypass_mode === "always") continue;
     if (!keptActor(spec, a)) out.push(`unexpected bypass actor: ${a.actor_type} ${a.actor_id ?? ""}`.trim());
   }
   return out;
@@ -115,6 +128,8 @@ export function rulesetDiff(spec: RulesetSpec, have: Ruleset, appIds: Partial<Re
 
 /** The body that makes a ruleset match `spec`, keeping whatever is stricter on `have`. */
 export function rulesetBody(spec: RulesetSpec, have: Ruleset | null, appIds: Partial<Record<Role, number>>): RulesetBody {
+  const clash = qlanderAppsAsExtra(spec, appIds);
+  if (clash.length) throw new Error(`refusing to write ${spec.name}: ${clash.join("; ")}`);
   const rules: Rule[] = [];
   for (const want of spec.rules) {
     const { params } = ruleParams(want, have?.rules.find((r) => r.type === want.type));
@@ -126,6 +141,7 @@ export function rulesetBody(spec: RulesetSpec, have: Ruleset | null, appIds: Par
     if (id === undefined) throw new Error(`the ${r} App's id is unknown`);
     return appActor(id);
   });
+  bypass.push(...(spec.apps ?? []).map(appActor));
   for (const a of have?.bypass_actors ?? []) if (keptActor(spec, a)) bypass.push(a);
   return {
     name: spec.name,

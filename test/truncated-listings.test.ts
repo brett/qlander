@@ -158,3 +158,23 @@ describe("the open PR list", () => {
     expect(w.target.calls.filter((c) => c.startsWith("createRef"))).toEqual([]);
   });
 });
+
+describe("a workflow's run list", () => {
+  test("is complete only when it holds as many runs as GitHub's total_count", async () => {
+    let total: number | undefined = 1;
+    const run = { id: 7, name: "promote", head_sha: sha("a"), head_branch: "main", event: "workflow_dispatch", status: "completed", conclusion: "success", path: ".github/workflows/promote.yml", created_at: NOW.toISOString(), run_attempt: 1, repository: { id: TARGET }, head_repository: { id: TARGET } };
+    const fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (pathRe(`/repos/${TARGET_SLUG}`).test(url)) return new Response(JSON.stringify({ id: TARGET, node_id: "R_target" }));
+      if (/\/actions\/workflows\/promote\.yml\/runs/.test(url)) return new Response(JSON.stringify({ ...(total === undefined ? {} : { total_count: total }), workflow_runs: [run] }));
+      return new Response("{}", { status: 599 });
+    }) as typeof globalThis.fetch;
+    const c = await TargetClient.connect({ ...TARGET_OPTS, token: "t", owner: NAMES.target.owner, repo: NAMES.target.name, repoId: TARGET, role: "read", fetch, sleep: async () => {} });
+    const list = () => c.listWorkflowRuns(".github/workflows/promote.yml", { branch: "main" });
+    expect((await list()).truncated).toBe(false);
+    total = 1001; // a filtered search GitHub cut short, with no next page
+    expect((await list()).truncated).toBe(true);
+    total = undefined;
+    expect((await list()).truncated).toBe(true);
+  });
+});

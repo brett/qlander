@@ -112,14 +112,19 @@ export async function connectReleaseClients(env: Env, cfg: ReleaseConfig = defau
   // The only target file the release job reads: a target-hosted qualification manifest.
   const q = cfg.qualification;
   const o = connectOptions(n, q.provider === "manifest" && q.source === "target" ? [q.path] : [], fetchFn);
+  const writing = role === "release" && !cfg.dryRun;
+  // release.mode dispatch: a client that writes no ref at all and may dispatch only the configured workflow (DESIGN.md §8.1).
+  const d = cfg.mode === "dispatch" ? cfg.dispatch : null;
   return {
     target: await TargetClient.connect({
       token,
       ...o.target,
-      role: cfg.dryRun ? "read" : role,
-      epochBranch: role === "release" && !cfg.dryRun && cfg.runner.epochFence ? epochBranchFor(cfg.runner, "release") : null,
+      role: !writing ? "read" : d ? "dispatch" : "release",
+      epochBranch: writing && cfg.runner.epochFence ? epochBranchFor(cfg.runner, "release") : null,
+      dispatch: writing && d ? { workflow: d.workflow, ref: d.ref, inputs: [d.inputs.sha, d.inputs.dryRun, d.inputs.dispatchId] } : null,
     }),
-    repo: await StateRepoClient.connect({ token: own, ...o.control, labels: stateRepoLabels(n), assign: pauseAssign(n) }),
+    // In dispatch mode the job also lists the status issue, where it reports a candidate and reads approvals.
+    repo: await StateRepoClient.connect({ token: own, ...o.control, labels: [...stateRepoLabels(n), ...(d ? [n.watchdogLabels.status] : [])], assign: pauseAssign(n) }),
     stateRef: await StateRefClient.connect({ token: state, ...o.control, branch: n.releaseStateBranch, stateBranches: o.stateBranches }),
   };
 }

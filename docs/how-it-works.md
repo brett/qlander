@@ -189,9 +189,10 @@ What happens when something goes wrong:
 | --- | --- |
 | The dry run fails, is cancelled or never appears | A `release-blocked` issue. That commit gets no second dry run; the next qualified commit gets its own. |
 | Nobody approves in time | The dry run expires, with a `release-blocked` issue. |
-| The real run fails or is cancelled | A `release-blocked` issue. That commit is never dispatched for real again. |
-| The real run never appears or never finishes | The release job pauses (`release-pause`): a promotion may be running that qlander can't see. |
-| The real run is green but `release` doesn't move | A `release-blocked` issue after [`observeMinutes`](configuration.md#releasedispatch). |
+| The real run fails, is cancelled, never appears or never finishes | The release job pauses (`release-pause`), not the queue: production may have changed. |
+| The real run is green but `release` doesn't move | The release job pauses after [`observeMinutes`](configuration.md#releasedispatch). |
+| The real run fails although `release` moved | The release job pauses: the ref alone doesn't show the promotion finished. |
+| You want that commit tried again | An approver re-arms it (`/qlander rearm-release <sha> <incident>`, or `rearm-release <sha>`): one new attempt, from a fresh dry run and a fresh approval. See [Operating](operating.md#approving-a-release-dispatch-mode). |
 | A newer commit qualifies | It replaces a candidate waiting for approval at once, and one whose dry run is running once that run ends. A real run is always followed to its end first. |
 | A freeze variable is set | No new dispatch until it is cleared. See [`release.dispatch.freeze`](configuration.md#releasedispatchfreeze). |
 

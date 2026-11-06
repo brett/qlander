@@ -13,7 +13,7 @@ Qlander moves a protected `main` for a whole team, and one wrong command can sto
 | `qlander setup --apply` | Apps, secrets and rulesets on GitHub | `qlander setup --plan` |
 | `qlander pause queue\|release\|both`, `qlander resume queue\|release\|both [--all]`, `qlander quiesce`, `qlander unquiesce [--all]` | Pause issues and `tick.yml` | `--dry-run` |
 | `qlander remove <pr>`, `qlander requeue <pr>`, `qlander prioritise <pr>`, `qlander approve-policy <pr> <sha>` | A label or comment on a target PR | `--dry-run` |
-| `qlander approve-release <sha>` | A comment on the status issue (release dispatch mode) | `--dry-run` |
+| `qlander approve-release <sha>`, `qlander rearm-release <sha>` | A comment on the status issue (release dispatch mode) | `--dry-run` |
 | `qlander verify-sandbox` | A sandbox repo, never the target | None: follow [the sandbox check](docs/getting-started.md#running-the-sandbox-check) |
 | `qlander tick`, `qlander watchdog` | The queue and its issues | None: only the workflows run these |
 
@@ -28,13 +28,13 @@ These are a person's decisions too, even where an API would let you:
 - setting `QLANDER_MODE=live`, after [gates G1 to G3](docs/getting-started.md#10-roll-out);
 - choosing `queue.policy.paths`, `queue.policy.approvers`, `queue.policy.trustedAutomations` and the break-glass people on the landing ruleset, and enabling release advance;
 - approving a control repo PR (if you push through a person's account, another account has to approve);
-- closing a pause issue, approving a CI-policy PR, and approving a release in dispatch mode;
+- closing a pause issue, approving a CI-policy PR, and approving or re-arming a release in dispatch mode;
 - choosing `release.mode`, `release.dispatch.approvers` and the freeze variables;
 - in `self-hosted-kill` mode, providing the runners and their host-side kill.
 
 ## CI-policy approval
 
-By default, agents don't approve: don't post `/qlander approve-policy <sha>` or run `qlander approve-policy`, and don't post `/qlander approve-release <sha>` or run `qlander approve-release`. Qlander checks the account against `queue.policy.approvers` (or `release.dispatch.approvers`), not who is using it, so the approval is only as human as the account behind it. Letting an agent use a person's account removes that check, and that is the adopter's choice, never an agent's.
+By default, agents don't approve: don't post `/qlander approve-policy <sha>` or run `qlander approve-policy`, and don't post `/qlander approve-release <sha>` or `/qlander rearm-release <sha> <incident>`, or run `qlander approve-release` or `qlander rearm-release`. Qlander checks the account against `queue.policy.approvers` (or `release.dispatch.approvers`), not who is using it, so the approval is only as human as the account behind it. Letting an agent use a person's account removes that check, and that is the adopter's choice, never an agent's.
 
 ## Reading results
 

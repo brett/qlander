@@ -330,8 +330,14 @@ class Tick {
       await this.apply({ kind: "built", head: r.head });
       return;
     }
-    // A linear landing is resent only as a fresh one would be sent: main still its base, every PR revalidated (§4.2).
+    // A linear landing is resent only as a fresh one would be sent (DESIGN.md §7.4): main still its base,
+    // the batch's latest CI attempt green on that head (§5.3 rule 5), and every PR revalidated (§4.2).
     if (r.kind === "retryLand" && op.kind === "land") {
+      const a = this.state.active;
+      if (a?.head !== op.after || snap.ci?.kind !== "green") {
+        await this.apply({ kind: "opDropped", reason: `the batch's CI is ${snap.ci?.kind ?? "unread"} now, not green` });
+        return;
+      }
       if (snap.main !== op.before || !valid((op.heads ?? []).map((h) => ({ pr: h.pr, head: h.before })))) {
         await this.apply({ kind: "opDropped", reason: "the batch no longer revalidates on this main" });
         return;

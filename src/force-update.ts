@@ -28,7 +28,15 @@ export async function forceUpdateOf(api: Pick<TargetApi, "branchRules" | "rulese
       }
       let read = cache.get(r.rulesetId);
       if (!read) cache.set(r.rulesetId, (read = api.rulesetBypass(r.rulesetId)));
-      const { name, bypass } = await read;
+      // Per ruleset: one unreadable answer must not hide a definite denial from another. Denied wins over unknown.
+      let answer: BypassRead;
+      try {
+        answer = await read;
+      } catch (e) {
+        unknown.push(`${r.type} in ruleset ${r.rulesetId}: not readable (${e instanceof Error ? e.message : String(e)})`);
+        continue;
+      }
+      const { name, bypass } = answer;
       // "exempt": the ruleset does not apply to the App at all; "always": it may bypass a direct update.
       if (bypass === "always" || bypass === "exempt") continue;
       if (bypass === "never" || bypass === "pull_requests_only") return { kind: "denied", rule: `${r.type} in ruleset "${name}" (${r.rulesetId}), which the queue App ${bypass === "never" ? "cannot bypass" : "may bypass only through a pull request"}` };

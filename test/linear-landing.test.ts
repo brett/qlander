@@ -841,6 +841,29 @@ describe("force-update compatibility at admission", () => {
     }
   });
 
+  test("forceUpdateOf: an unreadable ruleset never hides a definite denial from another, in either order; unreadable alone is unknown", async () => {
+    const never = { id: 2, name: "strict", covers: () => true, types: ["non_fast_forward"], bypass: "never" };
+    const broken = { id: 3, name: "broken", covers: () => true, types: ["non_fast_forward"], bypass: "always" };
+    for (const order of [[broken, never], [never, broken]]) {
+      const t = new FakeTarget();
+      t.branchRulesets = order;
+      const read = t.rulesetBypass.bind(t);
+      t.rulesetBypass = async (id) => {
+        if (id === 3) throw new (require("../src/github/http").GitHubError)("server", 502, "Bad gateway");
+        return read(id);
+      };
+      const v = await forceUpdateOf(t, "feat/x", new Map());
+      expect(v.kind).toBe("denied");
+      expect((v as { rule: string }).rule).toContain('"strict" (2)');
+    }
+    const t = new FakeTarget();
+    t.branchRulesets = [broken];
+    t.rulesetBypass = async () => {
+      throw new (require("../src/github/http").GitHubError)("server", 502, "Bad gateway");
+    };
+    expect((await forceUpdateOf(t, "feat/x", new Map())).kind).toBe("unknown");
+  });
+
   test("forceUpdateOf: exempt and always pass, each ruleset is read once per snapshot", async () => {
     const t = new FakeTarget();
     let reads = 0;
@@ -908,6 +931,25 @@ describe("a refused landing is classified, not a pause", () => {
     expect(v.paused()).toBe(true);
     expect(v.repo.issues.filter((i) => i.open).map((i) => i.body).join(" ")).toContain(`re-executed ${v.config.maxOpTries} times`);
     expect(v.target.landings).toEqual([]);
+  });
+
+  test("a resend needs the batch's latest CI attempt green: green, refused, rerun red, then no landing", async () => {
+    const w = linearWorld((b) => (b.attempt === 1 ? "pass" : "fail"));
+    pr(w, 1);
+    w.target.refuseLandings = 1;
+    const refusedOnce = () => w.stateRef.current !== null && (w.state().journal?.op as { refused?: number } | undefined)?.refused === 1;
+    for (let i = 0; i < 20 && !refusedOnce(); i++) await w.tick();
+    expect(refusedOnce()).toBe(true);
+    // Someone reruns the batch's CI by hand; attempt 2 fails.
+    const head = w.state().active!.head;
+    const run = w.target.runs.filter((r) => r.head_sha === head && r.head_branch?.startsWith(w.config.names.queuePrefix)).at(-1)!;
+    await w.target.rerunFailedJobs(run.id);
+    for (let i = 0; i < 3; i++) w.target.advance(); // the lists catch up with attempt 2
+    await w.runUntilIdle();
+    expect(w.target.landings).toEqual([]);
+    expect(w.landed()).toEqual([]);
+    expect(w.bounced()).toEqual([1]);
+    for (const m of w.mainHistory.slice(1)) expect(w.greenHeads.has(m)).toBe(true);
   });
 
   test("a resend revalidates first: a PR whose policy hash changed meanwhile is not landed", async () => {

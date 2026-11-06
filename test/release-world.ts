@@ -3,13 +3,13 @@
 // commits on main and qualify them (or forge their proof).
 
 import { CrashError, type CrashPoint } from "../src/queue";
-import { defaultReleaseConfig, type ReleaseConfig } from "../src/release-config";
+import { defaultReleaseConfig, type DispatchConfig, type ReleaseConfig } from "../src/release-config";
 import { releaseTick, type ReleaseResult } from "../src/release-runner";
 import { parseReleaseState, type ReleaseState } from "../src/release-state";
 import type { Executor } from "../src/state";
-import type { Job } from "../src/types";
+import type { Job, Run } from "../src/types";
 import { FakeTarget, FakeStateRef, FakeStateRepo } from "./fake-github";
-import { job, sha, TARGET_SLUG } from "./sim";
+import { APPROVERS, job, sha, TARGET_SLUG } from "./sim";
 
 /** The proof workflow the config names (release.qualification.manifest.proof). */
 const q = defaultReleaseConfig.qualification;
@@ -132,5 +132,156 @@ export class ReleaseWorld {
   /** Let a crashed runner's lease run out. */
   pastLease(): void {
     this.now = new Date(this.now.getTime() + (this.cfg.leaseMinutes + 1) * 60_000);
+  }
+}
+
+// ---------------------------------------------------------------- release.mode dispatch (DESIGN.md §8.1)
+
+/** The neutral dispatch settings the dispatch tests start from. */
+export const PROMOTE = ".github/workflows/promote.yml";
+export const DISPATCH: DispatchConfig = {
+  workflow: PROMOTE,
+  ref: "main",
+  inputs: { sha: "sha", dryRun: "dry_run", dispatchId: "dispatch_id" },
+  approvers: [{ login: APPROVERS[0]!.login, id: APPROVERS[0]!.id }],
+  dryRunValidMinutes: 1440,
+  appearMinutes: 30,
+  runHours: 6,
+  observeMinutes: 60,
+  budget: { window: 8, windowHours: 24 },
+  freeze: [],
+};
+/** The listed approver, and an account that is not listed. */
+export const APPROVER = DISPATCH.approvers[0]!;
+export const STRANGER = { login: `${APPROVER.login}-other`, id: APPROVER.id + 7919 };
+
+/** How the target's promote workflow behaves for one dispatch (defaults: appears and finishes a tick later, green, and a green real run moves release). */
+export interface Promotion {
+  /** Ticks before the run shows in run lists. */
+  appearTicks: number;
+  /** Ticks before it completes. */
+  runTicks: number;
+  conclusion: string;
+  /** The run-name carries the dispatch id (the contract); false models a workflow that forgot it. */
+  echo: boolean;
+  /** A green real run fast-forwards release to the sha with the target's own credential. */
+  moveRelease: boolean;
+  /** No run is ever created (a disabled workflow, a dispatch GitHub dropped). */
+  noRun: boolean;
+}
+
+export interface Dispatched {
+  kind: "dry" | "real";
+  sha: string;
+  id: string;
+  run: Run | null;
+}
+
+/**
+ * A release world whose job runs in dispatch mode: the target client has the
+ * dispatch role, every tick moves the clock by one cron interval, and the
+ * target's own promote workflow is modelled: a dispatch creates a run (named
+ * with the dispatch id) that appears and completes after a delay, and a green
+ * real run moves release itself. Every ref writer on the fake is spied on:
+ * `refWrites` must stay empty, which ok() checks after every tick.
+ */
+export class DispatchWorld extends ReleaseWorld {
+  behave: (d: { kind: "dry" | "real"; sha: string; id: string }) => Partial<Promotion> = () => ({});
+  dispatched: Dispatched[] = [];
+  /** Every call any ref writer on the target received (createRef, deleteRef, updateRef, epochUpdateRefs). */
+  refWrites: string[] = [];
+  statusIssue: number;
+  private due: { at: number; d: Dispatched; p: Promotion }[] = [];
+
+  constructor(over: Partial<DispatchConfig> = {}, rel: Partial<ReleaseConfig> = {}) {
+    super({ mode: "dispatch", dispatch: { ...DISPATCH, ...over }, ...rel });
+    this.target.role = "dispatch";
+    const t = this.target;
+    for (const m of ["createRef", "deleteRef", "updateRef", "epochUpdateRefs"] as const) {
+      const orig = (t[m] as (...a: unknown[]) => Promise<void>).bind(t);
+      (t as unknown as Record<string, unknown>)[m] = (...a: unknown[]) => {
+        this.refWrites.push(`${m} ${JSON.stringify(a)}`);
+        return orig(...a);
+      };
+    }
+    t.onWorkflowDispatch = (d) => this.promote(d);
+    this.statusIssue = this.repo.issues.length + 1;
+    this.repo.issues.push({ number: this.statusIssue, title: "qlander status", body: "", labels: [this.cfg.names.watchdogLabels.status], open: true });
+  }
+
+  get dcfg(): DispatchConfig {
+    return this.cfg.dispatch!;
+  }
+
+  /** The target's promote workflow receiving a dispatch. */
+  private promote(x: { workflow: string; ref: string; inputs: Record<string, string> }): void {
+    const i = this.dcfg.inputs;
+    const kind = x.inputs[i.dryRun] === "true" ? "dry" : "real";
+    const sha = x.inputs[i.sha]!;
+    const id = x.inputs[i.dispatchId]!;
+    const p: Promotion = { appearTicks: 1, runTicks: 1, conclusion: "success", echo: true, moveRelease: true, noRun: false, ...this.behave({ kind, sha, id }) };
+    const d: Dispatched = { kind, sha, id, run: null };
+    this.dispatched.push(d);
+    if (p.noRun) return;
+    d.run = this.target.addRun(
+      { head_sha: this.main, path: x.workflow, event: "workflow_dispatch", head_branch: x.ref, status: "queued", conclusion: null, created_at: this.now.toISOString(), run_started_at: this.now.toISOString(), display_title: p.echo ? `Promote ${sha} (${id})` : `Promote ${sha}` },
+      [job(kind === "dry" ? "plan" : "promote", null, "queued")],
+      p.appearTicks,
+    );
+    this.due.push({ at: this.target.clock + p.runTicks, d, p });
+  }
+
+  /** One tick, then a cron interval passes: lists catch up and the target's runs move on. */
+  override async tick(o: Parameters<ReleaseWorld["tick"]>[0] = {}): Promise<ReleaseResult | "crashed"> {
+    try {
+      return await super.tick(o);
+    } finally {
+      this.now = new Date(this.now.getTime() + this.cfg.runner.cronMinutes * 60_000);
+      this.target.advance();
+      for (const x of this.due.filter((x) => x.at <= this.target.clock)) this.finish(x.d, x.p);
+      this.due = this.due.filter((x) => x.at > this.target.clock);
+    }
+  }
+
+  private finish(d: Dispatched, p: Promotion): void {
+    const run = d.run!;
+    if (run.status === "completed") return;
+    this.target.updateRun(run, { status: "completed", conclusion: p.conclusion });
+    this.target.jobs.set(run.id, [job(d.kind === "dry" ? "plan" : "promote", p.conclusion)]);
+    // The target workflow moves release itself, with its own credential: GitHub's ref update, below every qlander client.
+    if (d.kind === "real" && p.conclusion === "success" && p.moveRelease) this.target.githubUpdateRefs("release", this.release!, d.sha);
+  }
+
+  override async ok(o: Parameters<ReleaseWorld["ok"]>[0] = {}): Promise<ReleaseResult> {
+    const r = await super.ok(o);
+    if (this.refWrites.length) throw new Error(`a ref writer was called in dispatch mode: ${this.refWrites.join("; ")}`);
+    return r;
+  }
+
+  /** Tick until `until` holds (or the limit), returning every result. */
+  async until(until: (r: ReleaseResult) => boolean, limit = 12): Promise<ReleaseResult[]> {
+    const out: ReleaseResult[] = [];
+    for (let i = 0; i < limit; i++) {
+      const r = await this.ok();
+      out.push(r);
+      if (until(r)) return out;
+    }
+    throw new Error(`not reached in ${limit} ticks: ${out.map((r) => r.outcome).join(", ")}`);
+  }
+
+  /** A comment on the status issue (an approval, by default from the listed approver, now). */
+  approve(sha: string, by: { login: string; id: number } = APPROVER, o: { at?: Date; edited?: boolean; body?: string } = {}): number {
+    const at = (o.at ?? this.now).toISOString();
+    return this.repo.addComment(this.statusIssue, by, o.body ?? `/qlander approve-release ${sha}`, at, o.edited ? new Date(Date.parse(at) + 60_000).toISOString() : at);
+  }
+
+  candidate() {
+    return this.state().dispatch?.candidate ?? null;
+  }
+  dispatchHistory() {
+    return this.state().dispatch?.history ?? [];
+  }
+  kinds(): string[] {
+    return this.dispatched.map((d) => `${d.kind} ${d.sha.slice(0, 8)}`);
   }
 }

@@ -25,18 +25,21 @@
 //
 // Nothing here checks out or runs target code.
 
-import type { TargetApi, StateRefApi, StateRepoApi } from "./github/api";
+import type { TargetApi, TargetReads, StateRefApi, StateRepoApi } from "./github/api";
 import { GitHubError, isGraphqlInternal } from "./github/http";
 import { epochClientProblem, invariantProblems } from "./config";
-import { epochHandover, fenced, takeEpoch } from "./fenced";
+import { epochHandover, fenced } from "./fenced";
 import { CrashError, type CrashPoint } from "./queue";
 import { CONTROL_ROOT } from "./config/load";
 import { controlFileReader, qualificationProvider, type QualificationProvider } from "./qualification";
 import { preflightRefs, type Receipt, type ReceiptEvidence, type ReleaseDecision } from "./release";
 import type { ReleaseConfig } from "./release-config";
-import { type AdvanceJournal, emptyReleaseState, parseReleaseState, releaseCodec, type ReleaseHistoryItem, type ReleaseState, renderReleaseState } from "./release-state";
+import { type AdvanceJournal, emptyReleaseState, parseReleaseState, releaseCodec, type ReleaseState, renderReleaseState } from "./release-state";
+import { type EpochBox, ReleaseTickBase, type ReleaseOutcome } from "./release-tick";
+import { DispatchTick, dispatchOnly, describeDispatch } from "./release-dispatch";
 import type { Executor } from "./state";
 import { isTransient as isTransientError, openOnce, pauseReason } from "./outbox";
+export type { ReleaseOutcome } from "./release-tick";
 import { CorruptStateError, inspectState, LeaseHeldError, LostLockError, StateStore, upsertMirror } from "./store";
 import { isSha } from "./validate";
 
@@ -57,8 +60,6 @@ export interface ReleaseDeps {
   crash?: (point: CrashPoint) => void;
 }
 
-export type ReleaseOutcome = "advanced" | "none" | "alert" | "paused" | "busy" | "lost-lock" | "retry-later" | "moved" | "rejected";
-
 export interface ReleaseResult {
   outcome: ReleaseOutcome;
   log: string[];
@@ -77,19 +78,14 @@ export function firstParentChain(main: string, commits: { sha: string; parents: 
   return out;
 }
 
-
-const oneLine = (title: string) => title.replace(/\s+/g, " ").slice(0, 100);
-
-const stableId = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
-
 export interface Discovery {
   decision: ReleaseDecision;
   release: string | null;
   main: string | null;
 }
 
-/** Steps 4 and 5: the newest qualified commit, or why there is none. */
-export async function discoverRelease(c: TargetApi, cfg: ReleaseConfig, readControlFile: (path: string) => string | null = controlFileReader(CONTROL_ROOT)): Promise<Discovery> {
+/** Steps 4 and 5: the newest qualified commit, or why there is none. Reads only. */
+export async function discoverRelease(c: TargetReads, cfg: ReleaseConfig, readControlFile: (path: string) => string | null = controlFileReader(CONTROL_ROOT)): Promise<Discovery> {
   const release = await c.getRef(cfg.names.release);
   const main = await c.getRef(cfg.names.main);
   // §8 step 1: no release branch → stop; an operator creates it.
@@ -131,7 +127,7 @@ export async function discoverRelease(c: TargetApi, cfg: ReleaseConfig, readCont
  * so later reads are skipped.
  */
 async function judge(
-  c: TargetApi,
+  c: TargetReads,
   provider: QualificationProvider,
   sha: string,
   release: string,
@@ -146,121 +142,25 @@ async function judge(
   return { ok: true, proofRun: screened.proofRun, evidence: judged.evidence };
 }
 
-class ReleaseTick {
-  log: string[] = [];
-  decision: ReleaseDecision | null = null;
-  private readonly target: TargetApi;
+class ReleaseTick extends ReleaseTickBase {
   constructor(
-    private readonly d: ReleaseDeps,
-    readonly store: StateStore<ReleaseState>,
-    public state: ReleaseState,
+    d: ReleaseDeps,
+    store: StateStore<ReleaseState>,
+    state: ReleaseState,
+    /** The lease-fenced client (src/fenced.ts): every target write goes through the release lease's fence; reads do not. */
+    private readonly target: TargetApi,
+    box: EpochBox,
   ) {
-    // Every target write goes through the release lease's fence; reads do not.
-    // With the epoch fence on, every ref write also carries the epoch taken below.
-    this.target = fenced(d.target, () => store.fence(), d.cfg.runner.epochFence ? () => this.epoch : null, (ms) => store.sleep(ms));
-  }
-
-  /** The epoch this tick advanced to (docs/deployment.md §3.4); null until taken, and while the fence is off. */
-  private epoch: string | null = null;
-
-  /** First act after the lease: advance the epoch, which voids every ref write a predecessor could still send. */
-  async takeEpoch(): Promise<void> {
-    if (!this.d.cfg.runner.epochFence) return;
-    this.epoch = await takeEpoch(this.target, this.store.runId);
-    this.log.push(`epoch ${this.target.epochBranch} advanced to ${this.epoch}`);
-  }
-
-  private crash(p: CrashPoint): void {
-    this.d.crash?.(p);
-  }
-
-  private nowIso(): string {
-    return this.d.now().toISOString();
-  }
-
-  async save(): Promise<void> {
-    await this.store.write(this.state);
-  }
-
-  /** Record the outcome and drop the journal in one state write; `also` rides in the same CAS. */
-  private async finishJournal(j: AdvanceJournal, outcome: ReleaseHistoryItem["outcome"], note: string, also: Partial<ReleaseState> = {}): Promise<void> {
-    const history = [...this.state.history, { at: this.nowIso(), outcome, from: j.before, to: j.after, note, receipt: outcome === "advanced" ? j.receipt : null }];
-    this.state = { ...this.state, ...also, journal: null, history: history.slice(-this.d.cfg.historyLimit) };
-    this.log.push(`advance ${j.before.slice(0, 8)} → ${j.after.slice(0, 8)}: ${outcome} (${note})`);
-    await this.save();
-  }
-
-  /**
-   * §3.2: what release says about `advance(R → C)`. At C or a descendant of C,
-   * the advance happened; at R, it did not; anything else, release moved.
-   */
-  private async observe(j: AdvanceJournal): Promise<{ cur: string | null; seen: "target" | "descendant" | "unchanged" | "moved" }> {
-    const cur = await this.target.getRef(this.d.cfg.names.release);
-    if (cur === j.after) return { cur, seen: "target" };
-    if (cur === j.before) return { cur, seen: "unchanged" };
-    if (cur !== null) {
-      const c = await this.target.compare(j.after, cur);
-      if (c.status === "identical" || c.status === "ahead") return { cur, seen: "descendant" };
-    }
-    return { cur, seen: "moved" };
-  }
-
-  private movedNote(cur: string | null): string {
-    return `release is ${cur ?? "absent"}, which neither the recorded head nor a descendant of the target`;
+    super(d, store, state, target, box);
   }
 
   /** §3.2, `advance` is reconciled like `land`: by observing release, never by trusting the intent. */
   async reconcile(): Promise<void> {
     const j = this.state.journal;
     if (!j) return;
-    const { cur, seen } = await this.observe(j);
-    if (seen === "target") return this.finishJournal(j, "advanced", "observed on recovery");
-    if (seen === "unchanged") return this.finishJournal(j, "not-applied", "release still at the recorded head; deciding again");
-    if (seen === "descendant") return this.finishJournal(j, "advanced", `observed on recovery; release has since moved on to ${cur}`);
-    return this.finishJournal(j, "moved", this.movedNote(cur));
-  }
-
-  /** Fails closed: an unreadable or incomplete release-pause listing counts as paused (src/outbox.ts pauseReason). */
-  async paused(): Promise<boolean> {
-    if (this.state.pausePending) return true;
-    const why = await pauseReason(this.d.repo, this.d.cfg.names.releaseLabels.pause);
-    if (why) this.log.push(`paused: ${why}`);
-    return why !== null;
-  }
-
-  /** Persist a pause first, then try to open its issue; a failed open leaves it pending (still paused). */
-  private pending(reason: string): NonNullable<ReleaseState["pausePending"]> {
-    return this.state.pausePending ?? { id: `release:${stableId(reason)}`, reason };
-  }
-
-  async pause(reason: string): Promise<void> {
-    this.state = { ...this.state, pausePending: this.pending(reason) };
-    this.log.push(`pause: ${reason}`);
-    await this.save();
-    await this.applyPause();
-  }
-
-  async applyPause(): Promise<void> {
-    const p = this.state.pausePending;
-    if (!p) return;
-    try {
-      await openOnce(this.d.repo, this.d.cfg.names.releaseLabels.pause, p.id, oneLine(`qlander release paused: ${p.reason}`), `${p.reason}\n\nThe release job advances nothing while this issue is open. Close it to resume. The queue is not affected.`);
-    } catch (e) {
-      if (!(e instanceof GitHubError)) throw e;
-      this.log.push(`pause issue not opened yet: ${String(e)}`);
-      return;
-    }
-    this.state = { ...this.state, pausePending: null };
-    await this.save();
-  }
-
-  private async alert(reason: string): Promise<void> {
-    try {
-      await openOnce(this.d.repo, this.d.cfg.names.releaseLabels.alert, `release-blocked:${stableId(reason.replace(/[0-9a-f]{40}/g, ""))}`, oneLine(`release blocked: ${reason}`), `${reason}\n\nThe release job keeps checking every tick. This does not pause the queue.`);
-    } catch (e) {
-      if (!(e instanceof GitHubError)) throw e;
-      this.log.push(`alert issue not opened: ${String(e)}`);
-    }
+    // A dispatch intent left by release.mode dispatch, which has since been switched off: settled as dispatch mode would, without resending.
+    if (j.op === "dispatch") return this.pause(`a ${j.kind} dispatch for ${j.sha} was in flight when release.mode changed to advance; set release.mode back to dispatch until it settles`);
+    return this.reconcileAdvance(j);
   }
 
   /** Steps 4 and 5, through the fenced client (reads are not fenced). */
@@ -352,7 +252,12 @@ export async function releaseTick(d: ReleaseDeps): Promise<ReleaseResult> {
     if (isTransient(e)) return { outcome: "retry-later", log: [String(e)], decision: null };
     throw e;
   }
-  const t = new ReleaseTick(d, opened.store, opened.state);
+  const store = opened.store;
+  const box: EpochBox = { epoch: null };
+  // Every target write goes through the release lease's fence; with the epoch fence on, every ref write also carries the epoch taken below.
+  const target = fenced(d.target, () => store.fence(), d.cfg.runner.epochFence ? () => box.epoch : null, (ms) => store.sleep(ms));
+  // Dispatch mode gets a client with no ref writer on it at all (DESIGN.md §8.1): release is never written in that mode.
+  const t: ReleaseTickBase = d.cfg.mode === "dispatch" ? new DispatchTick(d, store, opened.state, dispatchOnly(target), box) : new ReleaseTick(d, store, opened.state, target, box);
   if (opened.handover) t.log.push(opened.handover);
   let outcome: ReleaseOutcome;
   try {
@@ -409,11 +314,13 @@ export async function releaseDryRun(d: Pick<ReleaseDeps, "target" | "repo" | "st
     const reason = e instanceof Error ? e.message : String(e);
     return dry([`a live release tick would pause: corrupt state: ${reason}`], null, reason);
   }
-  if (state.journal) return dry([`an advance ${state.journal.before} → ${state.journal.after} is outstanding; a live tick would reconcile it first`]);
+  if (state.journal?.op === "advance") return dry([`an advance ${state.journal.before} → ${state.journal.after} is outstanding; a live tick would reconcile it first`]);
+  if (state.journal?.op === "dispatch") return dry([`a ${state.journal.kind} dispatch for ${state.journal.sha} is outstanding; a live tick would look for its run, never resend it`]);
   if (state.pausePending) return dry(["paused: a pending release pause"]);
   const why = await pauseReason(d.repo, d.cfg.names.releaseLabels.pause);
   if (why) return dry([`paused: ${why}`]);
   const { decision } = await discoverRelease(d.target, d.cfg);
+  if (d.cfg.mode === "dispatch") return dry([`[dry run] ${describeDispatch(state, decision)}`], decision);
   const reason = decision.kind === "advance" ? `advance ${decision.from} → ${decision.to}` : decision.reason;
   return dry([`[dry run] ${decision.kind}: ${reason}`], decision);
 }

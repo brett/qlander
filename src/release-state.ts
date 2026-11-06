@@ -18,6 +18,86 @@ export interface AdvanceJournal {
   at: string;
 }
 
+/**
+ * The intent of one workflow dispatch (release.mode dispatch, DESIGN.md
+ * §8.1), persisted with its budget reservation before the request. Its
+ * receipt is the candidate's DispatchRecord, written in the same state write
+ * that drops the journal. A journal left by a crash is never resent: it
+ * becomes a record whose `sent` is "unknown", and the run is looked for.
+ */
+export interface DispatchJournal {
+  seq: number;
+  op: "dispatch";
+  kind: DispatchKind;
+  sha: string;
+  /** The dispatch id the run's name must echo. */
+  id: string;
+  at: string;
+}
+
+export type ReleaseJournal = AdvanceJournal | DispatchJournal;
+
+export type DispatchKind = "dry" | "real";
+
+/** One dispatched run: its intent's id and time, the receipt, and what was seen of it. */
+export interface DispatchRecord {
+  kind: DispatchKind;
+  id: string;
+  /** When the intent was recorded: runs created before it (less a margin) are never matched. */
+  at: string;
+  /** yes: GitHub answered 204. unknown: the response was lost (or the job crashed), so the run may or may not exist. */
+  sent: "yes" | "unknown";
+  run: { id: number; url: string } | null;
+  /** The run's conclusion once completed, or what qlander concluded: never-appeared, stuck. Null while in flight. */
+  conclusion: string | null;
+  concludedAt: string | null;
+}
+
+/** The commit being promoted: its qualification receipt, its two runs, and its approval. */
+export interface DispatchCandidate {
+  sha: string;
+  receipt: Receipt;
+  since: string;
+  dry: DispatchRecord | null;
+  /** The status-issue report of its green dry run. */
+  reported: { issue: number; comment: number; at: string } | null;
+  approval: { comment: number; login: string; id: number; at: string } | null;
+  real: DispatchRecord | null;
+  /** Dispatches GitHub refused outright (a 4xx: nothing was started); retried while below DISPATCH_REFUSALS. */
+  refused: number;
+}
+
+export type DispatchOutcome = "released" | "superseded" | "dry-failed" | "expired" | "real-failed" | "not-observed" | "released-elsewhere";
+
+export interface DispatchHistoryItem {
+  at: string;
+  sha: string;
+  outcome: DispatchOutcome;
+  note: string;
+  dryRun: number | null;
+  realRun: number | null;
+}
+
+/** The dispatch mode's document; absent in advance mode, so an advance state is unchanged. */
+export interface DispatchState {
+  candidate: DispatchCandidate | null;
+  /** When each dispatch was reserved, for release.dispatch.budget. */
+  window: string[];
+  history: DispatchHistoryItem[];
+}
+
+/** Where a candidate is, in words (the status view and the mirror). */
+export function candidateStage(c: DispatchCandidate): string {
+  const run = (r: DispatchRecord) => (r.run ? `run ${r.run.id}` : r.sent === "unknown" ? "run not found yet, request unconfirmed" : "run not found yet");
+  if (c.real) return c.real.conclusion === null ? `real run in flight (${run(c.real)})` : `real run ${c.real.conclusion}; waiting to see release at the commit`;
+  if (!c.dry) return c.refused > 0 ? `dry run refused ${c.refused} time(s); retrying` : "dry run not dispatched yet";
+  if (c.dry.conclusion === null) return `dry run in flight (${run(c.dry)})`;
+  if (c.dry.conclusion !== "success") return `dry run ${c.dry.conclusion}; waiting for a newer candidate`;
+  return c.approval ? `approved by ${c.approval.login}; real run not dispatched yet` : "dry run green; waiting for an approval";
+}
+
+export const emptyDispatchState = (): DispatchState => ({ candidate: null, window: [], history: [] });
+
 export type ReleaseHistoryOutcome = "advanced" | "not-applied" | "moved" | "rejected";
 
 export interface ReleaseHistoryItem {
@@ -41,13 +121,15 @@ export interface ReleaseState {
   v: 1;
   lease: Lease | null;
   seq: number;
-  journal: AdvanceJournal | null;
+  journal: ReleaseJournal | null;
   /** A pause that must be applied (its issue opened). Pending counts as paused. */
   pausePending: { id: string; reason: string } | null;
   last: LastCheck | null;
   history: ReleaseHistoryItem[];
   /** As State.epochBranch: the branch the last holder fenced on; absent when it wrote without the fence. */
   epochBranch?: string;
+  /** The dispatch mode's document (DESIGN.md §8.1); absent until a dispatch-mode tick writes it. */
+  dispatch?: DispatchState;
 }
 
 export function emptyReleaseState(): ReleaseState {
@@ -111,15 +193,87 @@ function receipt(x: unknown, w: string): Receipt {
   };
 }
 
+const KINDS = ["dry", "real"] as const;
+const OUTCOMES = ["released", "superseded", "dry-failed", "expired", "real-failed", "not-observed", "released-elsewhere"] as const;
+/** The dispatch id format (src/release-dispatch.ts dispatchIdFor). */
+export const DISPATCH_ID_RE = /^qlr-(dry|real)-[0-9a-f]{12}-[0-9a-f]{12}$/;
+const dispatchId = (x: unknown, w: string): string => (typeof x === "string" && DISPATCH_ID_RE.test(x) ? x : fail(`${w}: not a dispatch id`));
+const nullable = <T>(x: unknown, f: (x: unknown) => T): T | null => (x === null ? null : f(x));
+const posInt = (x: unknown, w: string): number => (int(x, w) > 0 ? (x as number) : fail(`${w}: not a positive integer`));
+
+function dispatchRecord(x: unknown, w: string): DispatchRecord {
+  const o = obj(x, w, ["kind", "id", "at", "sent", "run", "conclusion", "concludedAt"]);
+  return {
+    kind: oneOf(o.kind, `${w}.kind`, KINDS),
+    id: dispatchId(o.id, `${w}.id`),
+    at: time(o.at, `${w}.at`),
+    sent: oneOf(o.sent, `${w}.sent`, ["yes", "unknown"] as const),
+    run: nullable(o.run, (r) => {
+      const ro = obj(r, `${w}.run`, ["id", "url"]);
+      return { id: posInt(ro.id, `${w}.run.id`), url: str(ro.url, `${w}.run.url`) };
+    }),
+    conclusion: nullable(o.conclusion, (c) => str(c, `${w}.conclusion`)),
+    concludedAt: nullable(o.concludedAt, (c) => time(c, `${w}.concludedAt`)),
+  };
+}
+
+function dispatchState(x: unknown): DispatchState {
+  const o = obj(x, "dispatch", ["candidate", "window", "history"]);
+  const candidate = nullable(o.candidate, (c) => {
+    const w = "dispatch.candidate";
+    const co = obj(c, w, ["sha", "receipt", "since", "dry", "reported", "approval", "real", "refused"]);
+    const out: DispatchCandidate = {
+      sha: sha(co.sha, `${w}.sha`),
+      receipt: receipt(co.receipt, `${w}.receipt`),
+      since: time(co.since, `${w}.since`),
+      dry: nullable(co.dry, (d) => dispatchRecord(d, `${w}.dry`)),
+      reported: nullable(co.reported, (r) => {
+        const ro = obj(r, `${w}.reported`, ["issue", "comment", "at"]);
+        return { issue: posInt(ro.issue, `${w}.reported.issue`), comment: posInt(ro.comment, `${w}.reported.comment`), at: time(ro.at, `${w}.reported.at`) };
+      }),
+      approval: nullable(co.approval, (a) => {
+        const ao = obj(a, `${w}.approval`, ["comment", "login", "id", "at"]);
+        return { comment: posInt(ao.comment, `${w}.approval.comment`), login: str(ao.login, `${w}.approval.login`), id: posInt(ao.id, `${w}.approval.id`), at: time(ao.at, `${w}.approval.at`) };
+      }),
+      real: nullable(co.real, (d) => dispatchRecord(d, `${w}.real`)),
+      refused: int(co.refused, `${w}.refused`),
+    };
+    if (out.receipt.to !== out.sha) fail(`${w}: receipt does not match the candidate`);
+    if (out.dry && out.dry.kind !== "dry") fail(`${w}.dry: not a dry run`);
+    if (out.real && out.real.kind !== "real") fail(`${w}.real: not a real run`);
+    if (out.real && !(out.dry && out.dry.conclusion === "success" && out.approval)) fail(`${w}: a real run without a green dry run and an approval`);
+    return out;
+  });
+  if (!Array.isArray(o.window)) fail("dispatch.window: not an array");
+  const window = (o.window as unknown[]).map((t, i) => time(t, `dispatch.window[${i}]`));
+  if (!Array.isArray(o.history)) fail("dispatch.history: not an array");
+  const history = (o.history as unknown[]).map((h, i) => {
+    const w = `dispatch.history[${i}]`;
+    const x = obj(h, w, ["at", "sha", "outcome", "note", "dryRun", "realRun"]);
+    return {
+      at: time(x.at, `${w}.at`),
+      sha: sha(x.sha, `${w}.sha`),
+      outcome: oneOf(x.outcome, `${w}.outcome`, OUTCOMES),
+      note: str(x.note, `${w}.note`),
+      dryRun: nullable(x.dryRun, (r) => posInt(r, `${w}.dryRun`)),
+      realRun: nullable(x.realRun, (r) => posInt(r, `${w}.realRun`)),
+    };
+  });
+  return { candidate, window, history };
+}
+
 /** Strict: unknown fields, wrong types, a bad sha or another version are refused. */
 export function parseReleaseState(text: string): ReleaseState {
   try {
     const raw = JSON.parse(text);
-    const optional = raw !== null && typeof raw === "object" && "epochBranch" in raw ? ["epochBranch"] : [];
+    const optional = raw !== null && typeof raw === "object" ? (["epochBranch", "dispatch"] as const).filter((k) => k in raw) : [];
     const o = obj(raw, "state", ["v", "lease", "seq", "journal", "pausePending", "last", "history", ...optional]);
     if (o.v !== 1) fail(`state: version ${String(o.v)} is not 1`);
     const lease = o.lease === null ? null : leaseOf(o.lease);
-    const journal = o.journal === null ? null : (() => {
+    const journal: ReleaseJournal | null = o.journal === null ? null : (o.journal as { op?: unknown }).op === "dispatch" ? (() => {
+      const j = obj(o.journal, "journal", ["seq", "op", "kind", "sha", "id", "at"]);
+      return { seq: int(j.seq, "journal.seq"), op: "dispatch" as const, kind: oneOf(j.kind, "journal.kind", KINDS), sha: sha(j.sha, "journal.sha"), id: dispatchId(j.id, "journal.id"), at: time(j.at, "journal.at") };
+    })() : (() => {
       const j = obj(o.journal, "journal", ["seq", "op", "before", "after", "receipt", "at"]);
       const out: AdvanceJournal = {
         seq: int(j.seq, "journal.seq"),
@@ -159,7 +313,8 @@ export function parseReleaseState(text: string): ReleaseState {
       };
     });
     const epochBranch = o.epochBranch === undefined ? {} : { epochBranch: epochBranchOf(o.epochBranch) };
-    return { v: 1, lease, seq: int(o.seq, "seq"), journal, pausePending, last, history, ...epochBranch };
+    const dispatch = o.dispatch === undefined ? {} : { dispatch: dispatchState(o.dispatch) };
+    return { v: 1, lease, seq: int(o.seq, "seq"), journal, pausePending, last, history, ...epochBranch, ...dispatch };
   } catch (e) {
     if (e instanceof Bad || e instanceof SyntaxError) throw new Error(`release state: ${e.message}`);
     throw e;

@@ -147,7 +147,9 @@ export function summariseReleaseState(body: string): string[] {
   const l = obj(s.last);
   const out = [l ? `seq ${int(s.seq)} · last check ${str(l.kind, 20)} at ${when(l.at)}: ${str(l.reason, 160)}` : `seq ${int(s.seq)} · no check recorded`];
   const j = obj(s.journal);
-  if (j) out.push(`journal: advance ${sha(j.before)} to ${sha(j.after)}`);
+  if (j) out.push(j.op === "dispatch" ? `journal: dispatch the ${str(j.kind, 10)} run for ${sha(j.sha)}` : `journal: advance ${sha(j.before)} to ${sha(j.after)}`);
+  const c = obj(obj(s.dispatch)?.candidate);
+  if (c) out.push(`dispatch candidate: ${sha(c.sha)}`);
   const p = obj(s.pausePending);
   if (p) out.push(`pause pending: ${str(p.reason, 160)}`);
   const h = Array.isArray(s.history) ? obj(s.history.at(-1)) : null;

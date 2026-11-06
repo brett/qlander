@@ -20,7 +20,7 @@
 // re-read until the reads agree.
 
 import { epochBranchFor, predecessorEpoch, type RunnerContract } from "./config/runner";
-import type { CommitAuthor, RefUpdate, TargetApi } from "./github/api";
+import type { BranchAt, CommitAuthor, RefUpdate, TargetApi } from "./github/api";
 import { GitHubError, isGraphqlInternal } from "./github/http";
 import { type EpochHandover, LeaseHeldError, LostLockError, VoidNeedsWriteError } from "./store";
 import { ZERO_SHA } from "./validate";
@@ -190,9 +190,13 @@ export function fenced(
     merge: guard((b: string, h: string, m: string) => target.merge(b, h, m)),
     createCommit: guard((t: string, p: string, m: string, a?: CommitAuthor) => target.createCommit(t, p, m, a)),
     // Linear landing (DESIGN.md §7.4): the epoch is this tick's, never the caller's.
-    landStack: guard(async (m: RefUpdate, h: RefUpdate[], e: string | null) => {
+    moveBranches: guard(async (g: BranchAt, m: RefUpdate[], e: string | null) => {
+      if (e !== null) throw new LostLockError("moveBranches takes its epoch from the fence, not the caller");
+      return epoch === null ? target.moveBranches(g, m, null) : epochCall((x) => target.moveBranches(g, m, x));
+    }),
+    landStack: guard(async (m: RefUpdate, p: BranchAt[], e: string | null) => {
       if (e !== null) throw new LostLockError("landStack takes its epoch from the fence, not the caller");
-      return epoch === null ? target.landStack(m, h, null) : epochCall((x) => target.landStack(m, h, x));
+      return epoch === null ? target.landStack(m, p, null) : epochCall((x) => target.landStack(m, p, x));
     }),
     rerunFailedJobs: guard((id: number) => target.rerunFailedJobs(id)),
     cancelRun: guard((id: number) => target.cancelRun(id)),

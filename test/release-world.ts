@@ -177,7 +177,7 @@ export interface Promotion {
 }
 
 /** Every ref-writing method on the fake target: a dispatch-mode tick may call only advanceEpoch, on its own epoch branch, with the fence on. */
-export const REF_WRITERS = ["createRef", "deleteRef", "updateRef", "epochUpdateRefs", "advanceEpoch", "voidEpoch", "merge", "createCommit", "landStack"] as const;
+export const REF_WRITERS = ["createRef", "deleteRef", "updateRef", "epochUpdateRefs", "advanceEpoch", "voidEpoch", "merge", "createCommit", "moveBranches", "landStack"] as const;
 
 export interface Dispatched {
   kind: "dry" | "real";

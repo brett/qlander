@@ -495,8 +495,8 @@ export async function observe(api: TargetApi, j: Journal, names: Names): Promise
       if (main === op.after) return { main, afterReachable: true };
       const c = await api.compare(op.after, main);
       const afterReachable = c.status === "ahead" || c.status === "identical";
-      // Linear (DESIGN.md §7.4): main unmoved, so how did each PR branch end up?
-      if (!afterReachable && main === op.before && op.heads) {
+      // Linear (DESIGN.md §7.4): not landed, so where is each PR branch?
+      if (!afterReachable && op.heads) {
         const heads: Record<string, string | null> = {};
         for (const h of op.heads) heads[String(h.pr)] = await api.getPrBranch(h.ref);
         return { main, afterReachable, heads };

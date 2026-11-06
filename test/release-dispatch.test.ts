@@ -122,7 +122,8 @@ describe("dispatch mode: release is never written", () => {
     await expect(c.deleteRef(`${NAMES.queuePrefix}1`)).rejects.toThrow("writes no ref");
     await expect(c.merge(`${NAMES.buildPrefix}1`, s1, "m")).rejects.toThrow("writes no ref");
     await expect(c.createCommit(s1, s2, "m")).rejects.toThrow("writes no ref");
-    await expect(c.landStack({ branch: NAMES.main, before: s1, after: s2 }, [{ branch: "feature", before: s1, after: s2 }], null)).rejects.toThrow("writes no ref");
+    await expect(c.moveBranches({ branch: NAMES.main, at: s1 }, [{ branch: "feature", before: s1, after: s2 }], null)).rejects.toThrow("writes no ref");
+    await expect(c.landStack({ branch: NAMES.main, before: s1, after: s2 }, [{ branch: "feature", at: s2 }], null)).rejects.toThrow("writes no ref");
     await expect(c.comment(1, "x")).rejects.toThrow("writes no ref");
     // Only the configured workflow, ref and input names.
     await expect(c.dispatchWorkflow(".github/workflows/other.yml", NAMES.main, { sha: s1, dry_run: "true", dispatch_id: "qlr-dry-x" })).rejects.toThrow("may be dispatched");
@@ -145,7 +146,7 @@ describe("dispatch mode: release is never written", () => {
 
   test("the client the dispatch tick gets has no ref writer at all", () => {
     const t = dispatchOnly(new FakeTarget("dispatch"));
-    for (const m of ["createRef", "deleteRef", "updateRef", "epochUpdateRefs", "merge", "voidEpoch", "createCommit", "landStack", "comment", "removeLabel", "dispatch", "rerunFailedJobs", "cancelRun"]) expect(m in t).toBe(false);
+    for (const m of ["createRef", "deleteRef", "updateRef", "epochUpdateRefs", "merge", "voidEpoch", "createCommit", "moveBranches", "landStack", "comment", "removeLabel", "dispatch", "rerunFailedJobs", "cancelRun"]) expect(m in t).toBe(false);
     expect(typeof t.dispatchWorkflow).toBe("function");
   });
 

@@ -40,6 +40,10 @@ export interface Auth {
   headRef?: string;
 }
 
+/** How many squashed commits a state keeps, and how many one PR may carry in linear mode (DESIGN.md §7.4). */
+export const SQUASHED_MAX = 1000;
+export const OWN_MAX = 250;
+
 /**
  * One commit of a linear stack (DESIGN.md §7.4): PR `pr`'s changes squashed
  * onto `parent` (the previous stack commit, or the batch's base), with the
@@ -50,6 +54,8 @@ export interface StackCommit {
   commit: string;
   parent: string;
   tree: string;
+  /** The commits the PR carries beyond the batch's base and the entries before this one, as commitPrefix: what state.squashed gains if it lands. */
+  own: string[];
 }
 
 /** What a trusted automation was let skip, recorded at admission. */
@@ -123,7 +129,8 @@ export interface VerifyItem {
 
 export interface BuildRecord {
   survivors: Pin[];
-  dropped: { pr: number; pin: string; outcome: "conflict" | "noop" }[];
+  /** `squashed`: refused for commits that landed squashed (DESIGN.md §7.4); `commit` is the newest such commit it carries, absent when it has too many commits to tell. */
+  dropped: { pr: number; pin: string; outcome: "conflict" | "noop" | "squashed"; commit?: string }[];
   chainHead: string | null; // null when nothing survived
   /** Linear landing only (optional, DESIGN.md §7.4): one stack commit per survivor, in order; chainHead is the last. */
   stack?: StackCommit[];
@@ -297,6 +304,13 @@ export interface State {
    * the current main, each as the PRs still to land on top of `base`.
    */
   seenRed?: SeenRed[];
+  /**
+   * The commits PRs carried when they landed squashed (optional; absent until
+   * a linear landing, DESIGN.md §7.4), as commitPrefix, newest last, at most
+   * SQUASHED_MAX. A fact about main's history, so switching to merge mode keeps
+   * it, and the build refuses a PR carrying any of them in either mode.
+   */
+  squashed?: string[];
   /** queue.strategy.reuseGreen: the last batch abandoned as the queue paused, so a later tick may land its run if that went green. */
   parked?: Parked;
   /** queue.strategy.adaptive: the fresh batch size limit now, and the green landings counted towards growing it. */
@@ -418,6 +432,10 @@ export function buildRecordProblem(
  * Is a linear stack (DESIGN.md §7.4) one commit per PR, in order, each on the
  * one before, the first on `base` (when given)? Returns the problem, or null.
  */
+export function commitPrefix(commit: string): string {
+  return commit.slice(0, 12);
+}
+
 export function stackProblem(stack: StackCommit[], prs: number[], base?: string): string | null {
   if (stack.length !== prs.length || stack.some((x, i) => x.pr !== prs[i])) return "the stack does not have one commit per PR, in order";
   for (let i = 0; i < stack.length; i++) {
@@ -518,11 +536,18 @@ function pins(x: unknown, where: string, nonEmpty: boolean): number[] {
   });
 }
 
+function prefixes(x: unknown, where: string): void {
+  arr(x, where).forEach((p, i) => {
+    if (typeof p !== "string" || !/^[0-9a-f]{12}$/.test(p)) fail(`${where}[${i}]: not a commit prefix`);
+  });
+}
+
 function stackList(x: unknown, where: string, prs: number[], base: string): void {
   const list = arr(x, where);
   list.forEach((e, i) => {
-    const o = obj(e, `${where}[${i}]`, ["pr", "commit", "parent", "tree"]);
+    const o = obj(e, `${where}[${i}]`, ["pr", "commit", "parent", "tree", "own"]);
     pr(o.pr, `${where}[${i}].pr`);
+    prefixes(o.own, `${where}[${i}].own`);
     sha(o.commit, `${where}[${i}].commit`);
     sha(o.parent, `${where}[${i}].parent`);
     sha(o.tree, `${where}[${i}].tree`);
@@ -716,6 +741,11 @@ function distinctPins(x: unknown, where: string, min: number): void {
 
 /** queue.strategy's optional fields (DESIGN.md §5.7): read and kept as they are. */
 function checkStrategyState(s: O): void {
+  if (s.squashed !== undefined) {
+    prefixes(s.squashed, "squashed");
+    if ((s.squashed as string[]).length === 0) fail("squashed: empty (absent when there is none)");
+    if ((s.squashed as string[]).length > SQUASHED_MAX) fail(`squashed: more than ${SQUASHED_MAX}`);
+  }
   if (s.seenRed !== undefined) {
     const list = arr(s.seenRed, "seenRed");
     if (list.length === 0) fail("seenRed: empty (absent when there is none)");
@@ -771,7 +801,7 @@ export function parseState(json: string, names: Names): State {
   }
   raw = migrate(raw);
   if ((raw as O)?.v !== 5) fail(`unknown version ${JSON.stringify((raw as O | null)?.v)}`);
-  const s = obj(raw, "state", Object.keys(emptyState()), ["eligibleSince", "go", "hooks", "held", "concurrent", "flakes", "epochBranch", "seenRed", "parked", "adaptive", "baseline", "internalErrors"]);
+  const s = obj(raw, "state", Object.keys(emptyState()), ["eligibleSince", "go", "hooks", "held", "concurrent", "flakes", "epochBranch", "seenRed", "squashed", "parked", "adaptive", "baseline", "internalErrors"]);
   if ("go" in s && s.go !== true) fail("go: must be true when present");
   if ("internalErrors" in s) {
     const times = arr(s.internalErrors, "internalErrors");
@@ -921,15 +951,17 @@ export function parseState(json: string, names: Names): State {
       if (j.checkpoint !== null) {
         const c = obj(j.checkpoint, "journal.checkpoint", ["survivors", "dropped", "chainHead"], ["stack"]);
         if (c.stack !== undefined) arr(c.stack, "journal.checkpoint.stack").forEach((e, i) => {
-          const o = obj(e, `journal.checkpoint.stack[${i}]`, ["pr", "commit", "parent", "tree"]);
+          const o = obj(e, `journal.checkpoint.stack[${i}]`, ["pr", "commit", "parent", "tree", "own"]);
           pr(o.pr, `journal.checkpoint.stack[${i}].pr`);
+          prefixes(o.own, `journal.checkpoint.stack[${i}].own`);
           for (const f of ["commit", "parent", "tree"]) sha(o[f], `journal.checkpoint.stack[${i}].${f}`);
         });
         pins(c.survivors, "journal.checkpoint.survivors", false);
         arr(c.dropped, "journal.checkpoint.dropped").forEach((d, i) => {
-          const o = obj(d, `journal.checkpoint.dropped[${i}]`, ["pr", "pin", "outcome"]);
+          const o = obj(d, `journal.checkpoint.dropped[${i}]`, ["pr", "pin", "outcome"], ["commit"]);
           sha(o.pin, `journal.checkpoint.dropped[${i}].pin`);
-          oneOf(o.outcome, `journal.checkpoint.dropped[${i}].outcome`, ["conflict", "noop"] as const);
+          if (o.commit !== undefined) sha(o.commit, `journal.checkpoint.dropped[${i}].commit`);
+          oneOf(o.outcome, `journal.checkpoint.dropped[${i}].outcome`, ["conflict", "noop", "squashed"] as const);
           pr(o.pr, `journal.checkpoint.dropped[${i}].pr`);
         });
         if (c.chainHead !== null) sha(c.chainHead, "journal.checkpoint.chainHead");

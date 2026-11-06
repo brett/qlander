@@ -195,7 +195,7 @@ export interface Config {
    * Opt-in (absent by default; absent means merge mode, exactly as before):
    * queue.landing.mode linear (DESIGN.md §7.4). Each PR lands as one squashed
    * commit on a linear stack, and the landing moves every PR's head branch to
-   * its own stack commit in the same atomic update as main. Policy: in the
+   * its own stack commit in the write before the one that moves main. Policy: in the
    * hash when present, so switching it drops every admitted PR.
    */
   landing?: {

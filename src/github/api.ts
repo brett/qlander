@@ -115,6 +115,12 @@ export interface RefUpdate {
   after: string;
 }
 
+/** A guard in an atomic ref update: `branch` must be at `at`, and stays there. */
+export interface BranchAt {
+  branch: string;
+  at: string;
+}
+
 /** The target repository, as the queue or release App sees it. */
 export interface TargetApi {
   readonly repoId: number;
@@ -225,15 +231,22 @@ export interface TargetApi {
    */
   createCommit(tree: string, parent: string, message: string, author?: CommitAuthor): Promise<string>;
   /**
-   * Linear landing (DESIGN.md §7.4): one atomic GraphQL updateRefs that moves
-   * main by fast-forward (`force: false`, beforeOid `main.before`) and every
-   * PR head branch in `heads` from its admitted head to its stack commit
-   * (`force: true`, so a non-fast-forward, but still with beforeOid: a branch
-   * someone pushed to is refused, and with it the whole call). `epoch` is the
-   * epoch entry's commit with the epoch fence on, and null with it off; the
-   * fenced client (src/fenced.ts) fills it in, so callers pass null.
+   * Linear landing, first write and settling (DESIGN.md §7.4): one atomic
+   * GraphQL updateRefs with main as a no-op guard, each move `force: true`
+   * but still with its beforeOid (a branch someone pushed to is refused, and
+   * with it the whole call), and an entry with `before === after` a no-op
+   * guard on that branch. `epoch` is the epoch entry's commit with the epoch
+   * fence on, and null with it off; the fenced client (src/fenced.ts) fills it
+   * in, so callers pass null.
    */
-  landStack(main: RefUpdate, heads: RefUpdate[], epoch: string | null): Promise<void>;
+  moveBranches(guard: BranchAt, moves: RefUpdate[], epoch: string | null): Promise<void>;
+  /**
+   * Linear landing, second write (DESIGN.md §7.4): one atomic GraphQL updateRefs
+   * that moves main by fast-forward (`force: false`, beforeOid `main.before`),
+   * with each PR head branch in `pinned` a no-op guard at its stack commit.
+   * `epoch` as for moveBranches.
+   */
+  landStack(main: RefUpdate, pinned: BranchAt[], epoch: string | null): Promise<void>;
   rerunFailedJobs(runId: number): Promise<void>;
   cancelRun(runId: number): Promise<void>;
   /** Post a comment; returns its id (the delivery receipt). */
@@ -264,6 +277,7 @@ export type TargetWriteMethod =
   | "voidEpoch"
   | "merge"
   | "createCommit"
+  | "moveBranches"
   | "landStack"
   | "rerunFailedJobs"
   | "cancelRun"

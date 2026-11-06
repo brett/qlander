@@ -10,7 +10,7 @@ import { refsOverlap } from "../config/runner";
 import { classicProtection } from "../force-update";
 import { EVENT_TYPE_RE } from "../hooks";
 import { BRANCH_NAME_RE, isBuildRef, isCommandLabel, isForbiddenHeadRef, isGitBranchName, isQlanderBranch, isPrNumber, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../validate";
-import type { Account, CommitAuthor, TargetApi, Commit, Compare, LabelEvent, Listed, MergeResult, PullRequest, RefActivity, RefUpdate, Review, Status, StatusEntry } from "./api";
+import type { Account, BranchAt, CommitAuthor, TargetApi, Commit, Compare, LabelEvent, Listed, MergeResult, PullRequest, RefActivity, RefUpdate, Review, Status, StatusEntry } from "./api";
 
 /** git's empty tree: every epoch commit has it (docs/deployment.md §3.4). */
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -604,22 +604,35 @@ export class TargetClient implements TargetApi {
     return oid(r.json.sha, "commit");
   }
 
-  async landStack(main: RefUpdate, heads: RefUpdate[], epoch: string | null): Promise<void> {
+  /** The checks moveBranches and landStack share, then the one atomic call. */
+  private async linearUpdate(what: string, trunk: string, branches: string[], entries: { name: string; beforeOid: string; afterOid: string; force: boolean }[], epoch: string | null): Promise<void> {
     this.can("queueOps");
-    if (main.branch !== this.names.main) bad("landStack moves main");
-    if (heads.length === 0 || heads.length > LAND_STACK_MAX) bad(`landStack takes 1 to ${LAND_STACK_MAX} PR branches`);
-    const all = [main, ...heads];
-    for (const u of all) if (!isRealSha(u.before) || !isRealSha(u.after) || u.before === u.after) bad(`${u.branch}: not a move between two real object ids`);
-    for (const h of heads) this.prBranch(h.branch);
-    if (new Set(all.map((u) => u.branch)).size !== all.length) bad("a branch twice in one update");
-    if ((epoch === null) !== (this.epochBranch === null)) bad(epoch === null ? "the epoch fence is on: landStack needs the epoch" : "the epoch fence is off");
-    const refUpdates = [
-      { name: `refs/heads/${main.branch}`, beforeOid: main.before, afterOid: main.after, force: false },
-      // A PR branch moves to a commit that does not contain its old head: force, but only from the recorded beforeOid.
-      ...heads.map((h) => ({ name: `refs/heads/${h.branch}`, beforeOid: h.before, afterOid: h.after, force: true })),
-      ...(epoch !== null ? [{ name: `refs/heads/${this.epochBranch}`, beforeOid: oid(epoch, "epoch"), afterOid: epoch, force: false }] : []),
-    ];
+    if (trunk !== this.names.main) bad(`${what} moves main`);
+    if (branches.length > LAND_STACK_MAX) bad(`${what} takes up to ${LAND_STACK_MAX} PR branches`);
+    for (const b of branches) this.prBranch(b);
+    if (new Set(branches).size !== branches.length) bad("a branch twice in one update");
+    if ((epoch === null) !== (this.epochBranch === null)) bad(epoch === null ? `the epoch fence is on: ${what} needs the epoch` : "the epoch fence is off");
+    const refUpdates = [...entries, ...(epoch !== null ? [{ name: `refs/heads/${this.epochBranch}`, beforeOid: oid(epoch, "epoch"), afterOid: epoch, force: false }] : [])];
     await this.http.graphql(UPDATE_REFS, { input: { repositoryId: this.nodeId, refUpdates } }, true);
+  }
+
+  async moveBranches(guard: BranchAt, moves: RefUpdate[], epoch: string | null): Promise<void> {
+    for (const u of [{ branch: guard.branch, before: guard.at, after: guard.at }, ...moves]) if (!isRealSha(u.before) || !isRealSha(u.after)) bad(`${u.branch}: not a real object id`);
+    await this.linearUpdate("moveBranches", guard.branch, moves.map((m) => m.branch), [
+      { name: `refs/heads/${guard.branch}`, beforeOid: guard.at, afterOid: guard.at, force: false },
+      // A move goes to a commit that does not contain its old value: force, but only from the recorded beforeOid.
+      ...moves.map((m) => ({ name: `refs/heads/${m.branch}`, beforeOid: m.before, afterOid: m.after, force: m.before !== m.after })),
+    ], epoch);
+  }
+
+  async landStack(main: RefUpdate, pinned: BranchAt[], epoch: string | null): Promise<void> {
+    if (pinned.length === 0) bad(`landStack takes 1 to ${LAND_STACK_MAX} PR branches`);
+    if (!isRealSha(main.before) || !isRealSha(main.after) || main.before === main.after) bad(`${main.branch}: not a move between two real object ids`);
+    for (const b of pinned) if (!isRealSha(b.at)) bad(`${b.branch}: not a real object id`);
+    await this.linearUpdate("landStack", main.branch, pinned.map((b) => b.branch), [
+      { name: `refs/heads/${main.branch}`, beforeOid: main.before, afterOid: main.after, force: false },
+      ...pinned.map((b) => ({ name: `refs/heads/${b.branch}`, beforeOid: b.at, afterOid: b.at, force: false })),
+    ], epoch);
   }
 
   async rerunFailedJobs(id: number): Promise<void> {

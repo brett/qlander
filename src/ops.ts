@@ -7,7 +7,7 @@ import type { Config } from "./config";
 import type { CommentSettings } from "./config/load";
 import { describeWaiver } from "./automation";
 import { actives, adaptiveLimit, comment, speculationRefused, type Decision, emit, emitDequeued, hookBatch, hookPr, makeCtx, notify, pause, record, refund, retire, setActives, unready, withEvents } from "./ctx";
-import { type Active, type Auth, type BuildRecord, buildRecordProblem, type Journal, type Op, type State } from "./state";
+import { type Active, type Auth, type BuildRecord, buildRecordProblem, type Journal, type Op, SQUASHED_MAX, type State } from "./state";
 import type { RunRef } from "./types";
 import { buildRef, queueRef } from "./validate";
 
@@ -35,10 +35,12 @@ export type OpResult =
   | { kind: "opAbandoned"; reason: string }
   | { kind: "landed" }
   | { kind: "landRejected"; retry: boolean; reason: string }
-  /** Linear landing (DESIGN.md §7.4): refused because these PRs' branches moved since admission; nothing moved. */
+  /** Linear landing (DESIGN.md §7.4): refused because these PRs' branches moved since admission; settled, nothing of ours is left on them. */
   | { kind: "headMoved"; prs: number[] }
-  /** Linear landing (DESIGN.md §7.4): reads disagree on whether it applied. The journal stays; `overdue` also pauses. */
+  /** Linear landing (DESIGN.md §7.4): the write that settles the branches was refused, so nothing is proved. The journal stays; `overdue` also pauses. */
   | { kind: "landUnsettled"; overdue: boolean; reason: string }
+  /** Linear landing (DESIGN.md §7.4): main at its base and every branch back at its admitted head, on the write path. The journal stays; the next tick resends. */
+  | { kind: "landRestored" }
   /**
    * Linear landing (DESIGN.md §7.4): refused with main and every PR branch
    * reading where the batch left them. The journal stays and the next tick
@@ -73,11 +75,15 @@ function restoreSource(s: State, op: BuildOp): void {
  * of its PRs on the new main: merging them onto that head gives the same tree
  * as the red batch. Every other entry is stale and goes. Called before the
  * landed PRs' authorisations are removed. With the key off (say, turned off
- * while this landing was journalled) a leftover field is removed instead.
+ * while this landing was journalled) a leftover field is removed instead. A
+ * linear landing carries nothing: a PR stacked on one it landed merged with
+ * that PR's commits in the red batch and without them now, so the tree can
+ * differ, and a split on that inference could test a PR apart from the one it
+ * needs (§7.4). The cost is at most one more run.
  */
-function carrySeenRed(s: State, landed: number[], before: string, after: string, cfg: Config): void {
+function carrySeenRed(s: State, landed: number[], before: string, after: string, cfg: Config, linear: boolean): void {
   if (!s.seenRed) return;
-  if (!cfg.strategy?.skipSeenRed) {
+  if (!cfg.strategy?.skipSeenRed || linear) {
     delete s.seenRed;
     return;
   }
@@ -139,12 +145,13 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
     if (result.overdue) pause(c, `batch ${s.active?.n ?? "?"}: ${result.reason}`);
     return withEvents(c, { state: s, log: [...c.log, `landing unsettled: ${result.reason}`] });
   }
+  if (result.kind === "landRestored" && op.kind === "land") return { state: s, log: ["landing: PR branches back at their admitted heads; resent next tick"] };
 
   if (op.kind === "build") {
     const rec = j.checkpoint;
     const applyDrops = () => {
       for (const d of rec?.dropped ?? []) {
-        emitDequeued(c, d.pr, d.outcome === "conflict" ? "conflict" : "already_in_main", d.outcome === "conflict" ? `conflicts with main plus the PRs ahead of it in batch ${op.n}` : "already contained in main");
+        emitDequeued(c, d.pr, d.outcome === "conflict" ? "conflict" : d.outcome === "squashed" ? "squashed" : "already_in_main", d.outcome === "conflict" ? `conflicts with main plus the PRs ahead of it in batch ${op.n}` : d.outcome === "squashed" ? "carries commits that landed squashed" : "already contained in main");
         delete s.auth[String(d.pr)];
         const tag = `${d.outcome}:${op.n}`;
         unready(c, d.pr, tag);
@@ -154,7 +161,9 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
           tag,
           d.outcome === "conflict"
             ? `Not queued: \`${d.pin}\` conflicts with main plus the PRs ahead of it in batch ${op.n}. Update the branch and re-add \`ready\`.`
-            : `Not queued: \`${d.pin}\` is already contained in main.`,
+            : d.outcome === "squashed"
+              ? squashedNotice(d.pin, d.commit)
+              : `Not queued: \`${d.pin}\` is already contained in main.`,
         );
       }
     };
@@ -176,7 +185,7 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
         if (under && result.record.dropped.length > 0) {
           refund(s, op.lineage, j.at);
           notify(c, { id: `db:${op.n}`, kind: "deleteRef", ref: buildRef(cfg.names, op.n) });
-          const why = result.record.dropped.map((d) => `#${d.pr} ${d.outcome === "conflict" ? "conflicts" : "is already contained"}`).join(", ");
+          const why = result.record.dropped.map((d) => `#${d.pr} ${d.outcome === "conflict" ? "conflicts" : d.outcome === "squashed" ? "carries squashed commits" : "is already contained"}`).join(", ");
           record(c, { n: op.n, outcome: "empty", prs: op.pins.map((p) => p.pr), head: null, note: `${speculationRefused(under.n)} ${why} on top of it` });
           return finish(`build ${op.n}: speculation on batch ${under.n} refused: ${why}`);
         }
@@ -325,7 +334,8 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
         prs: a.prs.filter((pr) => s.auth[String(pr)]).map((pr) => hookPr(c, pr, op.after)),
         details: { main: op.after, previousMain: op.before, rerun: a.rerun !== null },
       });
-      carrySeenRed(s, a.prs, op.before, op.after, cfg);
+      carrySeenRed(s, a.prs, op.before, op.after, cfg, op.heads !== undefined);
+      if (a.stack) s.squashed = [...new Set([...(s.squashed ?? []), ...a.stack.flatMap((x) => x.own)])].slice(-SQUASHED_MAX);
       countGreen(s, a, cfg);
       for (const pr of a.prs) {
         const auth = s.auth[String(pr)];
@@ -363,35 +373,10 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
   throw new Error(`applyOpResult: ${result.kind} does not fit op ${op.kind}`);
 }
 
-/**
- * Linear landing (DESIGN.md §7.4), with main reading at its base after the
- * update failed or its outcome was lost. GitHub applies the update
- * atomically, so a PR branch at its stack commit means the update applied and
- * the main read lags, or (never expected) GitHub broke its promise. Reads
- * cannot tell these apart, so that is never terminal: the journal stays and
- * later reads settle it (`landUnsettled`); past `reconcileMinutes` it also
- * pauses, still keeping the journal, naming the branches. A branch at
- * anything but its admitted head and its stack commit was pushed to: the
- * update was refused for it, and the next tick drops it. Null: every branch
- * is untouched.
- */
-export function headsVerdict(
-  heads: Extract<Op, { kind: "land" }>["heads"],
-  now: Record<string, string | null> | undefined,
-  timing: { since: string; now: Date; reconcileMinutes: number },
-): OpResult | null {
-  if (!heads || !now) return null;
-  const half = heads.filter((h) => now[String(h.pr)] === h.after);
-  if (half.length > 0) {
-    const overdue = timing.now.getTime() - Date.parse(timing.since) >= timing.reconcileMinutes * 60_000;
-    return {
-      kind: "landUnsettled",
-      overdue,
-      reason: `the linear landing's PR branches ${half.map((h) => `${h.ref} (#${h.pr})`).join(", ")} read at their stack commits while main still reads at its base. Either main's read lags (the landing applied, and the next read settles it) or GitHub applied only part of an atomic update. If main still does not move, restore ${half.map((h) => `#${h.pr} to ${h.before}`).join(", ")} before resuming; the journal is kept, so a landing that did apply is still recorded`,
-    };
-  }
-  const moved = heads.filter((h) => now[String(h.pr)] !== h.before).map((h) => h.pr);
-  return moved.length > 0 ? { kind: "headMoved", prs: moved } : null;
+/** The comment on a PR the build refused for carrying commits that landed squashed (DESIGN.md §7.4). */
+function squashedNotice(pin: string, commit: string | undefined): string {
+  if (!commit) return `Not queued: \`${pin}\` has more commits than this queue can check against what already landed squashed. Squash or rebase it into fewer, and re-add \`ready\`.`;
+  return `Not queued: \`${pin}\` carries \`${commit}\`, which already landed squashed as part of another PR. A merge now would start from before that commit, so anything this PR undoes of it would silently not land. Rebase only this PR's own commits onto main, \`git rebase --onto origin/main ${commit} <branch>\`, and re-add \`ready\`.`;
 }
 
 export interface Observation {
@@ -408,15 +393,20 @@ export interface Observation {
   /** land: current main, and whether op.after is main or an ancestor of it. */
   main?: string;
   afterReachable?: boolean;
-  /** land, linear (DESIGN.md §7.4): each moved PR branch's current commit (null: absent), by PR; read only while main is still op.before. */
+  /** land, linear (DESIGN.md §7.4): each PR branch's current commit (null: absent), by PR; read whenever the landing is not reachable. */
   heads?: Record<string, string | null>;
 }
 
-export type Recovery = OpResult | { kind: "resumeBuild"; head: string } | { kind: "retryLand" };
+/**
+ * `settleLand`: a linear landing that did not land and cannot simply be resent
+ * (DESIGN.md §7.4). The runner settles the PR branches with one guarded write
+ * before anything else; `stranded` names those read at their stack commits.
+ */
+export type Recovery = OpResult | { kind: "resumeBuild"; head: string } | { kind: "retryLand" } | { kind: "settleLand"; stranded: string };
 
 /** Recovery results that only record effects that already happened (allowed while paused). */
 export function isObservedOutcome(r: Recovery): boolean {
-  return !(r.kind === "resumeBuild" || r.kind === "retryOp" || r.kind === "retryLand");
+  return !(r.kind === "resumeBuild" || r.kind === "retryOp" || r.kind === "retryLand" || r.kind === "settleLand");
 }
 
 /**
@@ -471,8 +461,12 @@ export function interpretObservation(
     }
     case "land":
       if (o.afterReachable === true) return { kind: "landed" };
-      // Linear (DESIGN.md §7.4): every ref where the batch left it is resent, after revalidation, by the runner (retryLand); merge mode decides again.
-      if (o.main === op.before) return headsVerdict(op.heads, o.heads, { since: j.at, now: timing?.now ?? new Date(0), reconcileMinutes: timing?.reconcileMinutes ?? 0 }) ?? (op.heads ? { kind: "retryLand" } : { kind: "landRejected", retry: true, reason: "not applied" });
+      // Linear (DESIGN.md §7.4): every ref where the batch left it is resent, after revalidation, by the runner (retryLand). Anything else settles the branches first.
+      if (op.heads) {
+        if (o.main === op.before && op.heads.every((h) => o.heads?.[String(h.pr)] === h.before)) return { kind: "retryLand" };
+        return { kind: "settleLand", stranded: op.heads.filter((h) => o.heads?.[String(h.pr)] === h.after).map((h) => `${h.ref} (#${h.pr}) at ${h.after}, admitted ${h.before}`).join(", ") };
+      }
+      if (o.main === op.before) return { kind: "landRejected", retry: true, reason: "not applied" };
       return { kind: "baseMoved" };
     case "cancel":
       return { kind: "retryOp" };

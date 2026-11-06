@@ -23,12 +23,12 @@ import { actives, type Snapshot, type Verdict } from "./ctx";
 import type { TargetApi, StateRefApi, StateRepoApi } from "./github/api";
 import { GitHubError, isGraphqlInternal } from "./github/http";
 import { decide } from "./machine";
-import { applyOpResult, headsVerdict, interpretObservation, isObservedOutcome, type OpResult, type Recovery } from "./ops";
+import { applyOpResult, interpretObservation, isObservedOutcome, type OpResult, type Recovery } from "./ops";
 import { drain, isTransient, openPause, pauseReason } from "./outbox";
 import { buildSnapshot, observe, StaleSnapshotError } from "./snapshot";
 import type { CommentSettings } from "./config/load";
 import { deliverHooks, enqueueHooks, type Hook, type LifecycleEvent } from "./hooks";
-import type { BuildRecord, Executor, Op, StackCommit, State } from "./state";
+import { type BuildRecord, commitPrefix, type Executor, type Op, OWN_MAX, type StackCommit, type State } from "./state";
 import { CorruptStateError, LeaseHeldError, LostLockError, mirror, queueCodec, StateStore } from "./store";
 import { buildRef, queueRef } from "./validate";
 import { retickAt, type Wake, wakeFor } from "./wake";
@@ -45,6 +45,7 @@ export type CrashPoint =
   | "after-stack"
   | "after-checkpoint"
   | "after-queue-ref"
+  | "after-branches"
   | "after-effect"
   | "after-receipt"
   | "mid-drain";
@@ -171,13 +172,16 @@ export function mergeMessage(pr: number, head: string, n: number, title?: string
  * The message of a linear stack commit (DESIGN.md §7.4): the subject
  * `<title> (#<pr>)`, the title flattened and cut as for a merge commit (or
  * `Pull request #<pr>` when there is none), a blank line, then
- * queue.landing.body with its placeholders filled in.
+ * queue.landing.body with its placeholders filled in. A title that could read
+ * as one of this message's lines gets the neutral subject and a `Title:` line
+ * after the body, as in mergeMessage.
  */
 export function linearMessage(pr: number, head: string, n: number, title: string | undefined, body: string, coAuthor?: { login: string; email: string }): string {
   const t = mergeTitle(title);
-  const subject = t === null ? `Pull request #${pr}` : `${t} (#${pr})`;
+  const forged = t !== null && readsAsMergeLine(t);
+  const subject = t === null || forged ? `Pull request #${pr}` : `${t} (#${pr})`;
   const trailer = coAuthor ? `\n\nCo-authored-by: ${coAuthor.login} <${coAuthor.email}>` : "";
-  return `${subject}\n\n${body.replaceAll("{number}", String(pr)).replaceAll("{head}", head).replaceAll("{batch}", String(n))}${trailer}`;
+  return `${subject}\n\n${body.replaceAll("{number}", String(pr)).replaceAll("{head}", head).replaceAll("{batch}", String(n))}${forged ? `\nTitle: ${t}` : ""}${trailer}`;
 }
 
 /**
@@ -325,7 +329,7 @@ class Tick {
   async resolve(r: Recovery, snap: Snapshot): Promise<void> {
     const j = this.state.journal!;
     if (j.tries >= this.d.cfg.maxOpTries) {
-      await this.apply({ kind: "opAbandoned", reason: `${j.op.kind} re-executed ${j.tries} times without completing` });
+      await this.endLinear(j.op, { kind: "opAbandoned", reason: `${j.op.kind} re-executed ${j.tries} times without completing` });
       return;
     }
     await this.apply({ kind: "tried" });
@@ -355,11 +359,11 @@ class Tick {
     if (r.kind === "retryLand" && op.kind === "land") {
       const a = this.state.active;
       if (a?.head !== op.after || snap.ci?.kind !== "green") {
-        await this.apply({ kind: "opDropped", reason: `the batch's CI is ${snap.ci?.kind ?? "unread"} now, not green` });
+        await this.endLinear(op, { kind: "opDropped", reason: `the batch's CI is ${snap.ci?.kind ?? "unread"} now, not green` });
         return;
       }
       if (snap.main !== op.before || !valid((op.heads ?? []).map((h) => ({ pr: h.pr, head: h.before })))) {
-        await this.apply({ kind: "opDropped", reason: "the batch no longer revalidates on this main" });
+        await this.endLinear(op, { kind: "opDropped", reason: "the batch no longer revalidates on this main" });
         return;
       }
     }
@@ -368,6 +372,54 @@ class Tick {
       return;
     }
     await this.perform(snap);
+  }
+
+  /**
+   * Linear landing (DESIGN.md §7.4), on every way out that is not a landing:
+   * is it on main, and if not, prove where everything is with one guarded write
+   * that also moves back each PR branch read at its stack commit. Accepted, the
+   * write says that at one instant main was as read and each branch was as read,
+   * so a lagging read cannot end the op with a branch left behind, and a landing
+   * cannot be unwound. Refused, nothing is proved and the journal stays.
+   * Returns null when main is at its base and every branch back at its admitted
+   * head; a pushed branch is guarded, never moved.
+   */
+  private async settle(op: Extract<Op, { kind: "land" }>, since: string): Promise<OpResult | null> {
+    const c = this.d.target;
+    const name = this.d.cfg.names.main;
+    const main = await c.getRef(name);
+    if (main === op.after) return { kind: "landed" };
+    const heads = op.heads ?? [];
+    const unsettled = (why: string): OpResult => ({
+      kind: "landUnsettled",
+      overdue: this.d.now().getTime() - Date.parse(since) >= this.d.cfg.reconcileMinutes * 60_000,
+      reason: `the linear landing could not settle its PR branches (${why}). Qlander retries each tick; each should read at its admitted head: ${heads.map((h) => `${h.ref} (#${h.pr}) ${h.before}`).join(", ")}, and ${heads.map((h) => h.after).join(", ")} are its stack commits. The journal is kept, so a landing that did apply is still recorded`,
+    });
+    if (main === null) return unsettled(`${name} did not read`);
+    const seen = await c.compare(op.after, main);
+    if (seen.status === "ahead" || seen.status === "identical") return { kind: "landed" };
+    const now = new Map<number, string | null>();
+    for (const h of heads) now.set(h.pr, await c.getPrBranch(h.ref));
+    const moves = heads.flatMap((h) => {
+      const at = now.get(h.pr)!;
+      return at === null ? [] : [{ branch: h.ref, before: at, after: at === h.after ? h.before : at }];
+    });
+    try {
+      await c.moveBranches({ branch: name, at: main }, moves, null);
+    } catch (e) {
+      if (e instanceof CrashError || e instanceof LostLockError) throw e;
+      return unsettled(String(e));
+    }
+    if (main !== op.before) return { kind: "baseMoved" };
+    const pushed = heads.filter((h) => now.get(h.pr) !== h.before && now.get(h.pr) !== h.after).map((h) => h.pr);
+    return pushed.length > 0 ? { kind: "headMoved", prs: pushed } : null;
+  }
+
+  /** End a journalled op with `result`; a linear landing settles first, and only a clean result lets it end this way. */
+  private async endLinear(op: Op, result: OpResult): Promise<void> {
+    const j = this.state.journal!;
+    if (op.kind === "land" && op.heads) await this.apply((await this.settle(op, j.at)) ?? result);
+    else await this.apply(result);
   }
 
   /** Perform the journalled op. Every effect is followed by a checkpoint or receipt. */
@@ -416,25 +468,28 @@ class Tick {
         let result: OpResult;
         const main = this.d.cfg.names.main;
         try {
-          // CAS: beforeOid, force false. Linear (DESIGN.md §7.4): the same atomic call force-moves each PR branch from its admitted head.
-          if (op.heads) await c.landStack({ branch: main, before: op.before, after: op.after }, op.heads.map((h) => ({ branch: h.ref, before: h.before, after: h.after })), null);
-          else await c.updateRef(main, op.before, op.after);
+          if (op.heads) {
+            // Linear (DESIGN.md §7.4): GitHub marks a PR merged only if its head already reads where the main push reaches, so the branches move first, each write guarding the other's refs.
+            await c.moveBranches({ branch: main, at: op.before }, op.heads.map((h) => ({ branch: h.ref, before: h.before, after: h.after })), null);
+            this.crash("after-branches");
+            await c.landStack({ branch: main, before: op.before, after: op.after }, op.heads.map((h) => ({ branch: h.ref, at: h.after })), null);
+          } else await c.updateRef(main, op.before, op.after); // CAS: beforeOid, force false
           this.crash("after-effect");
           result = { kind: "landed" };
         } catch (e) {
           // A crash, or a lost lease at the fence: not a landing outcome. The tick ends quietly.
           if (e instanceof CrashError || e instanceof LostLockError) throw e;
-          // Judge by the ref, not the error text: did it move, and where to?
-          const now = await c.getRef(main);
-          if (now === op.after) result = { kind: "landed" };
-          else if (now !== op.before) result = { kind: "baseMoved" };
-          // The write may have applied and this read may lag: the journal stays, and the next tick judges again.
-          else if (isGraphqlInternal(e)) throw e;
-          else {
-            const heads: Record<string, string | null> = {};
-            for (const h of op.heads ?? []) heads[String(h.pr)] = await c.getPrBranch(h.ref);
-            // Linear (DESIGN.md §7.4): every ref where the batch left it is a refusal the next tick retries; merge mode is unchanged.
-            result = headsVerdict(op.heads, op.heads ? heads : undefined, { since: j.at, now: this.d.now(), reconcileMinutes: this.d.cfg.reconcileMinutes }) ?? (op.heads ? { kind: "landRefused", counted: !isTransient(e), reason: String(e) } : { kind: "landRejected", retry: isTransient(e), reason: String(e) });
+          if (op.heads) {
+            // Linear: every ref where the batch left it is a refusal the next tick retries.
+            result = (await this.settle(op, j.at)) ?? { kind: "landRefused", counted: !isTransient(e), reason: String(e) };
+          } else {
+            // Judge by the ref, not the error text: did it move, and where to?
+            const now = await c.getRef(main);
+            if (now === op.after) result = { kind: "landed" };
+            else if (now !== op.before) result = { kind: "baseMoved" };
+            // The write may have applied and this read may lag: the journal stays, and the next tick judges again.
+            else if (isGraphqlInternal(e)) throw e;
+            else result = { kind: "landRejected", retry: isTransient(e), reason: String(e) };
           }
         }
         await this.apply(result);
@@ -453,7 +508,33 @@ class Tick {
     const survivors: BuildRecord["survivors"] = [];
     const dropped: BuildRecord["dropped"] = [];
     const merges: string[] = [];
+    const landing = this.d.cfg.landing;
+    // What landed squashed, and what will if the batches under this base land (DESIGN.md §7.4). A batch beside this one is not under it: if it lands first, this one rebuilds on the new main.
+    const squashed = new Set(this.state.squashed);
+    const all = actives(this.state);
+    for (let a = all.find((x) => x.head === op.base); a; a = all.find((x) => x.n === a!.on)) for (const x of a.stack ?? []) for (const p of x.own) squashed.add(p);
+    const own = new Map<number, string[]>();
     for (const pin of op.pins) {
+      if (landing || squashed.size > 0) {
+        let carried;
+        try {
+          carried = await c.compare(op.base, pin.head);
+        } catch (e) {
+          if (e instanceof GitHubError && e.kind === "not_found") {
+            await this.apply({ kind: "buildAborted", reason: `comparing #${pin.pr}: ${e.message}` });
+            return;
+          }
+          throw e;
+        }
+        const tooMany = carried.commitsTruncated || (landing !== undefined && carried.commits.length > OWN_MAX);
+        // A head that already contains the base merges to its own tree: nothing can vanish.
+        const hit = carried.status === "ahead" ? undefined : [...carried.commits].reverse().find((x) => squashed.has(commitPrefix(x.sha)));
+        if (tooMany || hit) {
+          dropped.push({ pr: pin.pr, pin: pin.head, outcome: "squashed", ...(hit ? { commit: hit.sha } : {}) });
+          continue;
+        }
+        own.set(pin.pr, carried.commits.map((x) => commitPrefix(x.sha)));
+      }
       let r;
       try {
         r = await c.merge(build, pin.head, mergeMessage(pin.pr, pin.head, op.n, snap.prs[String(pin.pr)]?.title));
@@ -470,13 +551,13 @@ class Tick {
       } else dropped.push({ pr: pin.pr, pin: pin.head, outcome: r.kind });
     }
     this.crash("after-merges");
-    const landing = this.d.cfg.landing;
     // Linear (DESIGN.md §7.4): the merge chain stays on the build ref; the stack, one commit per PR on its tree, is what is pushed.
     const stack: StackCommit[] = [];
     /** Stack commits with the PR's author as author: GitHub does not sign those (queue.landing.author: author). */
     const authored = new Set<string>();
     if (landing) {
       let parent = op.base;
+      const recorded = new Set<string>();
       for (const [i, m] of merges.entries()) {
         const pin = survivors[i]!;
         const tree = (await c.getCommit(m)).tree;
@@ -491,7 +572,9 @@ class Tick {
         const message = linearMessage(pin.pr, pin.head, op.n, live?.title, landing.body, !byAuthor && who ? who : undefined);
         const commit = await c.createCommit(tree, parent, message, byAuthor ? { name: who.login, email: who.email } : undefined);
         if (byAuthor) authored.add(commit);
-        stack.push({ pr: pin.pr, commit, parent, tree });
+        const mine = (own.get(pin.pr) ?? []).filter((p) => !recorded.has(p));
+        for (const p of mine) recorded.add(p);
+        stack.push({ pr: pin.pr, commit, parent, tree, own: mine });
         parent = commit;
       }
       this.crash("after-stack");
@@ -537,10 +620,18 @@ class Tick {
     paused = paused || (await this.paused());
     if (this.state.journal && outstanding) {
       this.log.push(`admission not evaluated this tick: a journalled ${this.state.journal.op.kind} is outstanding`);
+      if (outstanding.kind === "settleLand" && paused && outstanding.stranded) this.log.push(`paused with PR branches at their stack commits, moved back once the pause closes: ${outstanding.stranded}`);
       if (paused) return "paused";
       if (outstanding.kind === "rerunReconcile" && (this.state.journal.op.kind !== "rerun" || (this.state.journal.op.requested ?? []).length > 0)) return "waiting";
-      // A linear landing the reads cannot settle yet (DESIGN.md §7.4): never re-sent, only observed again next tick.
-      if (outstanding.kind === "landUnsettled") return "waiting";
+      // A linear landing that did not land and cannot simply be resent (DESIGN.md §7.4): settled first, needing no snapshot.
+      if (outstanding.kind === "settleLand" && this.state.journal.op.kind === "land") {
+        const j = this.state.journal;
+        this.acted = true;
+        const r = await this.settle(this.state.journal.op, j.at);
+        await this.apply(r ?? { kind: "landRestored" });
+        await this.drainOutbox();
+        return r?.kind === "landUnsettled" ? "waiting" : "acted";
+      }
       const snap = await this.snapshot(paused);
       await this.resolve(outstanding, snap);
       await this.drainOutbox();

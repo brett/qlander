@@ -209,7 +209,7 @@
           "additionalProperties": false,
           "properties": {
             "mode": {
-              "description": "merge: each PR lands as a merge commit, and main fast-forwards to the tested queue commit. linear: each PR lands as one squashed commit on a linear stack, and the one atomic update that moves main also force-moves each PR's head branch, from its admitted head, to its own commit, so GitHub marks it merged. For repos that require linear history. See DESIGN.md §7.4.",
+              "description": "merge: each PR lands as a merge commit, and main fast-forwards to the tested queue commit. linear: each PR lands as one squashed commit on a linear stack, and each PR's head branch is force-moved, from its admitted head, to its own commit just before main moves, so GitHub marks it merged. If the landing does not complete, qlander moves the branches back. A PR carrying commits that already landed squashed is refused until rebased. For repos that require linear history. See DESIGN.md §7.4.",
               "type": "string",
               "enum": ["merge", "linear"],
               "default": "merge",
@@ -223,7 +223,7 @@
               "examples": ["app"]
             },
             "maxRefusals": {
-              "description": "linear mode only: refused landings in a row, with main and every PR branch still where the batch left them, before the queue pauses. Each refusal is retried on the next tick; none costs a CI run.",
+              "description": "linear mode only: refused landings in a row, with main unmoved and every PR branch back where the batch left it, before the queue pauses. Each refusal is retried on the next tick; none costs a CI run.",
               "$ref": "#/$defs/positive",
               "default": 3,
               "examples": [3]

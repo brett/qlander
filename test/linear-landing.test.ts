@@ -1,15 +1,14 @@
 // Linear landing (queue.landing.mode: linear, DESIGN.md §7.4): each PR lands
-// as one squashed commit on a linear stack, and the one atomic updateRefs that
-// moves main also moves each PR's head branch to its own stack commit, so
-// GitHub marks it merged. Merge mode is everything else in the suite.
+// as one squashed commit on a linear stack, and two guarded writes move each
+// PR's head branch to its own stack commit and then main (test/linear-split.test.ts),
+// so GitHub marks it merged. Merge mode is everything else in the suite.
 //
 // The in-memory GitHub models: trees (a merge's tree holds both parents'
 // changes; a created commit takes the tree it is given), PR branches (a PR's
 // head is its branch), the merged-state rule (a PR whose head is reachable
 // from main is marked merged, mergeLag ticks later), and updateRefs' atomicity
 // (every entry, forced or not, checked against its beforeOid before any
-// moves). The merged-state rule and the atomicity are GitHub's documented
-// behaviour; they are checked on real GitHub only by the sandbox checklist.
+// moves). They are checked on real GitHub only by the sandbox checklist.
 
 import { describe, expect, test } from "bun:test";
 import type { Config } from "../src/config";
@@ -17,7 +16,6 @@ import { DEFAULT_LINEAR_BODY, linearReleaseProblems, parseConfig } from "../src/
 import { fenced } from "../src/fenced";
 import { BLOCKS_DIRECT_UPDATE, classicProtection, forceUpdateOf } from "../src/force-update";
 import { TargetClient } from "../src/github/target";
-import { headsVerdict } from "../src/ops";
 import { type CrashPoint, linearMessage, policyHash } from "../src/queue";
 import { parseState } from "../src/state";
 import { LostLockError } from "../src/store";
@@ -88,9 +86,9 @@ describe("a batch lands as a linear stack", () => {
     expect(w.target.createdMessages).toEqual([1, 2, 3].map((n, i) => `Change number ${n} (#${n})\n\nSquashed from #${n} at ${heads[i]}.\n\nLanded-by: qlander batch ${batch}\n\n${by}`));
     expect(w.target.createdAuthors.size).toBe(0);
 
-    // One atomic landing: main from the root, each branch from its admitted head to its own commit.
+    // Each branch from its admitted head to its own commit, then main from the root.
     expect(w.target.landings).toHaveLength(1);
-    expect(w.target.landings[0]!.heads).toEqual([1, 2, 3].map((n, i) => ({ branch: `feat/pr-${n}`, before: heads[i]!, after: stack[i]!.sha })));
+    expect(w.target.branchMoves[0]!.moves).toEqual([1, 2, 3].map((n, i) => ({ branch: `feat/pr-${n}`, before: heads[i]!, after: stack[i]!.sha })));
     expect(w.target.calls.some((c) => c.startsWith(`updateRef ${NAMES.main}`))).toBe(false);
     for (const [i, n] of [1, 2, 3].entries()) {
       const p = w.target.prs.get(n)!.pr;
@@ -139,7 +137,7 @@ describe("a batch lands as a linear stack", () => {
     const h = history(w);
     expect(h).toHaveLength(3);
     expect(h[0]!.parents).toEqual([h[1]!.sha]); // #3's commit sits directly on #1's
-    expect(w.target.landings[0]!.heads.map((x) => x.branch)).toEqual(["feat/pr-1", "feat/pr-3"]);
+    expect(w.target.landings[0]!.pinned.map((x) => x.branch)).toEqual(["feat/pr-1", "feat/pr-3"]);
     expect(w.target.prs.get(2)!.pr.head.sha).toBe(p2.pr.head.sha);
   });
 
@@ -201,11 +199,11 @@ describe("the landing never overwrites a push", () => {
   test("an author push between the last revalidation and the landing: the update is refused whole, only that PR is dropped", async () => {
     const w = linearWorld();
     const heads = [1, 2, 3].map((n) => pr(w, n).pr.head.sha);
-    const land = w.target.landStack.bind(w.target);
+    const move = w.target.moveBranches.bind(w.target);
     let pushed: string | null = null;
-    w.target.landStack = async (m, h, e) => {
+    w.target.moveBranches = async (g, m, e) => {
       pushed ??= w.target.push(2); // the author pushes just as qlander lands
-      return land(m, h, e);
+      return move(g, m, e);
     };
     const logs: string[] = [];
     for (let i = 0; i < 80; i++) {
@@ -230,17 +228,17 @@ describe("the landing never overwrites a push", () => {
   test("main moved by someone else just before the landing: nothing moves, every PR branch is untouched, and the batch is rebuilt", async () => {
     const w = linearWorld();
     const heads = [1, 2].map((n) => pr(w, n).pr.head.sha);
-    const land = w.target.landStack.bind(w.target);
+    const move = w.target.moveBranches.bind(w.target);
     let glass: string | null = null;
     let afterRefusal: string[] = [];
-    w.target.landStack = async (m, h, e) => {
-      if (glass !== null) return land(m, h, e);
-      // A break-glass merge moves main first, so the landing's beforeOid for main no longer holds.
+    w.target.moveBranches = async (g, m, e) => {
+      if (glass !== null) return move(g, m, e);
+      // A break-glass merge moves main first, so the first write's guard on main no longer holds.
       const main = w.target.refs.get(NAMES.main)!;
       glass = w.target.commit([main], "break-glass");
       w.target.githubUpdateRefs(NAMES.main, main, glass);
       try {
-        return await land(m, h, e);
+        return await move(g, m, e);
       } finally {
         afterRefusal = [1, 2].map((n) => w.target.prs.get(n)!.pr.head.sha);
       }
@@ -257,34 +255,6 @@ describe("the landing never overwrites a push", () => {
     expect(isLinear(w)).toBe(true);
     for (const n of [1, 2]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
   });
-
-  test("a GitHub that moved the PR branches but not main: the journal is kept, it pauses only past the reconcile window, and lands once they are restored", async () => {
-    const w = linearWorld();
-    const heads = [1, 2].map((n) => pr(w, n).pr.head.sha);
-    w.target.partialLanding = true;
-    let unsettledAt: number | null = null;
-    for (let i = 0; i < 40 && !w.paused(); i++) {
-      await w.tick();
-      if (unsettledAt === null && w.state().journal?.op.kind === "land" && w.target.prs.get(1)!.pr.head.sha !== heads[0]) unsettledAt = w.now.getTime();
-    }
-    expect(w.paused()).toBe(true);
-    // Not before reconcileMinutes: until then it may be a main read that lags.
-    expect(w.now.getTime() - unsettledAt!).toBeGreaterThanOrEqual(w.config.reconcileMinutes * 60_000);
-    expect(w.state().journal?.op.kind).toBe("land");
-    const why = w.repo.issues.filter((i) => i.open && i.labels.includes(NAMES.controlLabels.pause)).map((i) => i.body).join(" ");
-    expect(why).toContain("while main still reads at its base");
-    expect(why).toContain(`#1 to ${heads[0]!}`);
-    // Nobody was told their PR changed: the moved branches are qlander's, not a push.
-    for (const n of [1, 2]) expect(w.comments(n).some((c) => c.startsWith("Removed from the landing queue"))).toBe(false);
-    // An operator restores the branches and resumes.
-    w.target.partialLanding = false;
-    for (const [i, n] of [1, 2].entries()) w.target.prs.get(n)!.pr.head.sha = heads[i]!;
-    for (const issue of w.repo.issues) issue.open = false;
-    await w.runUntilIdle();
-    expect(w.paused()).toBe(false);
-    expect(w.landed()).toEqual([[1, 2]]);
-    for (const n of [1, 2]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
-  });
 });
 
 describe("a main read that lags behind an applied landing is never taken for a half-applied one", () => {
@@ -297,7 +267,7 @@ describe("a main read that lags behind an applied landing is never taken for a h
         (await w.tick({
           crashWhen: (p) => {
             if (p !== "after-effect" || w.state().journal?.op.kind !== "land") return false;
-            w.target.staleMain = { value: w.mainHistory.at(-2)!, reads: 1 }; // the next read of main comes from a lagging replica
+            w.target.staleMain = { value: w.mainHistory.at(-2)!, reads: 2 }; // the next reads of main come from a lagging replica
             return true;
           },
         })) === "crashed";
@@ -338,7 +308,7 @@ describe("branch names", () => {
     await w.runUntilIdle();
     expect(w.paused()).toBe(false);
     expect(w.landed()).toEqual([[1]]);
-    expect(w.target.landings[0]!.heads[0]!.branch).toBe("feat/fix+tests");
+    expect(w.target.landings[0]!.pinned[0]!.branch).toBe("feat/fix+tests");
   });
 
   test("a name git would refuse is refused at admission with a comment, so the state never holds it", async () => {
@@ -382,7 +352,7 @@ describe("a PR based on another PR's branch", () => {
 });
 
 describe("a crash at every step boundary converges, linear", () => {
-  const POINTS: CrashPoint[] = ["after-intent", "after-build-ref", "after-merges", "after-stack", "after-checkpoint", "after-queue-ref", "after-effect", "after-receipt", "mid-drain"];
+  const POINTS: CrashPoint[] = ["after-intent", "after-build-ref", "after-merges", "after-stack", "after-checkpoint", "after-queue-ref", "after-branches", "after-effect", "after-receipt", "mid-drain"];
   const oracle = (b: BatchCi): CiOutcome => (b.attempt === 1 ? "fail" : "pass");
 
   async function scenario(crash?: { point: CrashPoint; at: number }) {
@@ -532,43 +502,38 @@ describe("evidence and approvals are bound to the admitted head, not the rewrite
 });
 
 describe("with the epoch fence on", () => {
-  test("the landing carries the epoch; a successor's epoch makes it a lost lease and nothing moves", async () => {
+  test("both writes carry the epoch; a successor's epoch makes either a lost lease and nothing moves", async () => {
     const t = new FakeTarget();
     t.epochBranch = "q-epoch/queue";
     const e = await t.advanceEpoch(null, "first");
     const f = t.addPr(1);
     const main = t.refs.get(NAMES.main)!;
-    const s = await t.createCommit(t.treeOf.get(f.pr.head.sha)!, main, "Change (#1)\n\nbody");
+    const h = f.pr.head.sha;
+    const s = await t.createCommit(t.treeOf.get(h)!, main, "Change (#1)\n\nbody");
     let epoch: string | null = e;
     const c = fenced(t, async () => {}, () => epoch);
-    await expect(c.landStack({ branch: NAMES.main, before: main, after: s }, [{ branch: "feat/pr-1", before: f.pr.head.sha, after: s }], e)).rejects.toThrow("takes its epoch from the fence");
+    const guard = { branch: NAMES.main, at: main };
+    const move = [{ branch: "feat/pr-1", before: h, after: s }];
+    const land = { branch: NAMES.main, before: main, after: s };
+    const pin = [{ branch: "feat/pr-1", at: s }];
+    await expect(c.moveBranches(guard, move, e)).rejects.toThrow("takes its epoch from the fence");
+    await expect(c.landStack(land, pin, e)).rejects.toThrow("takes its epoch from the fence");
     // A successor advanced the epoch: GitHub refuses the whole call, and the fence reads it as a lost lease.
     await t.advanceEpoch(e, "successor");
-    await expect(c.landStack({ branch: NAMES.main, before: main, after: s }, [{ branch: "feat/pr-1", before: f.pr.head.sha, after: s }], null)).rejects.toBeInstanceOf(LostLockError);
-    expect([t.refs.get(NAMES.main), t.prs.get(1)!.pr.head.sha]).toEqual([main, f.pr.head.sha]);
-    // Holding the current epoch, it lands, main and branch together.
+    await expect(c.moveBranches(guard, move, null)).rejects.toBeInstanceOf(LostLockError);
+    expect([t.refs.get(NAMES.main), t.prs.get(1)!.pr.head.sha]).toEqual([main, h]);
+    // Holding the current epoch, the branch moves.
     epoch = t.refs.get("q-epoch/queue")!;
-    await c.landStack({ branch: NAMES.main, before: main, after: s }, [{ branch: "feat/pr-1", before: f.pr.head.sha, after: s }], null);
-    expect([t.refs.get(NAMES.main), t.prs.get(1)!.pr.head.sha]).toEqual([s, s]);
-  });
-});
-
-describe("headsVerdict (recovery with main unmoved)", () => {
-  const heads = [
-    { pr: 1, ref: "feat/a", before: sha("h1"), after: sha("s1") },
-    { pr: 2, ref: "feat/b", before: sha("h2"), after: sha("s2") },
-  ];
-  const t = (minutes: number) => ({ since: "2026-10-21T12:00:00Z", now: new Date(Date.parse("2026-10-21T12:00:00Z") + minutes * 60_000), reconcileMinutes: 30 });
-  test("untouched: null; pushed to: headMoved; at its stack commit: unsettled, never terminal, overdue only past the window", () => {
-    expect(headsVerdict(heads, { "1": sha("h1"), "2": sha("h2") }, t(0))).toBeNull();
-    expect(headsVerdict(heads, { "1": sha("h1"), "2": sha("x") }, t(0))).toEqual({ kind: "headMoved", prs: [2] });
-    expect(headsVerdict(heads, { "1": sha("h1"), "2": null }, t(0))).toEqual({ kind: "headMoved", prs: [2] });
-    // A branch at its stack commit: main's read may lag. Even mixed with a pushed branch, it stays unsettled.
-    const half = headsVerdict(heads, { "1": sha("s1"), "2": sha("x") }, t(5));
-    expect(half).toMatchObject({ kind: "landUnsettled", overdue: false });
-    expect((half as { reason: string }).reason).toContain(`#1 to ${sha("h1")}`);
-    expect(headsVerdict(heads, { "1": sha("s1"), "2": sha("h2") }, t(30))).toMatchObject({ kind: "landUnsettled", overdue: true });
-    expect(headsVerdict(undefined, { "1": sha("s1") }, t(0))).toBeNull();
+    await c.moveBranches(guard, move, null);
+    expect(t.prs.get(1)!.pr.head.sha).toBe(s);
+    // A successor takes over between the writes: main cannot move.
+    const held = epoch;
+    await t.advanceEpoch(held, "successor 2");
+    await expect(c.landStack(land, pin, null)).rejects.toBeInstanceOf(LostLockError);
+    expect(t.refs.get(NAMES.main)).toBe(main);
+    epoch = t.refs.get("q-epoch/queue")!;
+    await c.landStack(land, pin, null);
+    expect(t.refs.get(NAMES.main)).toBe(s);
   });
 });
 
@@ -702,34 +667,58 @@ describe("the real client", () => {
   const main = { branch: NAMES.main, before: sha("B"), after: sha("Q") };
   const head = { branch: "feat/x", before: sha("H"), after: sha("S") };
 
-  test("landStack: one updateRefs, main by fast-forward, each PR branch forced but from its beforeOid", async () => {
+  const guard = { branch: NAMES.main, at: sha("B") };
+  const pin = { branch: "feat/x", at: sha("S") };
+
+  test("moveBranches: one updateRefs, main a no-op guard, a move forced but from its beforeOid, a no-op entry not forced", async () => {
     const { c, seen } = await client([ok]);
-    await c.landStack(main, [head], null);
+    await c.moveBranches(guard, [head, { branch: "feat/y", before: sha("Y"), after: sha("Y") }], null);
+    const gql = seen.filter((x) => x.url.endsWith("/graphql"));
+    expect(gql).toHaveLength(1);
+    expect(gql[0]!.body.variables.input.refUpdates).toEqual([
+      { name: `refs/heads/${NAMES.main}`, beforeOid: sha("B"), afterOid: sha("B"), force: false },
+      { name: "refs/heads/feat/x", beforeOid: sha("H"), afterOid: sha("S"), force: true },
+      { name: "refs/heads/feat/y", beforeOid: sha("Y"), afterOid: sha("Y"), force: false },
+    ]);
+  });
+
+  test("landStack: one updateRefs, main by fast-forward, each PR branch a no-op guard; nothing forced", async () => {
+    const { c, seen } = await client([ok]);
+    await c.landStack(main, [pin], null);
     const gql = seen.filter((x) => x.url.endsWith("/graphql"));
     expect(gql).toHaveLength(1);
     expect(gql[0]!.body.variables.input.refUpdates).toEqual([
       { name: `refs/heads/${NAMES.main}`, beforeOid: sha("B"), afterOid: sha("Q"), force: false },
-      { name: "refs/heads/feat/x", beforeOid: sha("H"), afterOid: sha("S"), force: true },
+      { name: "refs/heads/feat/x", beforeOid: sha("S"), afterOid: sha("S"), force: false },
     ]);
   });
 
-  test("landStack with the fence on adds the epoch entry, and refuses without one", async () => {
+  test("both with the fence on add the epoch entry, and refuse without one", async () => {
     const { c, seen } = await client([ok], "q-epoch/queue");
-    await expect(c.landStack(main, [head], null)).rejects.toThrow("needs the epoch");
-    await c.landStack(main, [head], sha("E"));
-    expect(seen.at(-1)!.body.variables.input.refUpdates.at(-1)).toEqual({ name: "refs/heads/q-epoch/queue", beforeOid: sha("E"), afterOid: sha("E"), force: false });
+    const entry = { name: "refs/heads/q-epoch/queue", beforeOid: sha("E"), afterOid: sha("E"), force: false };
+    await expect(c.landStack(main, [pin], null)).rejects.toThrow("needs the epoch");
+    await expect(c.moveBranches(guard, [head], null)).rejects.toThrow("needs the epoch");
+    await c.landStack(main, [pin], sha("E"));
+    expect(seen.at(-1)!.body.variables.input.refUpdates.at(-1)).toEqual(entry);
+    await c.moveBranches(guard, [head], sha("E"));
+    expect(seen.at(-1)!.body.variables.input.refUpdates.at(-1)).toEqual(entry);
   });
 
-  test("landStack refuses, before any request, a reserved or repeated branch, a zero or unmoved sha, and anything but main as the trunk", async () => {
+  test("both refuse, before any request, a reserved or repeated branch, a zero sha, and anything but main as the trunk", async () => {
     const { c, seen } = await client([ok]);
     const n = seen.length;
     for (const branch of [NAMES.main, NAMES.release, `${NAMES.queuePrefix}1`, `${NAMES.buildPrefix}1`, "../x", "a.lock/b"]) {
-      await expect(c.landStack(main, [{ ...head, branch }], null)).rejects.toThrow();
+      await expect(c.landStack(main, [{ ...pin, branch }], null)).rejects.toThrow();
+      await expect(c.moveBranches(guard, [{ ...head, branch }], null)).rejects.toThrow();
     }
-    await expect(c.landStack(main, [head, head], null)).rejects.toThrow("twice");
-    await expect(c.landStack(main, [{ ...head, after: "0".repeat(40) }], null)).rejects.toThrow("real object ids");
-    await expect(c.landStack(main, [{ ...head, after: head.before }], null)).rejects.toThrow("real object ids");
-    await expect(c.landStack({ ...main, branch: NAMES.release }, [head], null)).rejects.toThrow("moves main");
+    await expect(c.landStack(main, [pin, pin], null)).rejects.toThrow("twice");
+    await expect(c.moveBranches(guard, [head, head], null)).rejects.toThrow("twice");
+    await expect(c.landStack(main, [{ ...pin, at: "0".repeat(40) }], null)).rejects.toThrow("real object id");
+    await expect(c.moveBranches(guard, [{ ...head, after: "0".repeat(40) }], null)).rejects.toThrow("real object id");
+    await expect(c.moveBranches({ ...guard, at: "0".repeat(40) }, [head], null)).rejects.toThrow("real object id");
+    await expect(c.landStack({ ...main, after: main.before }, [pin], null)).rejects.toThrow("real object id");
+    await expect(c.landStack({ ...main, branch: NAMES.release }, [pin], null)).rejects.toThrow("moves main");
+    await expect(c.moveBranches({ ...guard, branch: NAMES.release }, [head], null)).rejects.toThrow("main");
     await expect(c.landStack(main, [], null)).rejects.toThrow("1 to");
     expect(seen.length).toBe(n);
   });

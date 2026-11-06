@@ -428,7 +428,17 @@ function processVerify(c: Ctx): void {
       pause(c, `#${v.pr}: landed pin ${v.pin} is not reachable from main`);
       continue;
     }
-    if (!pr.open) continue;
+    if (!pr.open) {
+      if (!v.admitted) continue;
+      // Linear landing (DESIGN.md §7.4): the change is on main, so say so; the wait is for a mark that may still arrive.
+      if (c.snap.now.getTime() - Date.parse(v.since) < VERIFY_MIN_MINUTES * 60_000) {
+        keep.push(v);
+        continue;
+      }
+      unready(c, v.pr, tag);
+      comment(c, v.pr, `${tag}:closed`, `Landed revision \`${v.admitted}\` in main as \`${v.pin}\` (\`${v.landedIn}\`), but GitHub closed this PR without marking it merged. Its change is on main; nothing is lost and nothing needs doing.`);
+      continue;
+    }
     // Linear landing (DESIGN.md §7.4): the branch still reading at its admitted head is not a push; it waits like an unmarked PR.
     if (pr.head !== v.pin && pr.head !== v.admitted) {
       unready(c, v.pr, tag);

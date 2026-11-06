@@ -95,7 +95,7 @@ Setup creates the release App, and the `release-write` environment in step 2, on
 | App | Repository permissions |
 | --- | --- |
 | queue App | Contents: write, Workflows: write, Pull requests: write, Actions: write, Checks: read, Commit statuses: read, Metadata: read |
-| release App | Contents: write, Workflows: write, Actions: read, Checks: read, Commit statuses: read, Metadata: read. With [`release.mode: dispatch`](how-it-works.md#dispatch-mode-opt-in), Actions: write, plus Variables: read if `release.dispatch.freeze` is set. |
+| release App | Contents: write, Workflows: write, Actions: read, Checks: read, Commit statuses: read, Metadata: read. With [`release.mode: dispatch`](how-it-works.md#dispatch-mode-opt-in), least privilege instead: Actions: write, Contents: read (write only with the epoch fence), no Workflows, Checks: read, Commit statuses: read, Metadata: read, plus Variables: read if `release.dispatch.freeze` is set. |
 | state App | Contents: write, Metadata: read |
 
 1. Install the queue and release Apps on the target only.

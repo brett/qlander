@@ -171,7 +171,7 @@ If promoting a commit means more than moving a branch (migrations, a deploy, smo
 4. **Real run.** Qlander dispatches the workflow again with the dry-run input `"false"`, once per sha, and only within [`dryRunValidMinutes`](configuration.md#releasedispatch) of the green dry run.
 5. **Advanced.** Release counts as advanced only when qlander sees `release` at the commit.
 
-Your workflow needs a `workflow_dispatch` trigger with the three inputs named in [`release.dispatch.inputs`](configuration.md#releasedispatchinputs), and a `run-name` that contains the dispatch id, which is how qlander finds the run it started:
+Your workflow needs a `workflow_dispatch` trigger with the three inputs named in [`release.dispatch.inputs`](configuration.md#releasedispatchinputs), and a `run-name` that contains the dispatch id, which is how qlander finds the run it started. A run counts only if GitHub also reports the release App's bot, [`release.dispatch.actor`](configuration.md#releasedispatchactor), as the account that started it and triggered its latest attempt, so a copy of the id in someone else's run is ignored:
 
 ```yaml
 on:
@@ -195,7 +195,7 @@ What happens when something goes wrong:
 | A newer commit qualifies | It replaces a candidate waiting for approval at once, and one whose dry run is running once that run ends. A real run is always followed to its end first. |
 | A freeze variable is set | No new dispatch until it is cleared. See [`release.dispatch.freeze`](configuration.md#releasedispatchfreeze). |
 
-Pauses, the lease and the dispatch budget work as for the rest of the release job. The release App needs **Actions: write** on the target in this mode. See [DESIGN.md, Dispatch mode](../DESIGN.md#81-dispatch-mode-opt-in).
+Pauses, the lease and the dispatch budget work as for the rest of the release job. Before the real run, qlander checks the dry run again: a rerun that failed, or a green run older than the window, stops it. In this mode the release App needs **Actions: write**, keeps only **Contents: read** (write only with the epoch fence) and no Workflows permission, and must not bypass the release ruleset, so it cannot move `release` itself. See [DESIGN.md, Dispatch mode](../DESIGN.md#81-dispatch-mode-opt-in).
 
 ## State
 

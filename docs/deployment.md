@@ -161,7 +161,7 @@ With the epoch fence:
 - **R5 in this mode:** takeover needs the holder's job `completed` **and** now ≥ `acquiredAt + jobTimeoutMinutes + takeoverGraceMinutes`. The new owner's first act is to advance the epoch (§3.4), which invalidates every ref write the old owner could still make.
 - **What stays exposed after a resume:** writes that are not ref updates, which the epoch cannot cover:
   - a comment (cosmetic, marker-deduplicated);
-  - a label removal (it could unready a PR the successor re-admitted: wrong but visible, and the PR is re-added by hand);
+  - a label removal (it could take `ready` off a PR the successor re-admitted: wrong but visible, and someone adds `ready` back by hand);
   - a failed-job rerun or a cancel on the old owner's own runs (cost only);
   - `POST /merges` onto a build ref (the successor deletes or never reuses that ref; a later merge fails with 404 or 409).
 
@@ -170,8 +170,8 @@ With the epoch fence:
 **Both modes are supported.** Hosted mode relies on the GitHub behaviour that experiment H1 (§3.4) checks. The target needs the two epoch rulesets (§3.4) before the first hosted tick.
 
 Other hosted-runner caveats, which affect liveness and cost, not safety:
-- **Cron is best effort.** GitHub delays scheduled runs under load, and in **public** repos it disables scheduled workflows after 60 days without repository activity. The watchdog alerts on "ticks stopped" and "tick workflow disabled".
-- **Minutes are rounded up per job.** Two jobs every 10 minutes is about 8,600 billed minutes a month, above the minutes included with the Free and Team plans for a private control repo. Raise `cronMinutes` (R6 then allows a longer lease) or use a public control repo. The control repo's visibility must be at least as restrictive as the target's, because job logs and mirror issues show PR numbers, branches and job names. `audit` (its control checks) checks this.
+- **Cron is best effort.** GitHub delays scheduled runs under load, and in **public** repos it disables scheduled workflows after 60 days without repository activity. The watchdog alerts on "ticks stopped" and "tick workflow disabled". [Getting started, When ticks run](getting-started.md#when-ticks-run) says what to expect on a new repo.
+- **Minutes are rounded up per job.** Two jobs every 10 minutes is about 8,600 billed minutes a month, above the minutes included with the Free and Team plans for a private control repo. Raise `cronMinutes` (R6 then allows a longer lease) or use a public control repo. The control repo's visibility must be at least as restrictive as the target's, because job logs and mirror issues show PR numbers, branches and job names. `audit` check C6 enforces this.
 
 ### 3.4 The epoch fence
 
@@ -452,4 +452,4 @@ Rolling back a version rolls back **code**, not **state**. `StateStore.open` wri
 
 ### 8.2 The policy hash
 
-`policyHash(cfg)` is `v2:` followed by 16 hex digits of the sha256 of a canonical, sorted projection of the policy-relevant config. Every authorisation records it, and revalidation drops a PR whose recorded hash differs: the PR loses `ready` and gets a comment. So **any change to policy-relevant config unreadies every admitted PR at the next unpaused tick**, because the rules it was admitted under have changed. Apply a policy change while nothing is admitted. The projection leaves out `hooks`, `tokens`, `bundle`, `notify`, `comments`, `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `runner` (its timings feed hashed values, §3.5) and `release` except `branch`, `stateBranch` and `labels`. Everything else is in it, including `control.repo`, `queue.historyLimit` and `watchdog.labels`. A new optional key is left out while it is unset, so adding it to the code changes no existing deployment's hash.
+`policyHash(cfg)` is `v2:` followed by 16 hex digits of the sha256 of a canonical, sorted projection of the policy-relevant config. Every authorisation records it, and revalidation drops a PR whose recorded hash differs: the PR loses `ready` and gets a comment. So **any change to policy-relevant config takes `ready` off every admitted PR at the next unpaused tick**, because the rules it was admitted under have changed. Apply a policy change while nothing is admitted. The projection leaves out `hooks`, `tokens`, `bundle`, `notify`, `comments`, `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `runner` (its timings feed hashed values, §3.5) and `release` except `branch`, `stateBranch` and `labels`. Everything else is in it, including `control.repo`, `queue.historyLimit` and `watchdog.labels`. A new optional key is left out while it is unset, so adding it to the code changes no existing deployment's hash.

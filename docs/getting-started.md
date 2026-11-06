@@ -1,6 +1,6 @@
 # Getting started
 
-This guide sets up qlander for one repository, from nothing to live. An org admin does it once. Nothing lands until the [rollout](#10-roll-out) gates pass.
+This guide sets up qlander for one repository, from nothing to live. An owner of the organization does it once. Nothing lands until the [rollout](#10-roll-out) gates pass.
 
 You end up with:
 

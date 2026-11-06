@@ -2,7 +2,10 @@
 
 This repo runs qlander for one target repo, and its issues and state are the queue's live controls. Read before you act, and stop and report when you're unsure.
 
-`qlander <command>` below means `bun "${bundle:?}" <command> --config qlander.yml`, run from this repo's root with the bundle downloaded as [README.md](README.md) shows and `GH_TOKEN=$(gh auth token)` set. There is no `qlander` binary. `version` takes no `--config`: run it as `bun "${bundle:?}" version`. Some commands need arguments: `qlander check-state queue|release <file>`, `qlander pause queue|release|both`, `qlander resume queue|release|both [--all]`, `qlander remove|requeue|prioritise <pr>` and `qlander unquiesce [--all]`.
+`qlander <command>` below means `bun "${bundle:?}" <command> --config qlander.yml`, run from this repo's root with the bundle downloaded as [README.md](README.md) shows and `GH_TOKEN=$(gh auth token)` set. There is no `qlander` binary.
+
+- `version` takes no `--config`: run it as `bun "${bundle:?}" version`.
+- These commands need arguments: `qlander check-state queue|release <file>`, `qlander pause queue|release|both`, `qlander resume queue|release|both [--all]`, `qlander remove|requeue|prioritise <pr>` and `qlander unquiesce [--all]`.
 
 The label names below are the defaults. The real ones are in `qlander.yml`: `queue.controlLabels.pause`, `release.labels.pause`, `release.labels.alert` and `watchdog.labels`.
 

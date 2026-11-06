@@ -99,7 +99,7 @@ Run `bun "${bundle:?}" <command> --config qlander.yml` from the control repo's r
 | `verify-sandbox <phase> …` | Runs rollout gate G1 against a sandbox repo. See [Getting started, Running G1](getting-started.md#running-the-sandbox-check). |
 | `pause`, `resume`, `remove`, `requeue`, `prioritise`, `approve-policy`, `quiesce`, `unquiesce` | Control commands. See [below](#controlling-the-queue-from-the-command-line). |
 
-With the bundle, always pass `--config`. Without it, the bundle looks for `qlander.yml` relative to where the bundle file is, not in the control repo. Only in source mode (`bun src/cli.ts`) does `--config` default to the control repo's own `qlander.yml`, next to the source. The tick and the watchdog always read their own checkout's file.
+Without `--config`, the bundle looks for `qlander.yml` relative to where the bundle file is, not in the control repo. Only in source mode (`bun src/cli.ts`) does `--config` default to the control repo's own `qlander.yml`, next to the source. The tick and the watchdog always read their own checkout's file.
 
 ### Watching the queue
 
@@ -159,7 +159,12 @@ A missing queue state branch is fine: a queue no live tick has run has nothing i
 
 When a branch is fine to be missing, `quiesce` prints `(absent: no live tick has written state)` or `(absent: release job has never written state)` in place of that commit.
 
-**When it refuses for the state.** At the first step, nothing has changed and ticks keep running, so wait and run it again. Verifying a landed PR and delivering a notice take a tick or two. A batch that was abandoned or stopped leaves a `cancelRuns` entry, which stays for at least `queue.timeouts.cancelWindowMinutes` (30 in the template) to catch runs published late. The refusal prints the time, and it can't be cleared sooner. A tick has to run after that time, so dispatch one if the cron is late. If runs were never seen on that branch, it stays until the later time printed (`queue.timeouts.cancelGiveUpHours`). On a busy queue, `pause both` first stops new batches, and with them new entries, while ticks still clear the old ones. `resume both` lifts that pause. If it refuses at step 4, nothing runs to clear the state: run `unquiesce` to go back, then wait.
+**When it refuses for the state:**
+
+- **At step 1,** nothing has changed and ticks keep running, so wait and run it again. Verifying a landed PR or delivering a notice takes a tick or two.
+- **A `cancelRuns` entry** is left by a batch that was abandoned or stopped. It stays for at least `queue.timeouts.cancelWindowMinutes` (30 in the template), to catch runs that appear late, and it can't be cleared sooner. The refusal prints the time. A tick has to run after that time, so dispatch one if the cron is late. If no runs were ever seen on that branch, the entry stays until the later time printed (`queue.timeouts.cancelGiveUpHours`).
+- **On a busy queue,** run `pause both` first. It stops new batches, and so new entries, while ticks still clear the old ones. `resume both` lifts that pause.
+- **At step 4,** nothing runs to clear the state, so run `unquiesce` to go back, then wait.
 
 **With `--dry-run`** it exits 0 only if the state is idle now and no tick run is in progress or queued. It exits 1 if a real run would refuse at the first step, or if it reads a running tick or anything else not idle (`not idle now`). A real run would wait for that tick.
 
@@ -337,4 +342,4 @@ These comments are always posted, and most ask someone to act:
 
 Two comments only report progress: **queued** ("Queued in batch N at ...") and **landed** ("Landed in main at ..."). You can leave out either with [`comments.omit`](configuration.md#comments). The schema refuses any other value.
 
-Leaving them out changes only who is notified. No decision reads a comment back. Each batch and landing is still recorded in the queue state's history, in each merge commit's message and in the lifecycle [hooks](hooks.md). A comment already waiting in the outbox when the setting changes is still posted. `comments` is not part of the policy hash, so changing it doesn't unready the queue.
+Leaving them out changes only who is notified. No decision reads a comment back. Each batch and landing is still recorded in the queue state's history, in each merge commit's message and in the lifecycle [hooks](hooks.md). A comment already waiting in the outbox when the setting changes is still posted. `comments` is not part of the policy hash, so changing it doesn't take `ready` off admitted PRs.

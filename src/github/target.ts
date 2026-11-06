@@ -8,7 +8,7 @@ import type { CheckRun, IssueComment, Job, Run } from "../types";
 import type { Names } from "../config";
 import { refsOverlap } from "../config/runner";
 import { EVENT_TYPE_RE } from "../hooks";
-import { BRANCH_NAME_RE, isBuildRef, isCommandLabel, isQlanderBranch, isPrNumber, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../validate";
+import { BRANCH_NAME_RE, isBuildRef, isCommandLabel, isForbiddenHeadRef, isQlanderBranch, isPrNumber, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../validate";
 import type { Account, TargetApi, Commit, Compare, LabelEvent, Listed, MergeResult, PullRequest, RefActivity, RefUpdate, Review, Status, StatusEntry } from "./api";
 
 /** git's empty tree: every epoch commit has it (docs/deployment.md §3.4). */
@@ -20,6 +20,8 @@ const UPDATE_REFS = "mutation($input: UpdateRefsInput!) { updateRefs(input: $inp
 const MAX_LOG_BYTES = 2_000_000;
 /** One job log download, both requests and the body, must finish within this. */
 const LOG_TIMEOUT_MS = 15_000;
+/** The most PR branches one linear landing moves: a batch is never larger (queue.batch.max and the adaptive ceiling are far below it). */
+export const LAND_STACK_MAX = 100;
 /** GitHub lists at most this many files in a compare; reaching it means the list may be cut. */
 const COMPARE_FILE_CAP = 300;
 import { GitHubError, Http, type HttpOptions, isGraphqlInternal } from "./http";
@@ -145,15 +147,17 @@ export class TargetClient implements TargetApi {
   }
 
   async getCommit(s: string): Promise<Commit> {
-    const r = await this.http.request<{ sha: string; parents: { sha: string }[]; commit: { verification?: { verified: boolean; reason: string } } }>(
+    const r = await this.http.request<{ sha: string; parents: { sha: string }[]; commit: { tree?: { sha?: unknown }; verification?: { verified: boolean; reason: string } } }>(
       "GET",
       `${this.path}/commits/${sha(s, "commit")}`,
     );
+    const tree = r.json.commit.tree?.sha;
     return {
       sha: sha(r.json.sha, "commit"),
       parents: r.json.parents.map((p) => sha(p.sha, "parent")),
       verified: r.json.commit.verification?.verified === true,
       reason: r.json.commit.verification?.reason ?? "unknown",
+      ...(typeof tree === "string" ? { tree: sha(tree, "tree") } : {}),
     };
   }
 
@@ -183,6 +187,28 @@ export class TargetClient implements TargetApi {
       truncated: truncated || items.length < f.ahead_by || fileCount >= COMPARE_FILE_CAP,
       commitsTruncated: truncated || items.length < f.ahead_by,
     };
+  }
+
+  /**
+   * A PR head branch (linear landing, DESIGN.md §7.4): a branch name git
+   * accepts, and never one qlander reserves (main, release, the batch
+   * prefixes) or the epoch branch.
+   */
+  private prBranch(b: string): string {
+    if (!BRANCH_NAME_RE.test(b) || b.length > 255 || b.split("/").some((c) => c.endsWith(".lock"))) bad(`bad branch name ${b}`);
+    if (isForbiddenHeadRef(this.names, b) || isQlanderBranch(this.names, b)) bad(`'${b}' is reserved, never a PR head qlander moves`);
+    if (this.epochBranch !== null && refsOverlap(b, this.epochBranch)) bad(`'${b}' overlaps the epoch branch`);
+    return b;
+  }
+
+  async getPrBranch(branch: string): Promise<string | null> {
+    try {
+      const r = await this.http.request<{ object: { sha: string } }>("GET", `${this.path}/git/ref/heads/${this.prBranch(branch)}`);
+      return sha(r.json.object.sha, `ref ${branch}`);
+    } catch (e) {
+      if (e instanceof GitHubError && e.kind === "not_found") return null;
+      throw e;
+    }
   }
 
   // ---------------------------------------------------------------- pull requests
@@ -500,6 +526,31 @@ export class TargetClient implements TargetApi {
       if (e instanceof GitHubError && e.kind === "conflict") return { kind: "conflict" };
       throw e;
     }
+  }
+
+  async createCommit(tree: string, parent: string, message: string): Promise<string> {
+    this.can("queueOps");
+    if (message.length === 0 || message.length > 65_000 || message.includes("\0")) bad("bad commit message");
+    const r = await this.http.request<{ sha: string }>("POST", `${this.path}/git/commits`, { body: { message, tree: oid(tree, "tree"), parents: [oid(parent, "parent")] } });
+    return oid(r.json.sha, "commit");
+  }
+
+  async landStack(main: RefUpdate, heads: RefUpdate[], epoch: string | null): Promise<void> {
+    this.can("queueOps");
+    if (main.branch !== this.names.main) bad("landStack moves main");
+    if (heads.length === 0 || heads.length > LAND_STACK_MAX) bad(`landStack takes 1 to ${LAND_STACK_MAX} PR branches`);
+    const all = [main, ...heads];
+    for (const u of all) if (!isRealSha(u.before) || !isRealSha(u.after) || u.before === u.after) bad(`${u.branch}: not a move between two real object ids`);
+    for (const h of heads) this.prBranch(h.branch);
+    if (new Set(all.map((u) => u.branch)).size !== all.length) bad("a branch twice in one update");
+    if ((epoch === null) !== (this.epochBranch === null)) bad(epoch === null ? "the epoch fence is on: landStack needs the epoch" : "the epoch fence is off");
+    const refUpdates = [
+      { name: `refs/heads/${main.branch}`, beforeOid: main.before, afterOid: main.after, force: false },
+      // A PR branch moves to a commit that does not contain its old head: force, but only from the recorded beforeOid.
+      ...heads.map((h) => ({ name: `refs/heads/${h.branch}`, beforeOid: h.before, afterOid: h.after, force: true })),
+      ...(epoch !== null ? [{ name: `refs/heads/${this.epochBranch}`, beforeOid: oid(epoch, "epoch"), afterOid: epoch, force: false }] : []),
+    ];
+    await this.http.graphql(UPDATE_REFS, { input: { repositoryId: this.nodeId, refUpdates } }, true);
   }
 
   async rerunFailedJobs(id: number): Promise<void> {

@@ -50,11 +50,14 @@ export function fenced(
   const ownershipUnknown = new WeakSet<object>();
 
   /** One atomic call with the epoch entry. A rejection after the epoch moved is a lost lease, not a GitHub error. */
-  const epochWrite = async (writes: RefUpdate[]): Promise<void> => {
+  const epochWrite = (writes: RefUpdate[]): Promise<void> => epochCall((e) => target.epochUpdateRefs(writes, e));
+
+  /** `send` makes one atomic ref write carrying epoch `e` (epochUpdateRefs, or a linear landing). */
+  const epochCall = async (send: (e: string) => Promise<void>): Promise<void> => {
     const e = epoch!();
     if (e === null) throw new LostLockError("no epoch taken this tick; not writing refs");
     try {
-      await target.epochUpdateRefs(writes, e);
+      await send(e);
     } catch (err) {
       // Asked on the write path, not read: a lagging read could show our own
       // earlier epoch (a false lost lease) or hide a successor's (a missed one).
@@ -168,6 +171,7 @@ export function fenced(
     listStatuses: (s) => target.listStatuses(s),
     listCommitStatuses: (s) => target.listCommitStatuses(s),
     getDataFile: (p, r) => target.getDataFile(p, r),
+    getPrBranch: (b) => target.getPrBranch(b),
     readEpoch: () => target.readEpoch(),
     epochHeld: (e) => target.epochHeld(e),
     advanceEpoch: guard((before: string | null, m: string) => target.advanceEpoch(before, m)),
@@ -181,6 +185,12 @@ export function fenced(
     deleteRef: guard(refs.deleteRef),
     updateRef: guard(refs.updateRef),
     merge: guard((b: string, h: string, m: string) => target.merge(b, h, m)),
+    createCommit: guard((t: string, p: string, m: string) => target.createCommit(t, p, m)),
+    // Linear landing (DESIGN.md §7.4): the epoch is this tick's, never the caller's.
+    landStack: guard(async (m: RefUpdate, h: RefUpdate[], e: string | null) => {
+      if (e !== null) throw new LostLockError("landStack takes its epoch from the fence, not the caller");
+      return epoch === null ? target.landStack(m, h, null) : epochCall((x) => target.landStack(m, h, x));
+    }),
     rerunFailedJobs: guard((id: number) => target.rerunFailedJobs(id)),
     cancelRun: guard((id: number) => target.cancelRun(id)),
     comment: guard((n: number, body: string) => target.comment(n, body)),

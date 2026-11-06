@@ -9,6 +9,8 @@ export interface Commit {
   parents: string[];
   verified: boolean;
   reason: string;
+  /** The commit's tree (absent when the read did not return one). Linear landing (DESIGN.md §7.4) builds each stack commit on a merge commit's tree. */
+  tree?: string;
 }
 
 /** A GitHub account as the API resolves it (a commit's author is null when its email maps to no account). */
@@ -187,11 +189,34 @@ export interface TargetApi {
    */
   epochHeld(epoch: string): Promise<boolean>;
 
+  /**
+   * A PR's head branch, read only for linear landing (DESIGN.md §7.4): the
+   * commit it points at, or null if it does not exist. Refused for main,
+   * release, the batch refs and anything else qlander reserves.
+   */
+  getPrBranch(branch: string): Promise<string | null>;
+
   // writes (each refused unless the client's role allows it)
   createRef(branch: string, sha: string): Promise<void>;
   deleteRef(branch: string): Promise<void>;
   updateRef(branch: string, before: string, after: string): Promise<void>;
   merge(base: string, headSha: string, message: string): Promise<MergeResult>;
+  /**
+   * Linear landing (DESIGN.md §7.4): a new commit with this tree and exactly
+   * one parent, through the git data API, with GitHub's own author and
+   * signature. Returns its sha. Queue only.
+   */
+  createCommit(tree: string, parent: string, message: string): Promise<string>;
+  /**
+   * Linear landing (DESIGN.md §7.4): one atomic GraphQL updateRefs that moves
+   * main by fast-forward (`force: false`, beforeOid `main.before`) and every
+   * PR head branch in `heads` from its admitted head to its stack commit
+   * (`force: true`, so a non-fast-forward, but still with beforeOid: a branch
+   * someone pushed to is refused, and with it the whole call). `epoch` is the
+   * epoch entry's commit with the epoch fence on, and null with it off; the
+   * fenced client (src/fenced.ts) fills it in, so callers pass null.
+   */
+  landStack(main: RefUpdate, heads: RefUpdate[], epoch: string | null): Promise<void>;
   rerunFailedJobs(runId: number): Promise<void>;
   cancelRun(runId: number): Promise<void>;
   /** Post a comment; returns its id (the delivery receipt). */

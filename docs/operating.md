@@ -224,7 +224,7 @@ Qlander's own PR CI and the watchdog run on GitHub-hosted runners, never on thes
 
 ### A job still running after its run finished
 
-GitHub sometimes reports a job as `in_progress` after its workflow run has completed: the job's `status` isn't `completed`, but it already has a `conclusion` and a `completed_at`. Qlander counts a job as done only when its `status` says so. Until then the batch is pending, and its time limits may not end the wait.
+GitHub sometimes reports a job as `in_progress` after its workflow run has completed: the job's `status` isn't `completed`, but it already has a `conclusion` and a `completed_at`. Qlander counts a job as done only when its `status` says so, so the batch stays pending. Once the job is past its time limit (`timeouts.inProgressMinutes`, or `queuedHours` for a job still queued), qlander pauses the queue with the reason `CI run <id> completed, but job '<name>' still shows <status> past its time limit` and puts the batch back. Versions before 0.2.3 wait with no limit.
 
 If a batch shows a job still running long after its run finished, look at the run's jobs:
 

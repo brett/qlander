@@ -9,6 +9,8 @@ Start at the pinned **qlander status** issue in the control repo.
 | A `qlander alert: <kind>` issue | [Alert issues](#alert-issues) |
 | A PR dropped from the queue, or commented on | [Bouncing, isolating and landing PRs](#bouncing-isolating-and-landing-prs), [PR comments](#pr-comments) |
 | A need for the live queue state | [Watching the queue](#watching-the-queue), [Inspecting state](#inspecting-state) |
+| A batch still pending long after its CI run finished | [A job still running after its run finished](#a-job-still-running-after-its-run-finished) |
+| A need to rename the control repo, an App or a label | [Renaming the control repo, an App or a label](#renaming-the-control-repo-an-app-or-a-label) |
 
 In the commands, `$R` is the control repo, as `owner/name`.
 
@@ -75,28 +77,29 @@ With [`queue.labels.priority`](configuration.md#queuelabels) set, add that label
 - **The running batch.** By default it is left alone, so priority builds right after that batch lands or fails. With `queue.concurrency` and a free slot, it builds alongside the running batch at once.
 - **Preemption.** With `queue.priority.preempt: true`, a running batch whose CI is still pending is stopped instead. Its runs are cancelled, and its PRs are retested right after the priority batch, in the same order. This happens at most once per batch, and never while it is landing. The stopped run still counts against both budgets, and the retest costs another run.
 - **Undoing it.** Removing the label returns the PR to its place. The PR's queued and landing comments say who prioritised it.
+- **It stays on.** Qlander never removes the priority label, not when the PR lands and not when it is bounced. If a bounced PR gets `ready` again with the label still on, it goes first again, so remove the label unless it should.
 
 Use it for a fix that must land now: `main` is red, a security advisory, a deploy blocker. Don't use it to shorten the wait for routine work: every use pushes every other PR back by a batch, and every preemption also costs a full-suite run. See [DESIGN.md, Order](../DESIGN.md#44-order).
 
 ## The command line
 
-Run `bun "${bundle:?}" <command> --config qlander.yml` from the control repo's root, with the bundle downloaded as [Getting started](getting-started.md#before-you-start) shows. The examples below leave out `--config qlander.yml`; add it.
+Run `bun "${bundle:?}" <command> --config qlander.yml` from the control repo's root, with the bundle downloaded as [Getting started](getting-started.md#before-you-start) shows. With the bundle, pass `--config qlander.yml` to every command except `version`, which takes no arguments. The examples below leave it out.
 
 | Command | What it does |
 | --- | --- |
 | `tick queue\|release [--config <file>]` | One tick of that job: what `tick.yml` runs. |
 | `watchdog [--config <file>]` | One watchdog run: what `watchdog.yml` runs. |
-| `check-state queue\|release <file> [--config <file>]` | Whether this version reads a state document (a copy of a state branch's `state.json`) and writes it back unchanged. Exits 1 if it refuses it, as a tick would. |
+| `check-state queue\|release <file> [--config <file>]` | Whether this version reads a state document (a copy of a state branch's `state.json`), and whether it would write it back unchanged or changed. It writes nothing, and exits 0 either way. Exits 1 if it refuses the document, as a tick would. |
 | `version` | Prints this version. |
 | `validate [--config <file>]` | Checks a config and prints every problem. Exits 1 if it is invalid. |
 | `render [--check] [--config <file>]` | Writes the workflows under the config file's directory. With `--check` it writes nothing, and exits 1 if a checked-in one differs. |
 | `status [--json] [--watch <seconds>] [--config <file>]` | Shows the live queue, read-only. Exits 3 if a read failed. See [Watching the queue](#watching-the-queue). |
-| `audit [--target-only\|--control-only] [--json] [--config <file>]` | Checks the target's CI requirements and the control repo's protection, read-only. Exits 1 on a `FAIL` that a failed read didn't cause, else 3 if a read failed. See [Getting started, step 9](getting-started.md#9-prepare-the-target). |
+| `audit [--target-only\|--control-only] [--json] [--queue-app <slug>] [--release-app <slug>] [--state-app <slug>] [--config <file>]` | Checks the target's CI requirements and the control repo's protection, read-only. Exits 1 on a `FAIL` that a failed read didn't cause, else 3 if a read failed. See [Getting started, step 9](getting-started.md#9-prepare-the-target). |
 | `setup …` | Creates and checks the Apps, installations and repo settings. See [Getting started](getting-started.md#let-setup-do-most-of-it). |
 | `verify-sandbox <phase> …` | Runs rollout gate G1 against a sandbox repo. See [Getting started, Running G1](getting-started.md#running-the-sandbox-check). |
 | `pause`, `resume`, `remove`, `requeue`, `prioritise`, `approve-policy`, `quiesce`, `unquiesce` | Control commands. See [below](#controlling-the-queue-from-the-command-line). |
 
-`--config` defaults to the control repo's own `qlander.yml`, next to the source. The tick and the watchdog always read their own checkout's file.
+Without `--config`, the bundle looks for `qlander.yml` relative to where the bundle file is, not in the control repo. Only in source mode (`bun src/cli.ts`) does `--config` default to the control repo's own `qlander.yml`, next to the source. The tick and the watchdog always read their own checkout's file.
 
 ### Watching the queue
 
@@ -156,7 +159,12 @@ A missing queue state branch is fine: a queue no live tick has run has nothing i
 
 When a branch is fine to be missing, `quiesce` prints `(absent: no live tick has written state)` or `(absent: release job has never written state)` in place of that commit.
 
-**When it refuses for the state.** At the first step, nothing has changed and ticks keep running, so wait and run it again. Verifying a landed PR and delivering a notice take a tick or two. A batch that was abandoned or stopped leaves a `cancelRuns` entry, which stays for at least `queue.timeouts.cancelWindowMinutes` (30 in the template) to catch runs published late. The refusal prints the time, and it can't be cleared sooner. A tick has to run after that time, so dispatch one if the cron is late. If runs were never seen on that branch, it stays until the later time printed (`queue.timeouts.cancelGiveUpHours`). On a busy queue, `pause both` first stops new batches, and with them new entries, while ticks still clear the old ones. `resume both` lifts that pause. If it refuses at step 4, nothing runs to clear the state: run `unquiesce` to go back, then wait.
+**When it refuses for the state:**
+
+- **At step 1,** nothing has changed and ticks keep running, so wait and run it again. Verifying a landed PR or delivering a notice takes a tick or two.
+- **A `cancelRuns` entry** is left by a batch that was abandoned or stopped. It stays for at least `queue.timeouts.cancelWindowMinutes` (30 in the template), to catch runs that appear late, and it can't be cleared sooner. The refusal prints the time. A tick has to run after that time, so dispatch one if the cron is late. If no runs were ever seen on that branch, the entry stays until the later time printed (`queue.timeouts.cancelGiveUpHours`).
+- **On a busy queue,** run `pause both` first. It stops new batches, and so new entries, while ticks still clear the old ones. `resume both` lifts that pause.
+- **At step 4,** nothing runs to clear the state, so run `unquiesce` to go back, then wait.
 
 **With `--dry-run`** it exits 0 only if the state is idle now and no tick run is in progress or queued. It exits 1 if a real run would refuse at the first step, or if it reads a running tick or anything else not idle (`not idle now`). A real run would wait for that tick.
 
@@ -213,6 +221,43 @@ Restart the controller only when both checks pass. Afterwards, re-enable the wor
 VMs the controller adopts after a restart may be bounded only later than either job's takeover window: see [DESIGN.md, Documented residual risks](../DESIGN.md#151-documented-residual-risks). `bun "${bundle:?}" quiesce` runs steps 1 to 3 and the state check as [one command](#quiesce).
 
 Qlander's own PR CI and the watchdog run on GitHub-hosted runners, never on these pools.
+
+### A job still running after its run finished
+
+GitHub sometimes reports a job as `in_progress` after its workflow run has completed: the job's `status` isn't `completed`, but it already has a `conclusion` and a `completed_at`. Qlander counts a job as done only when its `status` says so, so the batch stays pending. Once the job is past its time limit (`timeouts.inProgressMinutes`, or `queuedHours` for a job still queued), qlander pauses the queue with the reason `CI run <id> completed, but job '<name>' still shows <status> past its time limit` and puts the batch back. Versions before 0.2.3 wait with no limit.
+
+From 0.2.3, check the run as below, then close the pause issue: the batch's PRs kept `ready` and their place, and the next batch runs on a new CI run. On earlier versions, or if a batch shows a job still running long after its run finished, look at the run's jobs:
+
+```sh
+gh api "repos/<target>/actions/runs/<run id>/jobs" --jq '.jobs[] | {name, status, conclusion, completed_at}'
+```
+
+If a job has a `conclusion` and a `completed_at` but its `status` isn't `completed`, bounce one PR in the batch: add `qlander:bounce`, run `remove <pr>`, or remove `ready`. The batch is abandoned, and any other PRs in it are rebuilt on a new CI run.
+
+1. Wait for a tick to take the PR out: `status --json` no longer lists it, and the bounce label, if you used one, is gone. Adding `ready` back sooner can leave its admission, and the stuck batch, in place.
+2. Add `ready` back to it (`requeue <pr>`). Its fast lane must still be green on the same head.
+3. Check the batch's other PRs. If its retry budget had run out, they lose `ready` instead of being rebuilt, so add it back to each.
+
+### Renaming the control repo, an App or a label
+
+Rename with nothing admitted and both jobs stopped. GitHub redirects an old repo name for git and REST, but qlander refuses redirects, so anything that still uses an old name fails at its first request, before it reads or writes. A half-done rename stops the queue, and it never writes under the wrong name.
+
+| You rename | What uses the old name |
+| --- | --- |
+| The control repo | `control.repo`, which is in the policy hash. The rendered `tick.yml`, which mints the state App's token for that repo name. `setup`, whose default App prefix is the control repo's name, and `audit`, whose default App slugs are `<control repo name>-queue`, `-release` and `-state`. In `self-hosted-kill` mode, the runner group's workflow restriction. |
+| An App | Its slug: `audit`'s default slugs, and `setup`, which finds each App and its key (`<keys-dir>/<slug>.pem`, or `--key-cmd` run with the slug) by `<prefix>-queue`, `-release` and `-state`. So rename all the Apps to one new prefix, or `setup` can't find them. The App id, client id, installations and keys stay the same, so the tick and the ruleset bypasses keep working. |
+| A label | Its name in `qlander.yml` (`queue.labels`, `queue.controlLabels`, `release.labels`, `watchdog.labels`), most of which are in the policy hash. Qlander reads `ready`, each operator label and the priority label from the PR's latest `labeled` event with exactly that name, and a renamed label's old events keep the old name. The watchdog finds the status issue by its label. |
+
+Renaming a GitHub App is done in a browser only: in the App's settings, on **General**, change **GitHub App name** and save. Its slug and its bot's login change.
+
+1. **Let the queue empty.** Ask people to stop adding `ready`, and wait until `status --json` exits 0 with `active` null and `concurrent`, `pending`, `solo` and `queued` empty. `queued` lists the admitted PRs, which would all lose `ready` when the policy hash changes.
+2. **Stop both jobs.** Run `quiesce`, then `status --json` again. `quiesce` doesn't check for admitted PRs, so if `queued` isn't empty, run `unquiesce`, wait, and start again.
+3. **Stop the watchdog:** `gh workflow disable watchdog.yml -R "$R"`. A watchdog run that reads one label name while the issue has the other opens a second status issue. Disabling doesn't stop a run already started, so wait until `gh run list -R "$R" --workflow watchdog.yml --status in_progress` and `--status queued` both print nothing.
+4. **Rename on GitHub.** The repo (`gh repo rename <new name> -R "$R"`), the labels on the target and the control repo (`gh label edit <old> --name <new>`), and the Apps. Environments, secrets, variables, rulesets and App installations survive a repo rename. To rename a state branch too, rename the branch first and then point its ruleset at the new name: GitHub refuses to rename a branch into a name a ruleset covers.
+5. **Change the config to match.** Update `qlander.yml`, run `validate` and `render`, and merge both in one PR on the renamed repo. In `self-hosted-kill` mode, check that the runner group's workflow restriction names the new repo, and update it if it doesn't.
+6. **Put labels back on.** On every open PR that had a renamed label, remove it and add it again. Until then, a renamed `ready` doesn't count, and a renamed operator or priority label does nothing.
+7. **Fix your own copies.** Point your clone at the new name (`git remote set-url`). If the Apps were renamed, rename each key file or secret-store entry to the new slug. Unless the Apps' prefix is the control repo's new name, pass `--name <their prefix>` to `setup` and `--queue-app`, `--release-app` and `--state-app` to `audit`.
+8. **Start again.** A workflow disabled by hand stays disabled through a rename and a merge, so enable the watchdog yourself: `gh workflow enable watchdog.yml -R "$R"`, then `gh workflow run watchdog.yml -R "$R"`, and check that there is still one status issue. Run `unquiesce`, which enables `tick.yml`, then `audit`.
 
 ## Monitoring
 
@@ -301,4 +346,4 @@ These comments are always posted, and most ask someone to act:
 
 Two comments only report progress: **queued** ("Queued in batch N at ...") and **landed** ("Landed in main at ..."). You can leave out either with [`comments.omit`](configuration.md#comments). The schema refuses any other value.
 
-Leaving them out changes only who is notified. No decision reads a comment back. Each batch and landing is still recorded in the queue state's history, in each merge commit's message and in the lifecycle [hooks](hooks.md). A comment already waiting in the outbox when the setting changes is still posted. `comments` is not part of the policy hash, so changing it doesn't unready the queue.
+Leaving them out changes only who is notified. No decision reads a comment back. Each batch and landing is still recorded in the queue state's history, in each merge commit's message and in the lifecycle [hooks](hooks.md). A comment already waiting in the outbox when the setting changes is still posted. `comments` is not part of the policy hash, so changing it doesn't take `ready` off admitted PRs.

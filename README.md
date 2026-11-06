@@ -39,7 +39,7 @@ You can't use both: qlander's audit requires GitHub's merge queue to be off on `
 
 ## Quickstart
 
-You need an organization that owns your repo, and the [GitHub CLI](https://cli.github.com) signed in as its owner. [Getting started](docs/getting-started.md) has every step. These are the main commands:
+You need an organization that owns your repo, and the [GitHub CLI](https://cli.github.com) signed in as an owner of that organization. [Getting started](docs/getting-started.md) has every step. These are the main commands:
 
 ```sh
 # Create the control repo. It must be at least as private as your repo.
@@ -60,7 +60,7 @@ bun "${bundle:?}" setup --keys-dir ~/app-keys --config qlander.yml --apply --ste
 GH_TOKEN=$(gh auth token) bun "${bundle:?}" audit --config qlander.yml
 ```
 
-Then run the [rollout gates](docs/getting-started.md#10-roll-out): a sandbox check, then at least a day of dry runs with the repo variable `QLANDER_MODE` unset. Set it to `live`. To land a PR, wait for its fast-lane check to pass, then add `ready`.
+Then run the [rollout gates](docs/getting-started.md#10-roll-out): a sandbox check, then at least a day of dry runs with the repo variable `QLANDER_MODE` unset. Then set it to `live`. To land a PR, wait for its fast-lane check to pass, then add `ready`. The queue can take one to three ticks to admit it.
 
 ## Configuration
 

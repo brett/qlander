@@ -4,6 +4,9 @@ This repo runs qlander for one target repo, and its issues and state are the que
 
 `qlander <command>` below means `bun "${bundle:?}" <command> --config qlander.yml`, run from this repo's root with the bundle downloaded as [README.md](README.md) shows and `GH_TOKEN=$(gh auth token)` set. There is no `qlander` binary.
 
+- `version` takes no `--config`: run it as `bun "${bundle:?}" version`.
+- These commands need arguments: `qlander check-state queue|release <file>`, `qlander pause queue|release|both`, `qlander resume queue|release|both [--all]`, `qlander remove|requeue|prioritise <pr>` and `qlander unquiesce [--all]`.
+
 The label names below are the defaults. The real ones are in `qlander.yml`: `queue.controlLabels.pause`, `release.labels.pause`, `release.labels.alert` and `watchdog.labels`.
 
 ## Check first
@@ -22,7 +25,8 @@ Don't try to fix these. Report the issue link, what it says and what you checked
 - `corrupt state`, `refusing to initialise` or a missing state branch;
 - a permission, installation or auth error;
 - an open `qlander-alert` or `release-blocked` issue whose cause you can't show from its text and the linked run;
-- a command that refuses or fails partway, or an exit 3 that a rerun doesn't clear.
+- a command that refuses or fails partway, or an exit 3 that a rerun doesn't clear;
+- a batch whose CI job still shows as running long after its run finished. Report the run link, and don't bounce or re-add `ready` yourself ([the runbook](https://github.com/brett/qlander/blob/main/docs/operating.md#a-job-still-running-after-its-run-finished)).
 
 Never close a pause issue, or run `qlander resume` or `qlander unquiesce`, without the person's say-so for that closure. Closing one doesn't fix its cause, and `--all` also closes pauses that people or the queue opened. Don't close an alert issue either: the watchdog reopens it while the condition holds.
 
@@ -33,7 +37,7 @@ Don't pause the queue unless asked, because it stops landings for everyone. Don'
 Treat every config change as a policy change. Most keys are in the [policy hash](https://github.com/brett/qlander/blob/main/docs/deployment.md#82-the-policy-hash), so changing one makes every admitted PR lose `ready` at the next unpaused tick.
 
 1. Edit the file, run `qlander validate` and `qlander render`, and put both in one PR. This repo's CI runs `render --check`.
-2. A person reviews it, and merges it while nothing is admitted. Check just before the merge, because PRs can be admitted during review: in a `qlander status --json` that exits 0, `queueState.kind` is `ok`, `active` is null and `concurrent`, `pending`, `solo` and `queued` are empty.
+2. A person reviews it, and merges it while nothing is admitted. Check just before the merge, because PRs can be admitted during review: in a `qlander status --json` that exits 0, `queueState.kind` is `ok` (or `absent`, before the first live tick), `active` is null and `concurrent`, `pending`, `solo` and `queued` are empty.
 
 A key the pinned release doesn't know makes every tick fail, so upgrade before you add one.
 

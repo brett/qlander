@@ -1,8 +1,9 @@
 # qlander.yml: the whole configuration of one qlander deployment.
 # Every value below is a starting point; the ones marked CHANGE ME must be
-# set before the first tick. The full schema, with a description of every
-# key, is qlander.schema.json in each release; docs/deployment.md in
-# https://github.com/brett/qlander explains each block.
+# set before the first tick. docs/configuration.md in
+# https://github.com/brett/qlander lists every key with its default, and
+# docs/deployment.md explains each block. The schema itself is
+# qlander.schema.json in each release.
 #
 # After any change, re-render the workflows and commit them with the config:
 #

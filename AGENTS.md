@@ -4,15 +4,15 @@ Qlander moves a protected `main` for a whole team, and one wrong command can sto
 
 ## Commands
 
-`qlander <command>` below means `bun "${bundle:?}" <command> --config qlander.yml`, run from the control repo's root with the bundle downloaded as [Getting started](docs/getting-started.md#before-you-start) shows. There is no `qlander` binary, and `version` takes no `--config`. In this source repo, use `bun src/cli.ts <command>`.
+`qlander <command>` below means `bun "${bundle:?}" <command> --config qlander.yml`, run from the control repo's root with the bundle downloaded as [Getting started](docs/getting-started.md#before-you-start) shows. There is no `qlander` binary, and `version` takes no `--config`: run it as `bun "${bundle:?}" version`. In this source repo, use `bun src/cli.ts <command>`.
 
 | Command | Changes | Preview |
 | --- | --- | --- |
-| `qlander version`, `qlander validate`, `qlander render --check`, `qlander check-state`, `qlander status`, `qlander audit` | Nothing | Not needed |
+| `qlander version`, `qlander validate`, `qlander render --check`, `qlander check-state queue\|release <file>`, `qlander status`, `qlander audit` | Nothing | Not needed |
 | `qlander render` | Workflow files beside the config | `qlander render --check` |
 | `qlander setup --apply` | Apps, secrets and rulesets on GitHub | `qlander setup --plan` |
-| `qlander pause`, `qlander resume`, `qlander quiesce`, `qlander unquiesce` | Pause issues and `tick.yml` | `--dry-run` |
-| `qlander remove`, `qlander requeue`, `qlander prioritise`, `qlander approve-policy` | A label or comment on a target PR | `--dry-run` |
+| `qlander pause queue\|release\|both`, `qlander resume queue\|release\|both [--all]`, `qlander quiesce`, `qlander unquiesce [--all]` | Pause issues and `tick.yml` | `--dry-run` |
+| `qlander remove <pr>`, `qlander requeue <pr>`, `qlander prioritise <pr>`, `qlander approve-policy <pr> <sha>` | A label or comment on a target PR | `--dry-run` |
 | `qlander verify-sandbox` | A sandbox repo, never the target | None: follow [the sandbox check](docs/getting-started.md#running-the-sandbox-check) |
 | `qlander tick`, `qlander watchdog` | The queue and its issues | None: only the workflows run these |
 

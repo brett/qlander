@@ -4,7 +4,7 @@ Qlander tests ready PRs in batches, then moves `main` to the commit whose CI pas
 
 ## The moving parts
 
-Qlander runs from its own **control repo**, never from the repo it lands on (the **target**). A scheduled workflow, `tick.yml`, runs two jobs on each tick:
+Qlander runs from its own **control repo**, never from the repo it lands on (the **target**). A scheduled workflow, `tick.yml`, runs the queue job on each tick, and the release job too once release advance is enabled:
 
 - **Queue job:** admits PRs, builds batches and moves `main`.
 - **Release job (optional):** fast-forwards the target's `release` branch to qualified `main` commits.

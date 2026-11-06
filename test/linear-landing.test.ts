@@ -164,6 +164,34 @@ describe("a batch lands as a linear stack", () => {
   });
 });
 
+describe("a parked batch keeps its stack (queue.strategy.reuseGreen)", () => {
+  test("the run rerun by hand during the pause lands the parked stack linear, with no new queue run", async () => {
+    let first: number | undefined;
+    const w = linearWorld(
+      (b) => {
+        first ??= b.n;
+        return b.n === first && b.attempt <= 2 ? "cancel" : "pass";
+      },
+      { strategy: { reuseGreen: true } },
+    );
+    for (const n of [1, 2, 3]) pr(w, n);
+    for (let i = 0; i < 20 && !w.paused(); i++) await w.tick();
+    expect(w.paused()).toBe(true);
+    expect(w.state().parked?.stack).toHaveLength(3);
+    const run = w.target.runs.filter((r) => r.head_branch === `${w.config.names.queuePrefix}${first}`).at(-1)!;
+    await w.target.rerunFailedJobs(run.id); // by hand, while paused: passes
+    await w.tick();
+    for (const i of w.repo.issues) if (i.labels.includes(NAMES.controlLabels.pause)) i.open = false;
+    const before = w.verdicts.length;
+    await w.runUntilIdle(60);
+    expect(w.landed()).toEqual([[1, 2, 3]]);
+    expect(w.verdicts.length - before).toBe(0);
+    expect(w.mainHistory.at(-1)).toBe(run.head_sha);
+    expect(isLinear(w)).toBe(true);
+    for (const n of [1, 2, 3]) expect(w.target.prs.get(n)!.pr.merged).toBe(true);
+  });
+});
+
 describe("the landing never overwrites a push", () => {
   test("an author push between the last revalidation and the landing: the update is refused whole, only that PR is dropped", async () => {
     const w = linearWorld();

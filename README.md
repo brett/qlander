@@ -33,7 +33,7 @@ Qlander runs from a separate **control repo** that you own. A scheduled workflow
 
 ## Why not GitHub's merge queue?
 
-Qlander runs one CI build per batch instead of one per queued PR, finds a failing PR by rerunning and splitting the batch, and pauses when a run passes qlander's time limits instead of removing a PR (a job's own `timeout-minutes` still counts as a failure). It also requires an approval bound to the SHA of a PR that changes CI. In exchange, you run it yourself, and it lands merge commits only.
+Qlander runs one CI build per batch instead of one per queued PR, finds a failing PR by rerunning and splitting the batch, and pauses when a run passes qlander's time limits instead of removing a PR (a job's own `timeout-minutes` still counts as a failure). It also requires an approval bound to the SHA of a PR that changes CI. In exchange, you run it yourself, and it lands merge commits, or, with the opt-in [linear landing](docs/how-it-works.md#linear-landing-opt-in), one squashed commit per PR.
 
 You can't use both: qlander's audit requires GitHub's merge queue to be off on `main`. See the [full comparison](docs/vs-github-merge-queue.md).
 

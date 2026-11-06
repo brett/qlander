@@ -89,7 +89,7 @@ To keep that policy in the control repo instead, use `qualification.manifest.sou
 
 ## 2. Qualification providers for release advance
 
-The release job is a separate job with its own App, lease, state branch and pause (DESIGN §8). It is **off by default** (`release.enabled: false`). `release.dryRun` must be set explicitly; start with `true`, and only a reviewed config PR makes it live. Steps 1, 2, 4 and 5 of DESIGN §8 (candidate discovery, the strict-descendant check, the CAS, the receipt, the blocked alert) are shared. Only step 3, "is `C` qualified?", is pluggable:
+The release job is a separate job with its own App, lease, state branch and pause (DESIGN §8). It is **off by default** (`release.enabled: false`). `release.dryRun` must be set explicitly; start with `true`, and only a reviewed config PR makes it live. Steps 1, 2, 4 and 5 of DESIGN §8 (candidate discovery, the strict-descendant check, the CAS, the receipt, the blocked alert) are shared. Only step 3, "is `C` qualified?", is pluggable. With `release.mode: dispatch` (DESIGN §8.1), steps 4 and 5 are replaced: qlander dispatches the target's own release workflow for `C`, as a dry run and then, once approved, for real, and never writes `release` itself. The provider is the same in both modes:
 
 ```ts
 interface QualificationProvider {
@@ -249,7 +249,7 @@ GitHub's behaviour can change, so don't take H1 from this document: `verify-sand
 | T8 | The main-landing, main-integrity and queue-refs rulesets ([DESIGN §13](../DESIGN.md#13-target-side-requirements)). If `epochFence` is on: the `epoch-write` and `epoch-integrity` rulesets (§3.4). Merge queue (native) is off on `main`. | FAIL; bypass lists need an admin token, otherwise SKIPPED |
 | T9 | The `queue.labels` labels exist on the target. | FAIL (`setup` creates them) |
 | T10 | Release, if enabled: the release-landing and release-integrity rulesets (DESIGN §13; `audit` requires a PR and every check `setup` writes on release-landing, but not "Restrict updates", because a person merges hotfix PRs there); PR CI for base `release` runs the full suite (the hotfix path, DESIGN §9); the provider's inputs exist (the manifest file parses; the status context or proof workflow has been seen on main). | FAIL / WARN (WARN while `release.dryRun` is true) |
-| T11 | The queue App and the release App have exactly the expected permissions, registered and accepted on each installation (§5.3). | FAIL; installation permissions need an org owner's token, otherwise SKIPPED. Whether an installation covers only the target is always SKIPPED (`setup --step verify` checks it) |
+| T11 | The queue App and the release App have exactly the expected permissions, registered and accepted on each installation (§5.3). For the release App that depends on `release.mode` (the App table in §5). | FAIL; installation permissions need an org owner's token, otherwise SKIPPED. Whether an installation covers only the target is always SKIPPED (`setup --step verify` checks it) |
 | T12 | Policy coverage (§1.3): every file in the policy set, and every local action, local reusable workflow and repo script that those workflows run (a static scan of `uses: ./…` and of `run:` lines that execute repo paths), is matched by `queue.policy.paths`. The listed workflows of a target-hosted qualification manifest are read at `target.main`. | FAIL for an uncovered named file or dependency; WARN for a `run:` line the scan can't resolve |
 
 ### 4.2 `qlander audit`
@@ -286,6 +286,17 @@ qlander setup [--config qlander.yml] [--plan | --apply]
                   [--keys-dir <dir> | --key-cmd <command>] [--name <prefix>] [--rotate]
                   [--apply-target-rulesets] [--poll-seconds <n>] [--wait-minutes <n>] [--skip-audit]
 ```
+
+**The Apps and their permissions** (DESIGN §12.1). `setup` registers exactly these, `tick.yml` requests them when it mints each token, and `audit` T11 requires them, not fewer and not more:
+
+| App | On | Permissions |
+| --- | --- | --- |
+| queue App | the target | Contents: write, Workflows: write, Pull requests: write, Actions: write, Checks: read, Commit statuses: read, Metadata: read |
+| release App, `release.mode: advance` | the target | Contents: write, Workflows: write, Actions: read, Checks: read, Commit statuses: read, Metadata: read |
+| release App, `release.mode: dispatch` | the target | The same, but **Actions: write**, to dispatch `release.dispatch.workflow`; plus **Variables: read** when `release.dispatch.freeze` is set |
+| state App | the control repo | Contents: write, Metadata: read |
+
+Switching an existing release App to dispatch mode is a permission change: follow §5.3 (save the new permission in the App's settings, then accept it on the installation) before you merge the config change, or every release tick fails to mint its token. The queue App never gets the new permission.
 
 `--plan` (the default) prints every change it would make. `--apply` makes them. Without `--step` it runs apps, install, control, target and verify in order, stopping at the first that fails. It is idempotent: every step reads first and changes only what differs. It runs on an operator's machine with `gh` authenticated as an org owner, never in Actions.
 

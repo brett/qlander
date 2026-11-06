@@ -48,7 +48,10 @@ The release job opens a `release-pause` itself when:
 
 - its state is corrupt;
 - its state branch is missing while its mirror issue is open;
-- a release update was rejected while `release` was unchanged.
+- a release update was rejected while `release` was unchanged;
+- in [dispatch mode](how-it-works.md#dispatch-mode-opt-in), a real run it dispatched never appeared, or never finished. Check the target workflow's runs: one may still be promoting. Close the pause only when you know what it did.
+
+While paused, a dispatch-mode release job dispatches nothing, but still follows a run already in flight and records how it ended.
 
 In some other cases, such as a diverged `release`, the job raises a `release-blocked` issue instead, which pauses nothing. [How it works](how-it-works.md#release-advance) lists them.
 
@@ -97,7 +100,7 @@ Run `bun "${bundle:?}" <command> --config qlander.yml` from the control repo's r
 | `audit [--target-only\|--control-only] [--json] [--queue-app <slug>] [--release-app <slug>] [--state-app <slug>] [--config <file>]` | Checks the target's CI requirements and the control repo's protection, read-only. Exits 1 on a `FAIL` that a failed read didn't cause, else 3 if a read failed. See [Getting started, step 9](getting-started.md#9-prepare-the-target). |
 | `setup …` | Creates and checks the Apps, installations and repo settings. See [Getting started](getting-started.md#let-setup-do-most-of-it). |
 | `verify-sandbox <phase> …` | Runs rollout gate G1 against a sandbox repo. See [Getting started, Running G1](getting-started.md#running-the-sandbox-check). |
-| `pause`, `resume`, `remove`, `requeue`, `prioritise`, `approve-policy`, `quiesce`, `unquiesce` | Control commands. See [below](#controlling-the-queue-from-the-command-line). |
+| `pause`, `resume`, `remove`, `requeue`, `prioritise`, `approve-policy`, `approve-release`, `quiesce`, `unquiesce` | Control commands. See [below](#controlling-the-queue-from-the-command-line). |
 
 Without `--config`, the bundle looks for `qlander.yml` relative to where the bundle file is, not in the control repo. Only in source mode (`bun src/cli.ts`) does `--config` default to the control repo's own `qlander.yml`, next to the source. The tick and the watchdog always read their own checkout's file.
 
@@ -138,6 +141,7 @@ bun "${bundle:?}" remove 123                        # the bounce label
 bun "${bundle:?}" requeue 123                       # the ready label
 bun "${bundle:?}" prioritise 123                    # the priority label (when queue.labels.priority is set)
 bun "${bundle:?}" approve-policy 123 <40-hex head>  # the CI-policy approval, as an approver, for the PR's current head only
+bun "${bundle:?}" approve-release <40-hex sha>      # the release approval (dispatch mode), as a release approver, for the current candidate only
 bun "${bundle:?}" quiesce                           # stop both jobs safely (below)
 bun "${bundle:?}" unquiesce [--all]                 # and start them again
 ```
@@ -270,7 +274,7 @@ Renaming a GitHub App is done in a browser only: in the App's settings, on **Gen
 
 ### The status issue
 
-There is one issue titled **qlander status**, labelled `qlander-status` and pinned at the top of the Issues tab. It's the one place to look. The watchdog rewrites its body on every run and never comments, so its runs make no notification noise. Each control command that changes something logs one comment here, which notifies anyone subscribed to the issue.
+There is one issue titled **qlander status**, labelled `qlander-status` and pinned at the top of the Issues tab. It's the one place to look. The watchdog rewrites its body on every run and never comments, so its runs make no notification noise. Each control command that changes something logs one comment here, which notifies anyone subscribed to the issue. In [dispatch mode](how-it-works.md#dispatch-mode-opt-in), the release job also comments once per release candidate whose dry run is green, and approvals are posted here (see [Approving a release](#approving-a-release-dispatch-mode)).
 
 | Field | What it shows |
 | --- | --- |
@@ -285,6 +289,24 @@ There is one issue titled **qlander status**, labelled `qlander-status` and pinn
 
 - **Duplicates.** The watchdog keeps the pinned issue, else the oldest, and closes any extra with a comment. It creates an issue only when two complete listings both find none. An incomplete or failed read creates nothing, and closes no extra status issue. It also unpins closed status and alert issues, so they give back their pin slots.
 - **Pinning.** It pins the issue through the GraphQL `pinIssue` mutation. If `GITHUB_TOKEN` isn't allowed to pin, or the repo already has three pinned issues, the run doesn't fail. The body's footer says so instead, and someone pins the issue once by hand: open it, then **Pin issue**.
+
+### Approving a release (dispatch mode)
+
+With `release.mode: dispatch`, a commit is promoted only after a person approves it. When its dry run is green, the release job comments on the status issue with the sha, a link to the dry run and its jobs, and the exact line to post. To approve, one of `release.dispatch.approvers` posts a new comment whose whole body is that line:
+
+```
+/qlander approve-release <40-character sha>
+```
+
+or runs `approve-release <sha>`, which checks the same things first and posts it. Qlander ignores, and logs why, an approval that:
+
+- names any other sha, including an older candidate's;
+- comes from an account not listed in `release.dispatch.approvers` (login and id both checked);
+- was edited, or was posted before the dry run was dispatched.
+
+The approval counts for that sha only, and only within `release.dispatch.dryRunValidMinutes` of the green dry run. A newer qualified commit replaces a candidate that is still waiting, and gets its own dry run. Agents don't approve releases: the rule is the same as for [CI-policy approvals](../AGENTS.md#ci-policy-approval). `status` shows where the candidate is (`candidate <sha>: <stage>`).
+
+To stop new dispatches without pausing anything else, set one of `release.dispatch.freeze`'s target repository variables to its value. A run already started is still followed.
 
 ### Alert issues
 

@@ -7,11 +7,11 @@ Qlander tests ready PRs in batches, then moves `main` to the commit whose CI pas
 Qlander runs from its own **control repo**, never from the repo it lands on (the **target**). A scheduled workflow, `tick.yml`, runs the queue job on each tick, and the release job too once release advance is enabled:
 
 - **Queue job:** admits PRs, builds batches and moves `main`.
-- **Release job (optional):** fast-forwards the target's `release` branch to qualified `main` commits.
+- **Release job (optional):** fast-forwards the target's `release` branch to qualified `main` commits, or, in [dispatch mode](#dispatch-mode-opt-in), has the target's own release workflow do it.
 
 While work is in flight, the queue job also starts its own next tick, using its `GITHUB_TOKEN` and a `workflow_dispatch`, at most 30 times an hour.
 
-Qlander reaches the target only through the GitHub API, using GitHub Apps. It never checks out or runs target code. The queue App is the only identity allowed to move the target's `main`, and the release App moves `release`.
+Qlander reaches the target only through the GitHub API, using GitHub Apps. It never checks out or runs target code. The queue App is the only identity allowed to move the target's `main`, and the release App moves `release` (in dispatch mode, the target's workflow does).
 
 `qlander.yml` in the control repo sets everything Qlander acts on. The [configuration reference](configuration.md) lists every key. Label names on this page are examples, set in [`queue.labels`](configuration.md#queuelabels).
 
@@ -155,6 +155,47 @@ When `release` can't advance, the job opens a `release-blocked` issue, which pau
 - none of the newest [`release.maxCandidates`](configuration.md#release) commits qualifies, and older ones were not examined.
 
 Release advance is off until `release.enabled` is true. It acts only when `release.dryRun` is false and `QLANDER_MODE` is `live`. See [Getting started, step 3](getting-started.md#3-leave-qlander_mode-unset).
+
+### Dispatch mode (opt-in)
+
+If promoting a commit means more than moving a branch (migrations, a deploy, smoke checks), set [`release.mode: dispatch`](configuration.md#release). Qlander then never writes `release`. It still picks the newest qualified `main` commit as above, and hands it to your own workflow, [`release.dispatch.workflow`](configuration.md#releasedispatch), which promotes it and moves `release` itself:
+
+1. **Dry run.** Qlander dispatches the workflow with the commit's sha and the dry-run input set to `"true"`, once per sha.
+2. **Report.** When the dry run is green, the release job comments on the [status issue](operating.md#the-status-issue) with the sha and a link to the run.
+3. **Approval.** One of [`release.dispatch.approvers`](configuration.md#releasedispatchapprovers) comments there, with exactly:
+
+   ```
+   /qlander approve-release <40-character sha>
+   ```
+
+4. **Real run.** Qlander dispatches the workflow again with the dry-run input `"false"`, once per sha, and only within [`dryRunValidMinutes`](configuration.md#releasedispatch) of the green dry run.
+5. **Advanced.** Release counts as advanced only when qlander sees `release` at the commit.
+
+Your workflow needs a `workflow_dispatch` trigger with the three inputs named in [`release.dispatch.inputs`](configuration.md#releasedispatchinputs), and a `run-name` that contains the dispatch id, which is how qlander finds the run it started:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      sha: { required: true, type: string }
+      dry_run: { required: true, type: string }
+      dispatch_id: { required: true, type: string }
+run-name: "Promote ${{ inputs.sha }} (dry run ${{ inputs.dry_run }}) ${{ inputs.dispatch_id }}"
+```
+
+What happens when something goes wrong:
+
+| Case | What happens |
+| --- | --- |
+| The dry run fails, is cancelled or never appears | A `release-blocked` issue. That commit gets no second dry run; the next qualified commit gets its own. |
+| Nobody approves in time | The dry run expires, with a `release-blocked` issue. |
+| The real run fails or is cancelled | A `release-blocked` issue. That commit is never dispatched for real again. |
+| The real run never appears or never finishes | The release job pauses (`release-pause`): a promotion may be running that qlander can't see. |
+| The real run is green but `release` doesn't move | A `release-blocked` issue after [`observeMinutes`](configuration.md#releasedispatch). |
+| A newer commit qualifies | It replaces a candidate waiting for approval at once, and one whose dry run is running once that run ends. A real run is always followed to its end first. |
+| A freeze variable is set | No new dispatch until it is cleared. See [`release.dispatch.freeze`](configuration.md#releasedispatchfreeze). |
+
+Pauses, the lease and the dispatch budget work as for the rest of the release job. The release App needs **Actions: write** on the target in this mode. See [DESIGN.md, Dispatch mode](../DESIGN.md#81-dispatch-mode-opt-in).
 
 ## State
 

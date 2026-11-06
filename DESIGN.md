@@ -1,13 +1,13 @@
 # Qlander design
 
-Qlander is a merge queue for one GitHub repository, the **target**. It runs ready PRs through the pre-landing suite in batches, and then moves the target's `main` to exactly the commit that passed, using a compare-and-swap. It can also fast-forward a `release` branch to qualified `main` commits.
+Qlander is a merge queue for one GitHub repository, the **target**. It runs ready PRs through the pre-landing suite in batches, and then moves the target's `main` to exactly the commit that passed, using a compare-and-swap. It can also move a `release` branch to qualified `main` commits: by fast-forwarding it itself, or, in dispatch mode (§8.1), by dispatching the target's own release workflow and watching `release` move.
 
 It runs from its own **control repo**, so the credentials that can move the target's `main` and `release` never share a runner, a checkout or a workflow file with target code. Every identity it acts on (both repos, the branches, ref prefixes and labels) comes from `qlander.yml` in the control repo. The control repo's visibility must be at least as restrictive as the target's (docs/deployment.md §3.3), so it is private unless the target is public.
 
 ## 1. Invariants
 
 1. **Main only points at tested commits.** Qlander moves `main` to `Q` only when every job in the pre-landing manifest (§6) succeeded on `Q` itself. The evidence must come from a `push` run on `queue/<n>` in the target, from the expected workflow file, on the latest attempt. A result never carries over to another SHA or tree.
-2. **Compare-and-swap, never force.** Every update to `main` and `release` is a GraphQL `updateRefs` with `beforeOid` (the head qlander expects) and `force: false`. If `main` is not exactly the batch's base, the update fails and the batch is rebuilt and retested.
+2. **Compare-and-swap, never force.** Every update to `main` and `release` is a GraphQL `updateRefs` with `beforeOid` (the head qlander expects) and `force: false`. If `main` is not exactly the batch's base, the update fails and the batch is rebuilt and retested. In release dispatch mode (§8.1) qlander makes no update to `release` at all: the target's workflow moves it, and qlander only reads it.
 3. **Only the authorised revision lands.** Every PR in a batch carries an authorisation record for (PR, head SHA, base, policy version) (§4.2). The record is checked again before every sub-batch is built and again immediately before landing.
 4. **A change to CI policy is never landed on its own CI's word.** Policy PRs run solo (or, opt-in, only with other approved policy PRs, §4.3 (d)) and need an approval from an account listed as an approver, bound to their SHA (§4.3).
 5. **No target code runs with a credential.** Qlander uses the GitHub APIs only. It never checks out or executes anything from the target. It reads target JSON (a qualification manifest) through the contents API, and job logs (flaky tracking §10, the main baseline §5.7) through the Actions API, only as data: a log is matched as text against fixed patterns and nothing else is done with it.
@@ -26,6 +26,8 @@ target PR ─ fast lane (+ optional producer-bound review, on head H) ─▶ lab
                                  red:   rerun failed once → split (≤ maxSplitDepth) → solo → bounce
 
  release job (release App key) ─ newest qualified main commit C (§8) ─▶ updateRefs release R→C
+   or, dispatch mode (§8.1):  ─▶ dispatch the target's workflow for C (dry run) ─▶ approval of C
+                              ─▶ dispatch it for real ─▶ observe release at C (read only)
 ```
 
 The code map is in [CONTRIBUTING.md](CONTRIBUTING.md#where-things-are). [Operating, The command line](docs/operating.md#the-command-line) lists every command.
@@ -86,6 +88,7 @@ Each tick first reconciles a leftover journal, by observation:
 | `land(B → Q)` | Run this **before any PR-integrity check**. If `Q` is an ancestor of or equal to `main` (compare `Q...main` is `identical` or `ahead`), the batch landed: record a receipt and move its PRs to `verify`. If `main == B`, it was not applied, and `decide` runs again. Anything else means main moved without us, so rebuild. |
 | `comment` / `label` / `cancel` | These are idempotent. Every comment carries a hidden marker, `<!-- qlander:<seq>:<pr> -->`, and is skipped if that marker already exists. |
 | `advance(R → C)` (release) | Same as `land`. |
+| `dispatch(kind, C, id)` (release, dispatch mode, §8.1) | Never resent. The candidate gets a record of the dispatch with `sent: unknown`, and its run is looked for by the dispatch id `id` until `release.dispatch.appearMinutes` have passed; after that the dispatch counts as `never-appeared`. |
 
 **Retention:** `queue/<n>` and `qlander-build/<n>` refs are deleted once their batch is terminal and recorded in `history`. Recovery never needs an old ref, because `verify` and `history` live in the state document. Batch numbers come from `state.seq`, not from the refs. The ref prefixes (`queue/`, `qlander-build/`), `main` and `release` used throughout are example names; each is set in `qlander.yml`.
 
@@ -447,6 +450,55 @@ The release job is a separate job in `tick.yml` (§12.1), run by a separate App,
 4. Journal `advance(R → C)`, then call `updateRefs(release, beforeOid: R, afterOid: C, force: false)`. Record the receipt (C, policy blob, evidence run ids and attempts) in the release state history.
 5. If compare `R...M` is `diverged`, `release` has a hotfix that was not merged back. Open or update a release-blocked issue (`release.labels.alert`). This does **not** pause the queue.
 
+Steps 4 and 5 are `release.mode: advance`, the default. Steps 1 to 3, the job's lease, pause and fence are the same in both modes.
+
+### 8.1 Dispatch mode (opt-in)
+
+Some targets cannot let anything but their own deploy workflow move `release`, because promoting a commit does much more than move a branch: migrations, a deploy, smoke checks, rollback records. With `release.mode: dispatch`, qlander still decides **what** is qualified (steps 1 to 3), but the target's workflow (`release.dispatch.workflow`) does the promotion and moves `release` itself, and qlander only observes the result.
+
+**Qlander never writes `release` in this mode, structurally.** Three layers, each enough on its own:
+- the release job connects its target client with the `dispatch` role (src/main.ts), which refuses every ref write and every queue write before any request, and may dispatch exactly the configured workflow, on the configured ref, with exactly the configured input names (src/github/target.ts);
+- the dispatch tick is handed a client built by `dispatchOnly` (src/release-dispatch.ts), which has no ref writer on it at all, so no code path in the tick can reach one; its type has none either;
+- every dispatch-mode test runs against a fake whose ref writers are spied on, and fails if any is called.
+
+With the epoch fence on, the job still advances its own epoch branch, which is not `release`.
+
+**One candidate at a time.** The candidate is the newest qualified first-parent commit `C` not yet in `release` (the advance decision's target). For `C`:
+
+1. **Dry run, once per sha.** Journal `dispatch(dry, C, id)` with its budget reservation, then `POST /actions/workflows/{file}/dispatches` with `{ref, inputs: {<sha>: C, <dryRun>: "true", <dispatchId>: id}}`. `id` is unique per intent (`qlr-dry-<sha prefix>-<nonce>`). The receipt is the candidate's record of the dispatch, written in the same state write that drops the journal.
+2. **Find the run.** `workflow_dispatch` returns 204 with no run id. The target workflow's `run-name` must contain the dispatch id input, and qlander matches a run only if: its path is the configured workflow, its event is `workflow_dispatch`, its `head_branch` is the configured ref, its repository and head repository are the target (by id), it was created no more than 5 minutes before the intent, and its name contains the id as a whole token. A time window plus the run's head sha would not do: the run's `head_sha` is the ref's tip, not `C`, and two dispatches close together would be indistinguishable. Failure modes: a workflow whose `run-name` leaves the id out is never found (`never-appeared`, below); two runs with the same id (a person copying it into a manual dispatch) are `ambiguous`; a run deleted after it was found is `missing`. Once found, the run is followed by id with `GET /actions/runs/{id}`, its latest attempt's conclusion counts, and a run past `release.dispatch.runHours` is `stuck`.
+3. **Report.** When the dry run is green, the release job posts one comment on the status issue (§10): `C`, the run's link, and the dry run's job names and conclusions, read through the API as data (untrusted text, flattened). It is best effort: the marker it starts with keeps it to one per candidate, and a failure is retried next tick, never a pause.
+4. **Approval.** The real run needs a comment on the status issue whose whole body is `/qlander approve-release <C>`, unedited, from an account in `release.dispatch.approvers` (login and id), posted after the dry run was dispatched. This is §4.3 (b)'s rule, bound to the release candidate instead of a PR head, and with the same weakness: qlander checks the account, not who is using it. A comment naming another sha, from an account not listed, edited, or older than the dry run is refused, and the log says why. `qlander approve-release <sha>` posts it for an approver, refusing what the job would refuse.
+5. **Real run, once per sha.** Only with a green dry run of `C` that concluded within `release.dispatch.dryRunValidMinutes`, only while `C` is still the newest qualified candidate, and only if no real run was ever dispatched for `C`. It is journalled, dispatched and found exactly like the dry run, with `<dryRun>: "false"`.
+6. **Advanced only when seen.** Release counts as advanced only when `release` is observed at `C` or a descendant of it (a read), whatever the run's conclusion says. Then the receipt (from step 3 of §8) goes into the release history as `advanced`.
+
+**Every dispatch is bounded and fenced.** It needs the release lease (the fence checks it before the request) and, with the epoch fence on, an `epochHeld` probe on GitHub's write path just before the request. A dispatch is not a ref write, so GitHub cannot reject it with the epoch atomically: a frozen holder that passed the probe could still send one request after a successor took over. Its intent was written under its lease before the request, so the successor finds it in the journal, looks for its run and never dispatches that kind for `C` again. A late run is then either found or, if after the appear window, its sha is closed; a real one that cannot be followed pauses. Every dispatch also reserves from `release.dispatch.budget` (`window` dispatches in any `windowHours`), and none is made while a freeze variable equals its value.
+
+**Freeze.** `release.dispatch.freeze` lists target repository variables, each with the value that means frozen. While any equals its value, no new dispatch is made, dry or real; a run in flight is still followed. A variable that cannot be read counts as frozen; one that is not set does not. A repository variable was chosen over a status check: a freeze is a property of the repository at a moment, not of a commit, so a status would have to be posted on every new candidate to hold, and anyone with `statuses: write` could post one. Variables are also what deploy workflows commonly read already, so one switch can freeze both. It needs Variables: read on the release App, requested only when a freeze is configured.
+
+**Outcomes.** A candidate ends in exactly one of these, recorded in `dispatch.history`; none is ever retried for the same sha:
+
+| Case | Outcome |
+| --- | --- |
+| GitHub refuses the dispatch (a 4xx: nothing started) | No record; retried next tick, up to 3 times per candidate, each from the budget; release-blocked issue. A rate limit is retried without counting. |
+| Dispatch response lost (5xx, network, timeout) or a crash before the receipt | Not resent. The run is looked for by its id. |
+| Dry run red, cancelled, timed out, never appeared, ambiguous, missing or stuck | `dry-failed`, release-blocked issue. A newer qualified commit gets its own dry run. |
+| Green dry run not approved within `dryRunValidMinutes` | `expired`, release-blocked issue. |
+| Real run red or cancelled, and `release` not at `C` | `real-failed`, release-blocked issue. |
+| Real run never appeared, ambiguous, missing or stuck | `real-failed`, and the release job **pauses**: a promotion may be running that nobody can see. A person checks the target's runs before closing the pause. |
+| Real run green, `release` not at `C` within `observeMinutes` | `not-observed`, release-blocked issue. |
+| `release` at `C` or past it after the real run, whatever its conclusion | `released` (with a release-blocked issue if the run was not green). |
+| `release` reached `C` without a real run of ours | `released-elsewhere`. |
+| A newer qualified commit while `C`'s dry run is in flight | The dry run is followed to its end first (one target run at a time), then `C` is `superseded`. |
+| A newer qualified commit while `C` waits for its approval | `superseded` at once; an approval of `C` is then refused. |
+| A newer qualified commit while `C`'s real run is in flight | Never superseded: the real run is followed to its outcome above, then the newer commit starts with its dry run. |
+| `release` diverged, or the policy cannot be read | The advance decision's release-blocked issue; nothing is dispatched; the candidate is kept. |
+| Paused (an open `release-pause`, or one pending) | Nothing is dispatched or reported; runs in flight are still followed and recorded. |
+
+**The App.** The release App needs Actions: write on the target to dispatch, in this mode only, and Variables: read with a freeze (§12.1). `setup` registers them, `tick.yml` requests them and `audit` T11 checks them, from one function (src/release-permissions.ts).
+
+**Off unless enabled.** As advance mode: nothing runs unless `release.enabled` is true, and nothing is dispatched unless `release.dryRun` is false and `QLANDER_MODE` is `live`. Otherwise the job's dry run reads the state and makes the same decision, and says what a live tick would dispatch.
+
 ## 9. Hotfix protocol
 
 1. Branch `hotfix/<slug>` from `release` and open a PR into `release`.
@@ -465,7 +517,9 @@ The release job is a separate job in `tick.yml` (§12.1), run by a separate App,
 
 **Pause.** An open issue labelled `pause` (`queue.controlLabels.pause`) in the control repo pauses the queue. Qlander opens one itself for config, infra, red-main, budget and signature failures, and explains why in the issue. To resume, close the issue.
 
-**Release pause.** An open issue labelled `release-pause` (`release.labels.pause`) pauses the release job only. The queue's `pause` does not stop the release job, and a release pause never pauses the queue. The job opens one itself on a corrupt release state or a release CAS rejected while `release` was unchanged. A leftover `advance` intent is still reconciled by observation while paused.
+**Release pause.** An open issue labelled `release-pause` (`release.labels.pause`) pauses the release job only. The queue's `pause` does not stop the release job, and a release pause never pauses the queue. The job opens one itself on a corrupt release state, a release CAS rejected while `release` was unchanged, or, in dispatch mode, a real run it could not follow (§8.1). A leftover `advance` intent is still reconciled by observation while paused, and in dispatch mode a run in flight is still followed.
+
+**Release approval (dispatch mode).** The release job reports a candidate with a green dry run in one comment on the watchdog's status issue, and reads its comments for `/qlander approve-release <sha>` (§8.1). These are the only comments it reads or writes there; the watchdog still owns the body.
 
 **Operator commands** are labels on the target PR: `qlander:bounce`, `qlander:solo`, `qlander:unsolo` and `qlander:go` (the names in `queue.labels`; these are the example names). They are durable, so they are never workflow inputs: GitHub keeps one pending run per concurrency group and drops older pending runs, which would drop their inputs. `workflow_dispatch` takes no inputs and only wakes the queue tick.
 
@@ -503,13 +557,14 @@ The one residual: a crash between creating an issue and saving its receipt, with
 | --- | --- |
 | Event | `schedule` or `workflow_dispatch` only. There is **no `repository_dispatch`**. Polling replaces the wake-up credential. |
 | Repository | The target and control repo ids come from `qlander.yml` and are checked against `GET /repos` on connect. Every PR, run, job and status is checked by id, not by name. |
-| Refs | Writes are only allowed to `main` and `queue/<n>`/`qlander-build/<n>` (queue App), or to `release` (release App). `main` and `release` are only moved, never created or deleted; batch refs are only created or deleted through the ref APIs, and `POST /merges` advances build refs. With the epoch fence on, a job also advances its own epoch branch, and `voidEpoch` advances a predecessor's recorded epoch branch, which must not overlap any branch above and must point at an empty-tree commit (docs/deployment.md §3.4). The client wrapper enforces this, and `n` matches `^[1-9][0-9]{0,8}$`. |
+| Refs | Writes are only allowed to `main` and `queue/<n>`/`qlander-build/<n>` (queue App), or to `release` (release App; none at all in dispatch mode, §8.1). `main` and `release` are only moved, never created or deleted; batch refs are only created or deleted through the ref APIs, and `POST /merges` advances build refs. With the epoch fence on, a job also advances its own epoch branch, and `voidEpoch` advances a predecessor's recorded epoch branch, which must not overlap any branch above and must point at an empty-tree commit (docs/deployment.md §3.4). The client wrapper enforces this, and `n` matches `^[1-9][0-9]{0,8}$`. |
 | SHAs | `^[0-9a-f]{40}$` on every read and before every write. |
 | PR numbers | Integers from 1 to 10⁷. |
 | URLs | A proof status's `target_url` must match the anchored pattern in §8. |
 | State | Strict schema, with `v == 5` for the queue and `v == 1` for the release job. A queue document at v2, v3 or v4 is migrated on read, one version at a time (`src/state.ts`); any other version is refused. A parse failure or a failed cross-check pauses the queue. |
 | Branch names in events | Never trusted. A PR whose head branch is `main` is ignored (§4.2). A run counts as main evidence only when `event == push` and the repo id matches. |
 | Qualification manifest | Parsed as JSON data. `schema` must be 1, and unknown fields fail closed. |
+| Release dispatch (§8.1) | Only the configured workflow, on the configured ref (`main` or `release`), with exactly the configured input names, each value a sha, `true`/`false` or a dispatch id. A run counts only by the match rules in §8.1; its name and job names are untrusted text, shown flattened. Freeze variable names match `^[A-Za-z_][A-Za-z0-9_]*$`. |
 
 ### 11.1 Self-chaining
 
@@ -536,8 +591,10 @@ The queue and state Apps always exist; the release App exists only when `release
 | App | Permissions | Ruleset bypass |
 | --- | --- | --- |
 | queue App | Contents: write · Workflows: write · Pull requests: write · Actions: write · Checks: read · Commit statuses: read · Metadata: read, on the **target only** | the target's main-landing and queue-refs rulesets |
-| release App | Contents: write · Workflows: write · Actions: read · Checks: read · Commit statuses: read · Metadata: read, on the **target only** | the target's release-landing ruleset only |
+| release App | Contents: write · Workflows: write · Actions: read (**write** in dispatch mode, §8.1) · Checks: read · Commit statuses: read · Metadata: read, plus Variables: read with a dispatch freeze, on the **target only** | the target's release-landing ruleset only |
 | state App | Contents: write · Metadata: read, on the **control repo only** | the state branches' ruleset only |
+
+**Actions: write in dispatch mode, accepted.** The scope lets a token dispatch any workflow, and cancel, re-run or delete any run, in the target. The client allows only the one dispatch (§11), but a compromised release key is not bound by the client: it could start the target's promote workflow with inputs of its choosing, which a compromised key in advance mode could approximate anyway by moving `release`. Keep the promote workflow's own checks (an environment with required reviewers, for example) as the last word on what it promotes.
 
 Both target Apps need **Workflows: write**, because a ref update by an App that introduces `.github/workflows/**` changes is refused without it. Release lags main, so its fast-forwards carry workflow changes too.
 
@@ -631,6 +688,9 @@ A separate integrity ruleset is needed because a bypass actor skips every rule i
 | A key leaks | Integrity rulesets with no bypass still forbid force pushes and unsigned commits. Each key can move only its own refs. Revoke it in the App settings, and rotate keys yearly. |
 | A qlander bug | The client wrapper refuses to land a `Q` that is not the active batch's green head, and refuses non-allowlisted refs. The integrity rulesets bind qlander too. To stop it: pause, or disable the workflow. |
 | State corrupted or edited | Schema and cross-checks fail, and the queue pauses. Restore the state branch from its own history. |
+| Release dispatch mode: a dispatch whose response was lost, or a crash between the dispatch and its receipt | Never resent. The journal becomes a record with `sent: unknown`, and the run is looked for by its dispatch id (§8.1). |
+| Release dispatch mode: a dispatched run fails, is cancelled, never appears, or never finishes | A dry run: that commit is closed with a release-blocked issue and a newer one gets its own dry run. A real run that concluded: release-blocked. A real run that cannot be followed: the release job pauses. No sha ever gets a second dry or real run (§8.1). |
+| Release dispatch mode: `release` diverges, or a newer candidate arrives mid-flight | Diverged: release-blocked, nothing dispatched. Newer candidate: a dry run in flight finishes first, then the old candidate is superseded; a real run in flight is never superseded (§8.1). |
 
 ### 15.1 Documented residual risks
 

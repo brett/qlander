@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Release dispatch mode (`release.mode: dispatch`, opt-in). The release job never writes `release`: for the newest qualified `main` commit it dispatches the target's own release workflow as a dry run, reports a green one on the status issue, waits for `/qlander approve-release <sha>` from one of `release.dispatch.approvers`, then dispatches the real run, and counts release as advanced only when it sees the ref there. Each sha gets at most one dry run and one real run. Dispatches are journalled, never resent, budgeted, fenced, paused by `release-pause` and stopped by optional freeze variables. The release App needs Actions: write in this mode only (and Variables: read with a freeze): change its permissions before you switch. New command: `approve-release <sha>`. Advance mode, its state and the policy hash are unchanged; a dispatch-mode state has an extra `dispatch` field, which older releases refuse.
+
 ## 0.2.3
 
 One fix and a documentation update. State is unchanged, so this release reads what 0.2.2 wrote, and the policy hash is unchanged, so no admitted PR loses its place.

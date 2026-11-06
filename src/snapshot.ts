@@ -450,10 +450,20 @@ export async function observe(api: TargetApi, j: Journal, names: Names): Promise
       const ref = queueRef(names, op.n);
       const queueHead = await api.getRef(ref);
       if (queueHead === null || !j.checkpoint || !j.checkpoint.chainHead) return { queueHead, queueRef: ref, queueChainMatches: false };
-      // Walk back from the queue head: one merge commit per survivor, second
-      // parent = its pin, first parents ending at the recorded base.
       let cur = queueHead;
       let matches = queueHead === j.checkpoint.chainHead;
+      if (j.checkpoint.stack) {
+        // Linear (DESIGN.md §7.4): one commit per survivor, each exactly the recorded stack commit, on one parent, ending at the base.
+        for (const x of [...j.checkpoint.stack].reverse()) {
+          if (!matches) break;
+          const c = await api.getCommit(cur);
+          matches = c.sha === x.commit && c.parents.length === 1 && c.parents[0] === x.parent;
+          cur = c.parents[0] ?? "";
+        }
+        return { queueHead, queueRef: ref, queueChainMatches: matches && cur === op.base };
+      }
+      // Walk back from the queue head: one merge commit per survivor, second
+      // parent = its pin, first parents ending at the recorded base.
       for (const pin of [...j.checkpoint.survivors].reverse()) {
         if (!matches) break;
         const c = await api.getCommit(cur);
@@ -479,7 +489,14 @@ export async function observe(api: TargetApi, j: Journal, names: Names): Promise
       if (main === null) return { afterReachable: false };
       if (main === op.after) return { main, afterReachable: true };
       const c = await api.compare(op.after, main);
-      return { main, afterReachable: c.status === "ahead" || c.status === "identical" };
+      const afterReachable = c.status === "ahead" || c.status === "identical";
+      // Linear (DESIGN.md §7.4): main unmoved, so how did each PR branch end up?
+      if (!afterReachable && main === op.before && op.heads) {
+        const heads: Record<string, string | null> = {};
+        for (const h of op.heads) heads[String(h.pr)] = await api.getPrBranch(h.ref);
+        return { main, afterReachable, heads };
+      }
+      return { main, afterReachable };
     }
   }
 }

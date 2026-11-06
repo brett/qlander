@@ -32,6 +32,24 @@ export interface Auth {
    * tick, so removing the label returns the PR to its FIFO place.
    */
   priority?: { by: string; at: string };
+  /**
+   * Linear landing only (optional; absent in merge mode, DESIGN.md §7.4):
+   * the PR's head branch at admission. The landing moves exactly this branch,
+   * and only from `head`; revalidation drops the PR if it changes.
+   */
+  headRef?: string;
+}
+
+/**
+ * One commit of a linear stack (DESIGN.md §7.4): PR `pr`'s changes squashed
+ * onto `parent` (the previous stack commit, or the batch's base), with the
+ * tree of the build's merge commit for it. Its sha binds both.
+ */
+export interface StackCommit {
+  pr: number;
+  commit: string;
+  parent: string;
+  tree: string;
 }
 
 /** What a trusted automation was let skip, recorded at admission. */
@@ -72,6 +90,8 @@ export interface Active {
    * that head; if batch `on` ends any other way it is discarded.
    */
   on?: number;
+  /** Linear landing only (optional, DESIGN.md §7.4): the stack, one commit per PR in `prs` order; `head` is the last. */
+  stack?: StackCommit[];
 }
 
 export interface Pending {
@@ -93,12 +113,20 @@ export interface VerifyItem {
   since: string;
   ticks: number;
   notified: boolean;
+  /**
+   * Linear landing only (optional, DESIGN.md §7.4): the head the PR was
+   * admitted at. `pin` is then its stack commit, the commit its branch was
+   * moved to and that main contains.
+   */
+  admitted?: string;
 }
 
 export interface BuildRecord {
   survivors: Pin[];
   dropped: { pr: number; pin: string; outcome: "conflict" | "noop" }[];
   chainHead: string | null; // null when nothing survived
+  /** Linear landing only (optional, DESIGN.md §7.4): one stack commit per survivor, in order; chainHead is the last. */
+  stack?: StackCommit[];
 }
 
 export type BuildSource =
@@ -109,8 +137,17 @@ export type BuildSource =
 export type Op =
   | { kind: "build"; n: number; base: string; pins: Pin[]; depth: number; lineage: number; source: BuildSource; rebuild: boolean }
   | { kind: "rerun"; runs: RunRef[]; done?: RunRef[]; requested?: RerunRequest[]; everSent?: boolean }
-  | { kind: "land"; before: string; after: string }
+  /** `heads`: linear landing only (DESIGN.md §7.4), each PR branch the same atomic update moves from its admitted head to its stack commit. */
+  | { kind: "land"; before: string; after: string; heads?: HeadMove[] }
   | { kind: "cancel"; runs: RunRef[]; cause: "timeout" | "starved" };
+
+/** One PR head branch a linear landing moves (DESIGN.md §7.4): `ref` from `before` (the admitted head) to `after` (its stack commit). */
+export interface HeadMove {
+  pr: number;
+  ref: string;
+  before: string;
+  after: string;
+}
 
 /** A rerun request that was (or may have been) sent, awaiting confirmation that its attempt advanced. */
 export interface RerunRequest extends RunRef {
@@ -308,6 +345,8 @@ export interface Parked {
   depth: number;
   lineage: number;
   builtAt: string;
+  /** Linear landing only (optional): the parked batch's stack, landed with it. */
+  stack?: StackCommit[];
 }
 
 /** How long a flake counts towards the weekly figure. */
@@ -344,7 +383,7 @@ export function emptyState(): State {
  * applyOpResult (checkpoint and built) and by recovery.
  */
 export function buildRecordProblem(
-  op: { pins: Pin[] },
+  op: { pins: Pin[]; base?: string },
   rec: BuildRecord,
   auth: Record<string, Auth> | undefined,
 ): string | null {
@@ -362,11 +401,30 @@ export function buildRecordProblem(
   }
   if (seen.size !== pinned.size) return "the record does not account for every pinned PR";
   if ((rec.chainHead === null) !== (rec.survivors.length === 0)) return "chainHead and survivors disagree";
+  if (rec.stack !== undefined) {
+    const problem = stackProblem(rec.stack, rec.survivors.map((p) => p.pr), op.base);
+    if (problem) return problem;
+    if (rec.stack.at(-1)?.commit !== (rec.chainHead ?? undefined)) return "the stack's last commit is not chainHead";
+  }
   if (auth) {
     for (const p of op.pins) {
       if (auth[String(p.pr)]?.head !== p.head) return `pin #${p.pr} ${p.head} is not the authorised head`;
     }
   }
+  return null;
+}
+
+/**
+ * Is a linear stack (DESIGN.md §7.4) one commit per PR, in order, each on the
+ * one before, the first on `base` (when given)? Returns the problem, or null.
+ */
+export function stackProblem(stack: StackCommit[], prs: number[], base?: string): string | null {
+  if (stack.length !== prs.length || stack.some((x, i) => x.pr !== prs[i])) return "the stack does not have one commit per PR, in order";
+  for (let i = 0; i < stack.length; i++) {
+    const want = i === 0 ? base : stack[i - 1]!.commit;
+    if (want !== undefined && stack[i]!.parent !== want) return `stack commit for #${stack[i]!.pr} is not on ${i === 0 ? "the base" : "the commit before it"}`;
+  }
+  if (new Set(stack.map((x) => x.commit)).size !== stack.length) return "a stack commit twice";
   return null;
 }
 
@@ -460,6 +518,19 @@ function pins(x: unknown, where: string, nonEmpty: boolean): number[] {
   });
 }
 
+function stackList(x: unknown, where: string, prs: number[], base: string): void {
+  const list = arr(x, where);
+  list.forEach((e, i) => {
+    const o = obj(e, `${where}[${i}]`, ["pr", "commit", "parent", "tree"]);
+    pr(o.pr, `${where}[${i}].pr`);
+    sha(o.commit, `${where}[${i}].commit`);
+    sha(o.parent, `${where}[${i}].parent`);
+    sha(o.tree, `${where}[${i}].tree`);
+  });
+  const problem = stackProblem(list as StackCommit[], prs, base);
+  if (problem) fail(`${where}: ${problem}`);
+}
+
 function pendingItem(x: unknown, where: string): number[] {
   const o = obj(x, where, ["prs", "depth", "lineage"]);
   int(o.depth, `${where}.depth`);
@@ -505,9 +576,20 @@ function checkOp(x: unknown, where: string): string {
     const total = (o.runs as unknown[]).length + ((o.done as unknown[] | undefined)?.length ?? 0) + ((o.requested as unknown[] | undefined)?.length ?? 0);
     if (total === 0) fail(`${where}: a rerun of nothing`);
   } else if (kind === "land") {
-    const o = obj(x, where, ["kind", "before", "after"]);
+    const o = obj(x, where, ["kind", "before", "after"], ["heads"]);
     sha(o.before, `${where}.before`);
     sha(o.after, `${where}.after`);
+    if (o.heads !== undefined) {
+      const heads = arr(o.heads, `${where}.heads`);
+      if (heads.length === 0) fail(`${where}.heads: empty (absent in merge mode)`);
+      heads.forEach((h, i) => {
+        const m = obj(h, `${where}.heads[${i}]`, ["pr", "ref", "before", "after"]);
+        pr(m.pr, `${where}.heads[${i}].pr`);
+        if (!BRANCH_NAME_RE.test(str(m.ref, `${where}.heads[${i}].ref`))) fail(`${where}.heads[${i}].ref: bad`);
+        sha(m.before, `${where}.heads[${i}].before`);
+        sha(m.after, `${where}.heads[${i}].after`);
+      });
+    }
   } else {
     const o = obj(x, where, ["kind", "runs", "cause"]);
     runRefs(o.runs, `${where}.runs`, true);
@@ -599,7 +681,7 @@ export function checkLease(x: unknown): Lease {
 
 /** One running batch, strictly (state.active, or an entry of state.concurrent). */
 function checkActive(x: unknown, where: string): O {
-  const a = obj(x, where, ["n", "base", "head", "depth", "prs", "lineage", "rerun", "rerunAt", "cancels", "builtAt"], ["redJobs", "on"]);
+  const a = obj(x, where, ["n", "base", "head", "depth", "prs", "lineage", "rerun", "rerunAt", "cancels", "builtAt"], ["redJobs", "on", "stack"]);
   if (a.redJobs !== undefined) failedJobs(a.redJobs, `${where}.redJobs`);
   if (a.on !== undefined && int(a.on, `${where}.on`, 1) >= int(a.n, `${where}.n`, 1)) fail(`${where}.on: not an earlier batch`);
   if (a.rerunAt !== null) iso(a.rerunAt, `${where}.rerunAt`);
@@ -616,7 +698,11 @@ function checkActive(x: unknown, where: string): O {
     oneOf(o.cause, `${where}.cancels[${i}].cause`, ["timeout", "starved"] as const);
   });
   iso(a.builtAt, `${where}.builtAt`);
-  prList(a.prs, `${where}.prs`);
+  const prs = prList(a.prs, `${where}.prs`);
+  if (a.stack !== undefined) {
+    stackList(a.stack, `${where}.stack`, prs, a.base as string);
+    if ((a.stack as StackCommit[]).at(-1)!.commit !== a.head) fail(`${where}.stack: its last commit is not the head`);
+  }
   return a;
 }
 
@@ -640,7 +726,7 @@ function checkStrategyState(s: O): void {
     });
   }
   if (s.parked !== undefined) {
-    const o = obj(s.parked, "parked", ["n", "base", "head", "pins", "depth", "lineage", "builtAt"]);
+    const o = obj(s.parked, "parked", ["n", "base", "head", "pins", "depth", "lineage", "builtAt"], ["stack"]);
     int(o.n, "parked.n", 1);
     sha(o.base, "parked.base");
     sha(o.head, "parked.head");
@@ -648,6 +734,10 @@ function checkStrategyState(s: O): void {
     int(o.depth, "parked.depth");
     int(o.lineage, "parked.lineage", 1);
     iso(o.builtAt, "parked.builtAt");
+    if (o.stack !== undefined) {
+      stackList(o.stack, "parked.stack", (o.pins as Pin[]).map((p) => p.pr), o.base as string);
+      if ((o.stack as StackCommit[]).at(-1)!.commit !== o.head) fail("parked.stack: its last commit is not the head");
+    }
   }
   if (s.adaptive !== undefined) {
     const o = obj(s.adaptive, "adaptive", ["size", "greens"]);
@@ -729,7 +819,8 @@ export function parseState(json: string, names: Names): State {
   const auth = map(s.auth, "auth");
   for (const [k, v] of Object.entries(auth)) {
     if (!/^[1-9][0-9]{0,7}$/.test(k)) fail(`auth: bad key ${k}`);
-    const a = obj(v, `auth.${k}`, ["head", "baseRepoId", "policy", "policyPr", "admittedAt", "labelledAt", "evidence", "reviewRun"], ["author", "waiver", "priority"]);
+    const a = obj(v, `auth.${k}`, ["head", "baseRepoId", "policy", "policyPr", "admittedAt", "labelledAt", "evidence", "reviewRun"], ["author", "waiver", "priority", "headRef"]);
+    if (a.headRef !== undefined && !BRANCH_NAME_RE.test(str(a.headRef, `auth.${k}.headRef`))) fail(`auth.${k}.headRef: bad`);
     if (a.author !== undefined) str(a.author, `auth.${k}.author`);
     if (a.priority !== undefined) {
       const p = obj(a.priority, `auth.${k}.priority`, ["by", "at"]);
@@ -791,7 +882,8 @@ export function parseState(json: string, names: Names): State {
     int(o.cost, `window[${i}].cost`, 1);
   });
   arr(s.verify, "verify").forEach((v, i) => {
-    const o = obj(v, `verify[${i}]`, ["pr", "pin", "landedIn", "since", "ticks", "notified"]);
+    const o = obj(v, `verify[${i}]`, ["pr", "pin", "landedIn", "since", "ticks", "notified"], ["admitted"]);
+    if (o.admitted !== undefined) sha(o.admitted, `verify[${i}].admitted`);
     pr(o.pr, `verify[${i}].pr`);
     sha(o.pin, `verify[${i}].pin`);
     sha(o.landedIn, `verify[${i}].landedIn`);
@@ -826,7 +918,12 @@ export function parseState(json: string, names: Names): State {
         if ((auth[String(p.pr)] as { head?: string } | undefined)?.head !== p.head) fail(`journal: pin #${p.pr} is not the authorised head`);
       }
       if (j.checkpoint !== null) {
-        const c = obj(j.checkpoint, "journal.checkpoint", ["survivors", "dropped", "chainHead"]);
+        const c = obj(j.checkpoint, "journal.checkpoint", ["survivors", "dropped", "chainHead"], ["stack"]);
+        if (c.stack !== undefined) arr(c.stack, "journal.checkpoint.stack").forEach((e, i) => {
+          const o = obj(e, `journal.checkpoint.stack[${i}]`, ["pr", "commit", "parent", "tree"]);
+          pr(o.pr, `journal.checkpoint.stack[${i}].pr`);
+          for (const f of ["commit", "parent", "tree"]) sha(o[f], `journal.checkpoint.stack[${i}].${f}`);
+        });
         pins(c.survivors, "journal.checkpoint.survivors", false);
         arr(c.dropped, "journal.checkpoint.dropped").forEach((d, i) => {
           const o = obj(d, `journal.checkpoint.dropped[${i}]`, ["pr", "pin", "outcome"]);
@@ -842,6 +939,14 @@ export function parseState(json: string, names: Names): State {
       if (active === null) fail(`journal: a ${kind} with no active batch`);
       if (j.checkpoint !== null) fail("journal: checkpoint on a non-build op");
       if (kind === "land" && (op.before !== active.base || op.after !== active.head)) fail("journal: land does not match the active batch");
+      // Linear landing (DESIGN.md §7.4): exactly the active batch's PRs, each to its own stack commit.
+      if (kind === "land" && (op.heads !== undefined) !== (active.stack !== undefined)) fail("journal: land and the active batch disagree on linear landing");
+      if (kind === "land" && op.heads !== undefined) {
+        const stack = active.stack as StackCommit[];
+        const heads = op.heads as HeadMove[];
+        if (heads.length !== stack.length || heads.some((h, i) => h.pr !== stack[i]!.pr || h.after !== stack[i]!.commit)) fail("journal: land heads do not match the active batch's stack");
+        for (const h of heads) if ((auth[String(h.pr)] as { head?: string; headRef?: string } | undefined)?.head !== h.before || (auth[String(h.pr)] as { headRef?: string } | undefined)?.headRef !== h.ref) fail(`journal: land moves #${h.pr} from other than its admitted head and branch`);
+      }
     }
   }
   // Every lineage that can still spend runs needs a counter (else the budget reads 0).

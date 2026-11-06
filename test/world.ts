@@ -103,6 +103,7 @@ export class World {
 
   /** The PRs a queue head merged, from its chain: second parent = a PR head. */
   batchPrs(sha: string): number[] {
+    if (this.target.created.has(sha)) return this.stackPrs(sha);
     const out: number[] = [];
     let cur = sha;
     for (;;) {
@@ -111,6 +112,20 @@ export class World {
       const pr = [...this.target.prs.values()].find((f) => f.pr.head.sha === c.parents[1]);
       if (pr) out.unshift(pr.pr.number);
       cur = c.parents[0]!;
+    }
+    return out;
+  }
+
+  /** Linear landing: the PRs a stack holds, one per stack commit, by the change each commit adds to its parent's tree. */
+  stackPrs(sha: string): number[] {
+    const out: number[] = [];
+    let cur = sha;
+    while (this.target.created.has(cur)) {
+      const parent = this.target.commits.get(cur)!.parents[0]!;
+      const added = [...this.target.content.get(cur)!].filter((x) => !this.target.content.get(parent)?.has(x));
+      const pr = [...this.target.prs.values()].find((f) => added.includes(f.pr.head.sha));
+      if (pr) out.unshift(pr.pr.number);
+      cur = parent;
     }
     return out;
   }

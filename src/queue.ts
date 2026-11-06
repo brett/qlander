@@ -23,12 +23,12 @@ import { actives, type Snapshot, type Verdict } from "./ctx";
 import type { TargetApi, StateRefApi, StateRepoApi } from "./github/api";
 import { GitHubError, isGraphqlInternal } from "./github/http";
 import { decide } from "./machine";
-import { applyOpResult, interpretObservation, isObservedOutcome, type OpResult, type Recovery } from "./ops";
+import { applyOpResult, headsVerdict, interpretObservation, isObservedOutcome, type OpResult, type Recovery } from "./ops";
 import { drain, isTransient, openPause, pauseReason } from "./outbox";
 import { buildSnapshot, observe, StaleSnapshotError } from "./snapshot";
 import type { CommentSettings } from "./config/load";
 import { deliverHooks, enqueueHooks, type Hook, type LifecycleEvent } from "./hooks";
-import type { BuildRecord, Executor, Op, State } from "./state";
+import type { BuildRecord, Executor, Op, StackCommit, State } from "./state";
 import { CorruptStateError, LeaseHeldError, LostLockError, mirror, queueCodec, StateStore } from "./store";
 import { buildRef, queueRef } from "./validate";
 import { retickAt, type Wake, wakeFor } from "./wake";
@@ -41,6 +41,7 @@ export type CrashPoint =
   | "after-intent"
   | "after-build-ref"
   | "after-merges"
+  | "after-stack"
   | "after-checkpoint"
   | "after-queue-ref"
   | "after-effect"
@@ -143,6 +144,18 @@ export function mergeTitle(title: string | undefined): string | null {
 export function mergeMessage(pr: number, head: string, n: number, title?: string): string {
   const t = mergeTitle(title);
   return `Merge pull request #${pr} at ${head}\n\nLanded-by: qlander batch ${n}${t === null ? "" : `\nTitle: ${t}`}`;
+}
+
+/**
+ * The message of a linear stack commit (DESIGN.md §7.4): the subject
+ * `<title> (#<pr>)`, the title flattened and cut as for a merge commit (or
+ * `Pull request #<pr>` when there is none), a blank line, then
+ * queue.landing.body with its placeholders filled in.
+ */
+export function linearMessage(pr: number, head: string, n: number, title: string | undefined, body: string): string {
+  const t = mergeTitle(title);
+  const subject = t === null ? `Pull request #${pr}` : `${t} (#${pr})`;
+  return `${subject}\n\n${body.replaceAll("{number}", String(pr)).replaceAll("{head}", head).replaceAll("{batch}", String(n))}`;
 }
 
 const stableId = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
@@ -353,20 +366,27 @@ class Tick {
         return;
       case "land": {
         let result: OpResult;
+        const main = this.d.cfg.names.main;
         try {
-          await c.updateRef(this.d.cfg.names.main, op.before, op.after); // CAS: beforeOid, force false
+          // CAS: beforeOid, force false. Linear (DESIGN.md §7.4): the same atomic call force-moves each PR branch from its admitted head.
+          if (op.heads) await c.landStack({ branch: main, before: op.before, after: op.after }, op.heads.map((h) => ({ branch: h.ref, before: h.before, after: h.after })), null);
+          else await c.updateRef(main, op.before, op.after);
           this.crash("after-effect");
           result = { kind: "landed" };
         } catch (e) {
           // A crash, or a lost lease at the fence: not a landing outcome. The tick ends quietly.
           if (e instanceof CrashError || e instanceof LostLockError) throw e;
           // Judge by the ref, not the error text: did it move, and where to?
-          const main = await c.getRef(this.d.cfg.names.main);
-          if (main === op.after) result = { kind: "landed" };
-          else if (main !== op.before) result = { kind: "baseMoved" };
+          const now = await c.getRef(main);
+          if (now === op.after) result = { kind: "landed" };
+          else if (now !== op.before) result = { kind: "baseMoved" };
           // The write may have applied and this read may lag: the journal stays, and the next tick judges again.
           else if (isGraphqlInternal(e)) throw e;
-          else result = { kind: "landRejected", retry: isTransient(e), reason: String(e) };
+          else {
+            const heads: Record<string, string | null> = {};
+            for (const h of op.heads ?? []) heads[String(h.pr)] = await c.getPrBranch(h.ref);
+            result = headsVerdict(op.heads, op.heads ? heads : undefined) ?? { kind: "landRejected", retry: isTransient(e), reason: String(e) };
+          }
         }
         await this.apply(result);
         this.crash("after-receipt");
@@ -401,15 +421,34 @@ class Tick {
       } else dropped.push({ pr: pin.pr, pin: pin.head, outcome: r.kind });
     }
     this.crash("after-merges");
-    for (const m of merges) {
+    const landing = this.d.cfg.landing;
+    // Linear (DESIGN.md §7.4): the merge chain stays on the build ref; the stack, one commit per PR on its tree, is what is pushed.
+    const stack: StackCommit[] = [];
+    if (landing) {
+      let parent = op.base;
+      for (const [i, m] of merges.entries()) {
+        const pin = survivors[i]!;
+        const tree = (await c.getCommit(m)).tree;
+        if (!tree) {
+          await this.apply({ kind: "buildFailed", reason: `merge commit ${m} for #${pin.pr} came back without a tree` });
+          return;
+        }
+        const commit = await c.createCommit(tree, parent, linearMessage(pin.pr, pin.head, op.n, snap.prs[String(pin.pr)]?.title, landing.body));
+        stack.push({ pr: pin.pr, commit, parent, tree });
+        parent = commit;
+      }
+      this.crash("after-stack");
+    }
+    // What reaches main must be signed: the merge commits in merge mode, the stack commits in linear mode.
+    for (const m of landing ? stack.map((x) => x.commit) : merges) {
       const commit = await c.getCommit(m);
       if (!commit.verified || commit.reason !== "valid") {
-        await this.apply({ kind: "buildFailed", reason: `merge commit ${m} is not signed and verified (${commit.reason})` });
+        await this.apply({ kind: "buildFailed", reason: `${landing ? "stack" : "merge"} commit ${m} is not signed and verified (${commit.reason})` });
         return;
       }
     }
-    const chainHead = merges.at(-1) ?? null;
-    await this.apply({ kind: "checkpoint", record: { survivors, dropped, chainHead } });
+    const chainHead = landing ? (stack.at(-1)?.commit ?? null) : (merges.at(-1) ?? null);
+    await this.apply({ kind: "checkpoint", record: { survivors, dropped, chainHead, ...(landing ? { stack } : {}) } });
     this.crash("after-checkpoint");
     if (!this.state.journal) return; // the record was rejected (and paused)
     if (chainHead === null) {

@@ -119,6 +119,8 @@ export type Revalidation =
 export function revalidate(auth: Auth, pr: LivePr | undefined, cfg: Config, policyHash: string): Revalidation {
   if (!pr) return { ok: false, hold: false, headMoved: false, reason: "PR not readable" };
   if (pr.head !== auth.head) return { ok: false, hold: false, headMoved: true, reason: `head moved from ${auth.head} to ${pr.head}` };
+  // Linear landing (DESIGN.md §7.4): the landing moves the branch recorded at admission, so it must still be the PR's head branch.
+  if (auth.headRef !== undefined && pr.headRef !== auth.headRef) return { ok: false, hold: false, headMoved: true, reason: `head branch changed from ${auth.headRef} to ${pr.headRef}` };
   if (policyHash !== auth.policy) return { ok: false, hold: false, headMoved: true, reason: "qlander policy changed" };
   if (pr.policyPr !== auth.policyPr) return { ok: false, hold: false, headMoved: true, reason: "policy classification changed" };
   // Admitted under a trusted-automation waiver: it must still hold, for the same bot.

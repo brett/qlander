@@ -35,6 +35,8 @@ export type OpResult =
   | { kind: "opAbandoned"; reason: string }
   | { kind: "landed" }
   | { kind: "landRejected"; retry: boolean; reason: string }
+  /** Linear landing (DESIGN.md §7.4): refused because these PRs' branches moved since admission; nothing moved. */
+  | { kind: "headMoved"; prs: number[] }
   | { kind: "baseMoved" }
   | { kind: "cancelled" }
   | { kind: "retryOp" };
@@ -182,6 +184,7 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
           cancels: [],
           builtAt: c.now,
           ...(under ? { on: under.n } : {}),
+          ...(rec.stack ? { stack: rec.stack } : {}),
         };
         setActives(s, [...actives(s), batch]);
         notify(c, { id: `db:${op.n}`, kind: "deleteRef", ref: buildRef(cfg.names, op.n) });
@@ -306,9 +309,12 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
       for (const pr of a.prs) {
         const auth = s.auth[String(pr)];
         if (!auth) continue;
-        s.verify.push({ pr, pin: auth.head, landedIn: op.after, since: c.now, ticks: 0, notified: false });
+        // Linear landing (DESIGN.md §7.4): the PR's branch now points at its stack commit, which is what main contains.
+        const moved = op.heads?.find((h) => h.pr === pr);
+        s.verify.push({ pr, pin: moved?.after ?? auth.head, landedIn: op.after, since: c.now, ticks: 0, notified: false, ...(moved ? { admitted: auth.head } : {}) });
         const waived = auth.waiver ? `\n\nLanded under a ${describeWaiver(auth.waiver)}. It ran the full pre-landing suite in a batch of its own.` : "";
-        if (!comments.omit.includes("landed")) comment(c, pr, `landed:${a.n}`, `Landed in ${cfg.names.main} at \`${op.after}\` (batch ${a.n}, pin \`${auth.head}\`).${prioritised(auth)}${waived}`);
+        const as = moved ? `, squashed as \`${moved.after}\`, which its branch now points at` : "";
+        if (!comments.omit.includes("landed")) comment(c, pr, `landed:${a.n}`, `Landed in ${cfg.names.main} at \`${op.after}\` (batch ${a.n}, pin \`${auth.head}\`${as}).${prioritised(auth)}${waived}`);
         delete s.auth[String(pr)];
       }
       record(c, { n: a.n, outcome: "landed", prs: a.prs, head: op.after, note: `main ${op.before} -> ${op.after}` });
@@ -323,9 +329,33 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
       return finish(`landing not applied: ${result.reason}`);
     }
     if (result.kind === "baseMoved") return finish("main moved before landing; the next tick rebuilds");
+    // Nothing moved: the next tick's revalidation sees the new head, drops that PR and rebuilds the rest (§5.3 rule 3).
+    if (result.kind === "headMoved") return finish(`landing not applied: ${result.prs.map((p) => `#${p}`).join(" ")} moved since admission; the next tick drops ${result.prs.length > 1 ? "them" : "it"} and rebuilds the rest`);
   }
 
   throw new Error(`applyOpResult: ${result.kind} does not fit op ${op.kind}`);
+}
+
+/**
+ * Linear landing (DESIGN.md §7.4), with main still at its base after the
+ * update failed or its outcome was lost: GitHub applies the update atomically,
+ * so no PR branch may be at its stack commit. One that is means the promise
+ * was broken: pause, and say which branches to restore. A branch at anything
+ * else than its admitted head was pushed to: the update was refused for it,
+ * and the next tick drops it. Null: every branch is untouched.
+ */
+export function headsVerdict(heads: Extract<Op, { kind: "land" }>["heads"], now: Record<string, string | null> | undefined): OpResult | null {
+  if (!heads || !now) return null;
+  const half = heads.filter((h) => now[String(h.pr)] === h.after);
+  if (half.length > 0) {
+    return {
+      kind: "landRejected",
+      retry: false,
+      reason: `the linear landing moved ${half.map((h) => `${h.ref} (#${h.pr}) to ${h.after}`).join(", ")} but not main, which GitHub's atomic updateRefs should never do; restore ${half.length > 1 ? "each branch to its admitted head" : `it to ${half[0]!.before}`} (${half.map((h) => `#${h.pr}: ${h.before}`).join(", ")}) before resuming`,
+    };
+  }
+  const moved = heads.filter((h) => now[String(h.pr)] !== h.before).map((h) => h.pr);
+  return moved.length > 0 ? { kind: "headMoved", prs: moved } : null;
 }
 
 export interface Observation {
@@ -342,6 +372,8 @@ export interface Observation {
   /** land: current main, and whether op.after is main or an ancestor of it. */
   main?: string;
   afterReachable?: boolean;
+  /** land, linear (DESIGN.md §7.4): each moved PR branch's current commit (null: absent), by PR; read only while main is still op.before. */
+  heads?: Record<string, string | null>;
 }
 
 export type Recovery = OpResult | { kind: "resumeBuild"; head: string };
@@ -403,7 +435,7 @@ export function interpretObservation(
     }
     case "land":
       if (o.afterReachable === true) return { kind: "landed" };
-      if (o.main === op.before) return { kind: "landRejected", retry: true, reason: "not applied" };
+      if (o.main === op.before) return headsVerdict(op.heads, o.heads) ?? { kind: "landRejected", retry: true, reason: "not applied" };
       return { kind: "baseMoved" };
     case "cancel":
       return { kind: "retryOp" };

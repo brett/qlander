@@ -15,7 +15,7 @@ import { describe, expect, test } from "bun:test";
 import type { Config } from "../src/config";
 import { DEFAULT_LINEAR_BODY, linearReleaseProblems, parseConfig } from "../src/config/load";
 import { fenced } from "../src/fenced";
-import { forceUpdateOf } from "../src/force-update";
+import { BLOCKS_DIRECT_UPDATE, classicProtection, forceUpdateOf } from "../src/force-update";
 import { TargetClient } from "../src/github/target";
 import { headsVerdict } from "../src/ops";
 import { type CrashPoint, linearMessage, policyHash } from "../src/queue";
@@ -886,6 +886,38 @@ describe("force-update compatibility at admission", () => {
     expect(await forceUpdateOf(t, "feat/x", cache)).toEqual({ kind: "allowed" });
     expect(await forceUpdateOf(t, "feat/y", cache)).toEqual({ kind: "allowed" });
     expect(reads).toBe(1); // only ruleset 1 blocks a forced update, and it is cached
+  });
+
+  test("forceUpdateOf: every rule that refuses a forced update denies it without a bypass, and passes with one", async () => {
+    // required_status_checks was seen refusing a real landing: 'Required status check "x" is expected.'
+    expect(BLOCKS_DIRECT_UPDATE).toContain("required_status_checks");
+    for (const type of ["non_fast_forward", ...BLOCKS_DIRECT_UPDATE]) {
+      const t = new FakeTarget();
+      t.branchRulesets = [{ id: 1, name: "r", covers: () => true, types: [type], bypass: "never" }];
+      const v = await forceUpdateOf(t, "feat/x", new Map());
+      expect(v.kind).toBe("denied");
+      expect((v as { rule: string }).rule).toContain(type);
+      t.branchRulesets = [{ id: 1, name: "r", covers: () => true, types: [type], bypass: "always" }];
+      expect(await forceUpdateOf(t, "feat/x", new Map())).toEqual({ kind: "allowed" });
+    }
+  });
+
+  test("forceUpdateOf: a rule the landing satisfies or never meets does not hold the PR; required signatures only hold unsigned author commits", async () => {
+    const t = new FakeTarget();
+    t.branchRulesets = [{ id: 1, name: "r", covers: () => true, types: ["creation", "deletion", "required_linear_history", "copilot_code_review", "commit_message_pattern", "file_path_restriction"], bypass: "never" }];
+    expect(await forceUpdateOf(t, "feat/x", new Map())).toEqual({ kind: "allowed" });
+    t.branchRulesets = [{ id: 1, name: "r", covers: () => true, types: ["required_signatures"], bypass: "never" }];
+    expect(await forceUpdateOf(t, "feat/x", new Map(), "app")).toEqual({ kind: "allowed" });
+    expect((await forceUpdateOf(t, "feat/x", new Map(), "author")).kind).toBe("denied");
+  });
+
+  test("classicProtection: GitHub's protected flag is true for a ruleset too; protection.enabled says which", () => {
+    // As GET /branches/{b} answers, even anonymously, for a branch with rulesets only (its classic endpoint: 404).
+    expect(classicProtection({ protected: true, protection: { enabled: false, required_status_checks: { enforcement_level: "off", contexts: [], checks: [] } } } as never)).toBe(false);
+    expect(classicProtection({ protected: true, protection: { enabled: true } })).toBe(true);
+    expect(classicProtection({ protected: false, protection: { enabled: false } })).toBe(false);
+    // An answer without the field is not proof of no protection: stay with the advisory unknown.
+    expect(classicProtection({ protected: true })).toBe(true);
   });
 });
 

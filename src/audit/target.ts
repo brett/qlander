@@ -120,18 +120,18 @@ export async function t9(cfg: LoadedConfig, gh: AuditGh, repo: string): Promise<
 
 // --- T10: release ---------------------------------------------------------------
 
-export async function t10(cfg: LoadedConfig, view: RepoView, wfs: Wf[], c: RulesetCtx | null, releaseApp: AppIdentity | undefined): Promise<Finding[]> {
+export async function t10(cfg: LoadedConfig, view: RepoView, wfs: Wf[], c: RulesetCtx | null, releaseApp: AppIdentity | undefined, otherApps: readonly AppIdentity[] = []): Promise<Finding[]> {
   if (!cfg.release.enabled) return [skipped("T10", "release advance is off (release.enabled: false)")];
   const out: Finding[] = [];
   try {
-    await t10Checks(out, cfg, view, wfs, c, releaseApp);
+    await t10Checks(out, cfg, view, wfs, c, releaseApp, otherApps);
   } catch (e) {
     out.push(couldNotCheck("T10", "T10", e)); // what it had found still counts
   }
   return out;
 }
 
-async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs: Wf[], c: RulesetCtx | null, releaseApp: AppIdentity | undefined): Promise<void> {
+async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs: Wf[], c: RulesetCtx | null, releaseApp: AppIdentity | undefined, otherApps: readonly AppIdentity[]): Promise<void> {
   const R = cfg.release;
   // In dry run nothing ships through release advance, so its gaps are warnings.
   const sev = R.dryRun ? warn : fail;
@@ -147,7 +147,7 @@ async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs:
   // Linear landing with dispatch (DESIGN.md §7.4, §9): release only fast-forwards to main commits, so its landing ruleset
   // restricts updates, the promote Apps must be able to move it, and there are no PRs into release to check.
   const linear = linearDispatch(cfg);
-  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, !linear, { appMustNotBypass: R.mode === "dispatch", promoterApps: R.dispatch?.promoterApps ?? [], promoterUpdates: linear }), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
+  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, !linear, { appMustNotBypass: R.mode === "dispatch", promoterApps: R.dispatch?.promoterApps ?? [], otherApps, promoterUpdates: linear }), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
   for (const e of linear ? [] : cfg.config.preLanding) {
     const w = wfs.find((x) => x.path === e.path);
     if (!w?.wf) continue;
@@ -163,6 +163,12 @@ async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs:
     out.push(f ? pass("T10", `${what} ${path} exists on ${main}`) : sev("T10", `${what} ${path} does not exist on ${main}${tag}`, "add it, or fix release.qualification"));
     return f;
   };
+  // GitHub dispatches the file on the configured ref, so that is where it has to be. T12 leaves a missing named file to this check.
+  if (R.mode === "dispatch" && R.dispatch) {
+    const { workflow, ref } = R.dispatch;
+    const f = await (ref === main ? view : new RepoView(view.gh, view.repo, ref)).file(workflow);
+    out.push(f ? pass("T10", `the promote workflow ${workflow} exists on ${ref}`) : sev("T10", `the promote workflow ${workflow} does not exist on ${ref}${tag}`, "add it, or fix release.dispatch.workflow"));
+  }
   // The provider's evidence has been seen on main: its proof workflow has run, and its status context is on a recent commit.
   const ran = async (path: string) => {
     try {
@@ -268,7 +274,7 @@ export async function auditTarget(gh: AuditGh, cfg: LoadedConfig, apps: AppIdent
     out.push(...(await guard("T8", "T8", () => t8(cfg, ctx, queueApp, releaseApp, classic))));
   }
   out.push(...(await guard("T9", "T9", () => t9(cfg, gh, repo))));
-  out.push(...(await guard("T10", "T10", () => t10(cfg, view, wfs ?? [], rc, releaseApp))));
+  out.push(...(await guard("T10", "T10", () => t10(cfg, view, wfs ?? [], rc, releaseApp, apps.filter((a) => a.role !== "release")))));
   out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11", cfg.release, cfg.runner.epochFence))));
   out.push(...(await guard("T12", "T12", () => t12(cfg, view))));
   out.push(...(await guard("T13", "T13", () => t13(cfg, gh, repo, rc, queueApp, admin))));

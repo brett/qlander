@@ -110,7 +110,7 @@ export const echoesId = (title: string, id: string) => new RegExp(`(^|[^A-Za-z0-
 const runUrl = (cfg: ReleaseDeps["cfg"], id: number) => `https://github.com/${cfg.names.target.owner}/${cfg.names.target.name}/actions/runs/${id}`;
 
 /** Concluded by qlander, not by GitHub: the run could not be followed. A real run left like this may still be promoting, so it pauses. */
-const UNFOLLOWED = new Set(["never-appeared", "stuck", "ambiguous", "missing", "foreign-attempt", "unauthenticated"]);
+const UNFOLLOWED = new Set(["never-appeared", "stuck", "ambiguous", "missing", "foreign-attempt", "unauthenticated", "unverified"]);
 
 /** Untrusted target text for an issue comment: one line, no markdown that could break out of a code span, bounded. */
 const plain = (s: string, max = 100) => s.replace(/[\s`<>]+/g, " ").trim().slice(0, max);
@@ -302,6 +302,8 @@ export class DispatchTick extends ReleaseTickBase {
     if (run.conclusion === "success") {
       // A green run counts only with GitHub's own completion time, which the validity window runs from.
       if (at === null) {
+        // Bounded like every other wait: without that time it can never count as a pass, and it must not hold the candidate forever.
+        if (now - Date.parse(run.created_at) > this.cfg.runHours * 3_600_000) return done("unverified", `run ${run.id}, attempt ${run.run_attempt}, reports success, but its jobs did not say when it completed within ${this.cfg.runHours} hours of its start, so it does not count as a pass`);
         this.log.push(`${r.kind} run ${run.id}: completed, but its jobs do not yet say when; waiting`);
         return r;
       }

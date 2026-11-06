@@ -7,8 +7,9 @@
 //     without admin; classic protection needs an admin token, and without one
 //     that half is SKIPPED, never assumed off.
 //   - The landing force-updates same-repo PR head branches: every ruleset
-//     with non_fast_forward or update that covers such a branch must list
-//     the queue App as a bypass actor, by App id, with bypass mode "always".
+//     with a rule that refuses that (blockingRules, the list admission uses)
+//     and covers such a branch must list the queue App as a bypass actor, by
+//     App id, with bypass mode "always".
 //     An open PR's branch proven blocked FAILs; a pattern that could cover a
 //     future PR branch WARNs; an unreadable bypass list is SKIPPED (marked
 //     inconclusive when the read failed), never a guess. Classic protection
@@ -19,7 +20,7 @@
 import type { LoadedConfig } from "../config/load";
 import { epochBranchFor } from "../config/runner";
 import { GitHubError } from "../github/http";
-import { BLOCKING_RULES } from "../force-update";
+import { blockingRules, classicProtection } from "../force-update";
 import { isForbiddenHeadRef, isGitBranchName } from "../validate";
 import type { AppIdentity } from "./apps";
 import { why } from "./repo-view";
@@ -28,8 +29,6 @@ import { appliesTo, hasRule, type Ruleset } from "./rulesets";
 import { type AuditGh, fail, type Finding, pass, skipped, unread, warn } from "./types";
 
 const ID = "T13";
-
-const blocking = (r: Ruleset) => BLOCKING_RULES.filter((t) => hasRule(r, t));
 
 /** The queue App, by id, may always bypass this ruleset (a direct update, not only through a PR). */
 const appBypasses = (r: Ruleset, app: AppIdentity | undefined) =>
@@ -78,6 +77,7 @@ export async function t13(cfg: LoadedConfig, gh: AuditGh, repo: string, c: Rules
   if (!landing) return [];
   const N = cfg.config.names;
   const out: Finding[] = [];
+  const blocking = (r: Ruleset) => blockingRules(landing.author).filter((t) => hasRule(r, t));
 
   // --- unsigned commits by the PR's author
   if (landing.author === "author") {
@@ -137,8 +137,8 @@ export async function t13(cfg: LoadedConfig, gh: AuditGh, repo: string, c: Rules
   // --- classic protection on open PR branches
   for (const b of prs ?? []) {
     try {
-      const br = await gh.get<{ protected?: boolean }>(`repos/${repo}/branches/${b.split("/").map(encodeURIComponent).join("/")}`);
-      if (br.protected !== true) continue;
+      const br = await gh.get<{ protected?: unknown; protection?: { enabled?: unknown } }>(`repos/${repo}/branches/${b.split("/").map(encodeURIComponent).join("/")}`);
+      if (!classicProtection(br)) continue;
       if (!admin) {
         out.push(skipped(ID, `${b}: classic branch protection not read (needs an admin token)`, "rerun with an admin token"));
         continue;

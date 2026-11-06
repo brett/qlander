@@ -989,7 +989,7 @@ Run a pinned release instead of the control repo's own source. .github/qlander-r
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `bundle.repo` | [owner/name](#formats) | required | The repo whose releases hold the bundle. |
+| `bundle.repo` | [owner/name](#formats) | required | The repo whose releases hold the bundle. After changing it, run `render`: it also updates the download in `ci.yml` and `verify-sandbox.yml`. |
 | `bundle.private` | boolean | `false` | Download through the API with the job's own token, which reads only the control repo, so repo must be the control repo. False: an anonymous download of a public release. |
 | `bundle.watchdog` | boolean | `true` | Run the bundle in watchdog.yml too. False keeps the watchdog on the source in its checkout, so a broken release cannot also silence the alarm. |
 

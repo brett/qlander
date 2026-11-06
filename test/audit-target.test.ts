@@ -235,12 +235,35 @@ describe("T10: release", () => {
     };
     const setupWorld = (cfg: LoadedConfig) => {
       const r = releaseWorld();
+      r[`${T}/contents/.github/workflows/promote.yml`] = file("name: Promote\non:\n  workflow_dispatch:\njobs: {}\n");
       targetRulesets(cfg, true)
         .filter((s) => s.name.startsWith("release-"))
         .forEach((s, i) => (r[`${T}/rulesets/${6 + i}`] = { id: 6 + i, ...rulesetBody(s, null, { release: RELEASE_APP, queue: QUEUE_APP }) }));
       return r;
     };
     const bad = (f: Awaited<ReturnType<typeof audit>>) => lines(f, "T10").filter((l) => !l.startsWith("PASS"));
+    test("a promote workflow that does not exist fails T10, on the ref it would be dispatched from", async () => {
+      const cfg = dispatchOn(false);
+      const r = setupWorld(cfg);
+      expect(lines(await audit(r, cfg), "T10")).toContain("PASS the promote workflow .github/workflows/promote.yml exists on trunk");
+      delete r[`${T}/contents/.github/workflows/promote.yml`];
+      expect(bad(await audit(r, cfg))).toContain("FAIL the promote workflow .github/workflows/promote.yml does not exist on trunk");
+    });
+
+    test("the queue App as a promoter fails T10, listed in the config or only on the ruleset, as setup refuses it", async () => {
+      const r = setupWorld(dispatchOn(false));
+      const landing = Object.keys(r).find((k) => (r[k] as { name?: string })?.name === "release-landing")!;
+      (r[landing] as { bypass_actors: unknown[] }).bypass_actors = [{ ...app(QUEUE_APP), bypass_mode: "always" }];
+      const asPromoter = dispatchOn(false);
+      asPromoter.release = { ...asPromoter.release, dispatch: { ...asPromoter.release.dispatch!, promoterApps: [QUEUE_APP] } };
+      const found = bad(await audit(r, asPromoter));
+      expect(found.some((l) => l.startsWith(`FAIL release.dispatch.promoterApps lists ${QUEUE_APP}, which is the queue App`))).toBe(true);
+      expect(found.some((l) => l.startsWith('FAIL stable: landing ruleset "release-landing" lists the queue App'))).toBe(true);
+      const onlyOnRuleset = bad(await audit(r, dispatchOn(false)));
+      expect(onlyOnRuleset.filter((l) => l.includes("lists the queue App")).length).toBe(1);
+      expect(onlyOnRuleset.some((l) => l.includes("bypass actors other than"))).toBe(false);
+    });
+
     test("merge mode: what setup writes passes without an update rule, and the pre-landing workflows must still run on PRs into release", async () => {
       const cfg = dispatchOn(false);
       const f = await audit(setupWorld(cfg), cfg);

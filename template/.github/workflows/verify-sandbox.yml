@@ -14,7 +14,8 @@
 #   cross    queue-write:   the release epoch as the other App
 # The admin phase runs on your own machine, with an org admin's token.
 #
-# Unlike tick.yml, this file is not rendered: edit it by hand if you must.
+# Unlike tick.yml, only this file's qlander download is rendered (`render`
+# keeps it in line with `bundle`). Edit the rest by hand if you must.
 
 name: verify-sandbox
 

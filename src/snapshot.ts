@@ -194,7 +194,7 @@ async function describePr(i: SnapshotInput, n: number, l: Lookups): Promise<Live
   if (bot) live.automation = await trustOf(i, bot, pr.head.ref, head, diff);
   live.fastLane = await fastLaneProof(i, head, l);
   // Linear landing (DESIGN.md §7.4): can the landing move this branch? Never fails the snapshot.
-  if (i.cfg.landing && isGitBranchName(pr.head.ref) && !isForbiddenHeadRef(i.cfg.names, pr.head.ref)) live.forceUpdate = await forceUpdateOf(i.api, pr.head.ref, l.bypass);
+  if (i.cfg.landing && isGitBranchName(pr.head.ref) && !isForbiddenHeadRef(i.cfg.names, pr.head.ref)) live.forceUpdate = await forceUpdateOf(i.api, pr.head.ref, l.bypass, i.cfg.landing.author);
   const auth = i.state.auth[String(n)];
   live.review = i.cfg.reviewRequired
     ? await reviewProof(i, head, l, auth && auth.head === head ? auth.reviewRun : null)

@@ -49,7 +49,7 @@ export interface DispatchRecord {
   sent: "yes" | "unknown";
   /** The authenticated run (DESIGN.md §8.1), with GitHub's created_at: the evidence that it started. */
   run: { id: number; url: string; createdAt: string } | null;
-  /** The run's conclusion once completed, or what qlander concluded: never-appeared, stuck. Null while in flight. */
+  /** The run's conclusion once completed, or what qlander concluded: never-appeared, stuck, unverified. Null while in flight. */
   conclusion: string | null;
   /** When the run completed, from its latest attempt's jobs (GitHub's clock); qlander's own clock only for a conclusion it drew itself. */
   concludedAt: string | null;

@@ -6,7 +6,7 @@
 import { type ControlMainProtection, type LoadedConfig, STRICT_CONTROL_MAIN } from "../config/load";
 import { GitHubError } from "../github/http";
 import { CONTROL_BRANCH } from "../job-names";
-import { firstDifference, renderWorkflows } from "../render";
+import { firstDifference, HAND_WORKFLOWS, hasBundleDownload, renderWorkflows, withBundleDownload } from "../render";
 import { appChecks, type AppIdentity } from "./apps";
 import { type RepoInfo, RepoView, why } from "./repo-view";
 import { refsRuleset, type RulesetCtx } from "./ruleset-checks";
@@ -153,6 +153,19 @@ export async function c7(cfg: LoadedConfig, view: RepoView): Promise<Finding[]> 
     }
     const d = firstDifference(f.text, have.text);
     out.push(d ? fail("C7", `${f.path} differs from its rendering at line ${d.line}`, "run `render` and commit the result", [`rendered:   ${d.want}`, `checked in: ${d.have}`]) : pass("C7", `${f.path} matches its rendering`));
+  }
+  // Hand-edited, so only their download is judged, and only as a WARN. A file without one (or none at all) is not qlander's to judge.
+  for (const path of cfg.bundle ? HAND_WORKFLOWS : []) {
+    let have: Awaited<ReturnType<RepoView["file"]>>;
+    try {
+      have = await view.file(path);
+    } catch (e) {
+      out.push(couldNotCheck("C7", path, e));
+      continue;
+    }
+    if (!have || !hasBundleDownload(have.text)) continue;
+    const d = firstDifference(withBundleDownload(have.text, cfg.bundle!), have.text);
+    out.push(d ? warn("C7", `${path}: its qlander download differs from bundle`, "run `render` and commit the result", [`rendered:   ${d.want}`, `checked in: ${d.have}`]) : pass("C7", `${path}: its qlander download matches bundle`));
   }
   return out;
 }

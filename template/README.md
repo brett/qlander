@@ -15,7 +15,7 @@ Qlander itself is supported best effort. Report problems in [brett/qlander](http
 | `.github/bun-release.txt` | The pinned Bun release the jobs run it with, in the same format. |
 | `.github/workflows/tick.yml`, `watchdog.yml` | Rendered from `qlander.yml`. Never edit them by hand. |
 | `.github/workflows/ci.yml` | PR checks: the config is valid, and the two workflows are exactly its rendering. |
-| `.github/workflows/verify-sandbox.yml` | The rollout's sandbox check, run by hand. Not rendered. |
+| `.github/workflows/verify-sandbox.yml` | The rollout's sandbox check, run by hand. Only its qlander download is rendered. |
 | `AGENTS.md` | For a coding agent working in this repo. |
 | `agent-landing-rules.md` | Rules to copy into the target repo's agent instructions. |
 

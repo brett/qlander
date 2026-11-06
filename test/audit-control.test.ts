@@ -1,11 +1,13 @@
 // `qlander audit`, control checks C1–C8 (docs/deployment.md §4.2), the
 // command (flags, output, exit codes, the token), and the read-only reader.
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { auditCommand, runAudit } from "../src/audit/command";
 import { auditReader } from "../src/audit/reader";
 import type { LoadedConfig } from "../src/config/load";
 import { auditExitCode, type Finding, readFailed, unsettled } from "../src/audit/types";
-import { renderWorkflows } from "../src/render";
+import { HAND_WORKFLOWS, renderWorkflows, withBundleDownload } from "../src/render";
 import { GitHubError } from "../src/github/http";
 import { ACME, acmeConfig, app, C_REPO, fakeGh, file, forbidden, lines, type Routes, statuses, user, world } from "./audit-fake";
 
@@ -100,6 +102,27 @@ test("C7: a checked-in workflow that drifted from its rendering fails", async ()
   const f = (await audit(r)).filter((x) => x.id === "C7");
   expect(f.map((x) => x.status)).toEqual(["FAIL", "PASS"]);
   expect(f[0]!.message).toBe(".github/workflows/tick.yml differs from its rendering at line 1");
+});
+
+test("C7: a hand-edited workflow's download only warns when it differs from bundle, and is left out in source mode", async () => {
+  const b = { repo: "acme/qlander", private: false, watchdog: true };
+  const cfg = { ...acmeConfig(), bundle: b };
+  const path = HAND_WORKFLOWS[0]!;
+  const template = readFileSync(join(import.meta.dir, "..", "template", path), "utf8");
+  const download = (repo: string) => withBundleDownload(template, { ...b, repo });
+  const rendered = renderWorkflows(cfg);
+  const routes = (text: string | null) => {
+    const r = world();
+    for (const w of rendered) r[`${C}/contents/${w.path}`] = file(w.text);
+    if (text !== null) r[`${C}/contents/${path}`] = file(text);
+    return r;
+  };
+  const c7Lines = async (r: Routes, c: LoadedConfig = cfg) => (await runAudit(fakeGh(r), c, "control", {})).filter((x) => x.id === "C7" && x.message.includes(path)).map((x) => `${x.status} ${x.message}`);
+  expect(await c7Lines(routes(download("acme/qlander")))).toEqual([`PASS ${path}: its qlander download matches bundle`]);
+  expect(await c7Lines(routes(download("someone/else")))).toEqual([`WARN ${path}: its qlander download differs from bundle`]);
+  expect(await c7Lines(routes(null))).toEqual([]);
+  expect(await c7Lines(routes("name: ci\n"))).toEqual([]);
+  expect(await c7Lines(routes(download("someone/else")), acmeConfig())).toEqual([]);
 });
 
 test("C8: the state App's permissions", async () => {

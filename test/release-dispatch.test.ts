@@ -5,12 +5,16 @@
 // DispatchWorld tick checks that no ref writer on the target was called.
 
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fenced } from "../src/fenced";
 import { GitHubError } from "../src/github/http";
 import { TargetClient } from "../src/github/target";
 import { dispatchOnly, echoesId, dispatchIdFor, DISPATCH_REFUSALS } from "../src/release-dispatch";
 import { parseReleaseState } from "../src/release-state";
-import { releaseDryRun } from "../src/release-runner";
+import { releaseDryRun, type ReleaseResult } from "../src/release-runner";
+import { writeTickOutputs } from "../src/main";
 import { LostLockError } from "../src/store";
 import { APPROVER, BOT, DispatchWorld, PROMOTE, STRANGER } from "./release-world";
 import { CrashError } from "../src/queue";
@@ -960,6 +964,110 @@ describe("dispatch mode: re-arm", () => {
     expect(w.issues(ALERT).some((i) => i.title.includes("budget"))).toBe(true);
     w.cfg = { ...w.cfg, dispatch: { ...w.dcfg, budget: { window: 8, windowHours: 24 } } };
     expect((await w.ok()).outcome).toBe("dispatched");
+  });
+});
+
+describe("dispatch mode: a green run whose jobs never say when it completed", () => {
+  /** Only the promote workflow's runs: main's qualification keeps reading its CI's jobs. */
+  const noJobs = (w: DispatchWorld, truncated: boolean) => {
+    const real = FakeTarget.prototype.listJobs.bind(w.target);
+    w.target.listJobs = async (id) => ((await w.target.getRun(id))?.path === PROMOTE ? { items: [], truncated } : real(id));
+  };
+  for (const truncated of [false, true]) {
+    test(`dry run, listing ${truncated ? "truncated" : "empty"}: waits, then ends visibly after runHours, never as a pass`, async () => {
+      const w = new DispatchWorld({ runHours: 1 });
+      noJobs(w, truncated);
+      const a = w.land();
+      w.qualified(a);
+      expect((await w.ok()).outcome).toBe("dispatched");
+      expect((await w.ok()).outcome).toBe("waiting");
+      const rs = await w.until((r) => r.outcome !== "waiting", 12);
+      expect(rs.at(-1)!.outcome).toBe("alert");
+      expect(w.candidate()).toBeNull();
+      expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "dry-failed", note: expect.stringContaining("unverified") });
+      // Nothing green is on record for it, and the next commit is not held up.
+      const b = w.land();
+      w.qualified(b);
+      expect((await w.ok()).outcome).toBe("dispatched");
+      expect(w.candidate()).toMatchObject({ sha: b });
+    });
+  }
+
+  test("real run that did reach release: still paused, and recorded as incomplete, not as a promotion", async () => {
+    const { w, a } = await greenDry({ runHours: 1 });
+    w.approve(a);
+    await w.ok();
+    noJobs(w, false);
+    await w.until((r) => r.outcome === "paused", 12);
+    expect(w.candidate()).toBeNull();
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "incomplete", note: expect.stringContaining("unverified") });
+  });
+
+  test("real run: closed and paused like any run that could not be followed", async () => {
+    const { w, a } = await greenDry({ runHours: 1 });
+    w.behave = ({ kind }) => (kind === "real" ? { moveRelease: false } : {});
+    w.approve(a);
+    await w.ok(); // real dispatched: the dry run's own recheck, just before, read its jobs
+    noJobs(w, false);
+    await w.until((r) => r.outcome === "paused", 12);
+    expect(w.candidate()).toBeNull();
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "real-failed", note: expect.stringContaining("unverified") });
+    expect(w.issues("release-pause").at(-1)!.body).toContain("could not be followed");
+  });
+});
+
+describe("dispatch mode: turning the epoch fence off with a read-only token", () => {
+  const fenced = async () => {
+    const w = new DispatchWorld({}, {});
+    w.cfg = { ...w.cfg, runner: { ...w.cfg.runner, epochFence: true } };
+    w.target.epochBranch = `${w.cfg.runner.epochPrefix}release`;
+    const a = w.land();
+    w.qualified(a);
+    expect((await w.ok()).outcome).toBe("dispatched");
+    w.cfg = { ...w.cfg, runner: { ...w.cfg.runner, epochFence: false } };
+    w.target.epochBranch = null;
+    return w;
+  };
+
+  test("a refused void leaves the lease untaken and asks for the write token; with it the record goes, and later ticks need nothing", async () => {
+    const w = await fenced();
+    const voidEpoch = w.target.voidEpoch.bind(w.target);
+    w.target.voidEpoch = async () => {
+      throw new GitHubError("auth", 403, "Resource not accessible by integration");
+    };
+    const stranded = await w.tick();
+    expect(stranded).toMatchObject({ outcome: "busy", needsContentsWrite: true });
+    expect(w.state().epochBranch).toBeDefined();
+    let voids = 0;
+    w.target.voidEpoch = async (b, m) => (voids++, voidEpoch(b, m));
+    expect((await w.tick() as { outcome: string }).outcome).not.toBe("busy");
+    expect(voids).toBe(1);
+    expect(w.state().epochBranch).toBeUndefined();
+    w.target.voidEpoch = async () => {
+      throw new GitHubError("auth", 403, "Resource not accessible by integration");
+    };
+    const after = await w.tick() as ReleaseResult;
+    expect(after.outcome).not.toBe("busy");
+    expect(after.needsContentsWrite).toBeUndefined();
+  });
+
+  test("any other failure to void is not a reason to ask for write", async () => {
+    const w = await fenced();
+    w.target.voidEpoch = async () => {
+      throw new GitHubError("server", 502, "Bad gateway");
+    };
+    const r = await w.tick() as ReleaseResult;
+    expect(r.outcome).toBe("busy");
+    expect(r.needsContentsWrite).toBeUndefined();
+  });
+
+  test("the tick tells the next steps through GITHUB_OUTPUT, only when asked", () => {
+    const out = join(mkdtempSync(join(tmpdir(), "tick-out-")), "output");
+    writeTickOutputs({ outcome: "busy", log: [], decision: null }, { GITHUB_OUTPUT: out });
+    expect(existsSync(out)).toBe(false);
+    writeTickOutputs({ outcome: "busy", log: [], decision: null, needsContentsWrite: true }, {});
+    writeTickOutputs({ outcome: "busy", log: [], decision: null, needsContentsWrite: true }, { GITHUB_OUTPUT: out });
+    expect(readFileSync(out, "utf8")).toBe("needs-contents-write=true\n");
   });
 });
 

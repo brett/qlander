@@ -20,6 +20,8 @@ import { releaseTokenPermissions } from "./release-permissions";
 /** The workflow files, relative to the control repo's root. */
 export const TICK_WORKFLOW = ".github/workflows/tick.yml";
 export const WATCHDOG_WORKFLOW = ".github/workflows/watchdog.yml";
+/** Hand-edited workflows that also run the bundle: `render` keeps only their download in line with `bundle` (withBundleDownload). */
+export const HAND_WORKFLOWS = [".github/workflows/ci.yml", ".github/workflows/verify-sandbox.yml"];
 
 /** How often the watchdog runs. */
 export const WATCHDOG_CRON_MINUTES = 15;
@@ -103,10 +105,13 @@ export const BUNDLE_SECONDS = 20;
 /** A private release's listing. */
 export const RELEASE_LISTING_SECONDS = 10;
 
-/** Download, verify and run the pinned bundle (bundle set). */
-function bundleLines(b: Bundle, args: string): string[] {
+const ASSET_NAME_CHECK = '          [[ "$relasset" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\\.js$ ]]';
+const ASSET_SUM_CHECK = '          (cd "$dir" && echo "${relsum}  ${relasset}" | sha256sum -c -)';
+
+/** The lines that fetch the pinned bundle into $dir, public or private. */
+function downloadLines(b: Bundle): string[] {
   const curl = CURL;
-  const download = b.private
+  return b.private
     ? [
         `          # A private release of ${b.repo},`,
         "          # read through the API with this job's own token (contents: read),",
@@ -127,14 +132,18 @@ function bundleLines(b: Bundle, args: string): string[] {
         `          timeout ${BUNDLE_SECONDS} ${curl} \\`,
         `            --output "$dir/$relasset" "https://github.com/${b.repo}/releases/download/v\${relversion}/\${relasset}"`,
       ];
+}
+
+/** Download, verify and run the pinned bundle (bundle set). */
+function bundleLines(b: Bundle, args: string): string[] {
   return [
     '          bun="$dir/${asset%.zip}/bun"',
     "          # The pinned qlander release, checked against the sha256 committed in",
     `          # ${PIN_FILE} before it runs. The checksum is the trust root.`,
     `          read -r relversion relasset relsum < ${PIN_FILE}`,
-    '          [[ "$relasset" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*\\.js$ ]]',
-    ...download,
-    '          (cd "$dir" && echo "${relsum}  ${relasset}" | sha256sum -c -)',
+    ASSET_NAME_CHECK,
+    ...downloadLines(b),
+    ASSET_SUM_CHECK,
     `          ${qlanderCommand({ bundle: b }, args)}`,
   ];
 }
@@ -175,10 +184,11 @@ function stateTokenStep(n: Names): string[] {
 }
 
 /** The App token for the target repo, with exactly the job's permissions. */
-function targetTokenStep(n: Names, app: "queue" | "release", secret: string, permissions: [string, string][]): string[] {
+function targetTokenStep(n: Names, app: "queue" | "release", secret: string, permissions: [string, string][], guarded?: { id: string; if: string }): string[] {
   return [
-    `      - name: Mint the ${app} App token (${n.target.name} only, least privilege)`,
-    "        id: target",
+    guarded ? `      - name: Mint the ${app} App token with Contents write (${n.target.name} only, to void a recorded epoch branch)` : `      - name: Mint the ${app} App token (${n.target.name} only, least privilege)`,
+    `        id: ${guarded?.id ?? "target"}`,
+    ...(guarded ? [`        if: ${guarded.if}`] : []),
     `        uses: ${APP_TOKEN}`,
     "        with:",
     `          client-id: \${{ secrets.${secret}_CLIENT_ID }}`,
@@ -307,6 +317,17 @@ export function renderTick(c: RenderInput): string {
     ...runScript(c, "tick queue"),
   ];
   if (release) {
+    // Dispatch mode with the fence off is the one release job whose token can't void an epoch branch.
+    const readOnly = c.release.mode === "dispatch" && !r.epochFence;
+    const releaseSteps = (write: boolean) =>
+      Object.entries({ ...releaseTokenPermissions({ mode: c.release.mode ?? "advance", dispatch: c.release.dispatch ?? null }, r.epochFence), ...(write ? { contents: "write" } : {}) }).map(([k, v]): [string, string] => [k.replace(/_/g, "-"), v]);
+    const tickEnv = (step: string) => [
+      "        env:",
+      `          ${scalar(c.tokens.release)}: \${{ steps.${step}.outputs.token }}`,
+      "          STATE_TOKEN: ${{ steps.state.outputs.token }}",
+      "          GITHUB_TOKEN: ${{ github.token }}",
+      "          QLANDER_MODE: ${{ vars.QLANDER_MODE }}",
+    ];
     lines.push(
       "",
       "  release:",
@@ -330,18 +351,28 @@ export function renderTick(c: RenderInput): string {
       ...checkoutStep(n),
       "",
       // release.mode dispatch: actions: write (dispatching the target's release workflow), contents: read (write only for the epoch fence), no workflows, and, with a freeze, actions-variables: read.
-      ...targetTokenStep(n, "release", "RELEASE_APP", Object.entries(releaseTokenPermissions({ mode: c.release.mode ?? "advance", dispatch: c.release.dispatch ?? null }, r.epochFence)).map(([k, v]) => [k.replace(/_/g, "-"), v])),
+      ...targetTokenStep(n, "release", "RELEASE_APP", releaseSteps(false)),
       "",
       ...stateTokenStep(n),
       "",
       '      - name: Run one release tick (a dry run unless QLANDER_MODE is "live" and release advance is enabled)',
-      "        env:",
-      `          ${scalar(c.tokens.release)}: \${{ steps.target.outputs.token }}`,
-      "          STATE_TOKEN: ${{ steps.state.outputs.token }}",
-      "          GITHUB_TOKEN: ${{ github.token }}",
-      "          QLANDER_MODE: ${{ vars.QLANDER_MODE }}",
+      ...(readOnly ? ["        id: tick"] : []),
+      ...tickEnv("target"),
       ...runScript(c, "tick release"),
     );
+    // The token above can't void a predecessor's epoch branch left by turning the fence off (docs/deployment.md §3.4). Only then, a tick with one that can.
+    if (readOnly) {
+      const asked = "steps.tick.outputs.needs-contents-write == 'true'";
+      lines.push(
+        "",
+        ...targetTokenStep(n, "release", "RELEASE_APP", releaseSteps(true), { id: "void", if: asked }),
+        "",
+        "      - name: Run the release tick again, to void the recorded epoch branch",
+        `        if: ${asked}`,
+        ...tickEnv("void"),
+        ...runScript(c, "tick release"),
+      );
+    }
   }
   return `${lines.join("\n")}\n`;
 }
@@ -411,6 +442,48 @@ export function renderWorkflows(c: RenderInput): { path: string; text: string }[
     { path: TICK_WORKFLOW, text: renderTick(c) },
     { path: WATCHDOG_WORKFLOW, text: renderWatchdog(c) },
   ];
+}
+
+/** Give the step holding `at` the job's own token, which a private download reads. An `env:` in any other form is left alone, and the download then stops visibly. */
+function ensureTokenEnv(lines: string[], at: number): void {
+  let start = at;
+  while (start > 0 && !lines[start]!.startsWith("      - ")) start--;
+  let end = at;
+  while (end < lines.length && !lines[end]!.startsWith("      - ") && !/^ {0,5}\S/.test(lines[end]!)) end++;
+  const step = lines.slice(start, end);
+  if (step.some((l) => l.startsWith("          GITHUB_TOKEN:"))) return;
+  const token = "          GITHUB_TOKEN: ${{ github.token }}";
+  const env = step.indexOf("        env:");
+  const run = step.indexOf("        run: |");
+  if (env >= 0) lines.splice(start + env + 1, 0, token);
+  else if (run >= 0 && !step.some((l) => l.startsWith("        env:"))) lines.splice(start + run, 0, "        env:", token);
+}
+
+/** Whether a hand-edited workflow has a download withBundleDownload would recognise. */
+export function hasBundleDownload(text: string): boolean {
+  const lines = text.split("\n");
+  return lines.includes(ASSET_NAME_CHECK) && lines.includes(ASSET_SUM_CHECK);
+}
+
+/**
+ * A hand-edited workflow with its qlander downloads made what `bundle` renders
+ * (the lines between the asset name check and the sha256 check), and nothing
+ * else touched. A file without those two lines comes back unchanged.
+ */
+export function withBundleDownload(text: string, b: Bundle): string {
+  const lines = text.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]!);
+    if (lines[i] !== ASSET_NAME_CHECK) continue;
+    const end = lines.indexOf(ASSET_SUM_CHECK, i);
+    if (end < 0) continue;
+    out.push(...downloadLines(b));
+    i = end - 1;
+  }
+  // Last to first, so an insertion doesn't move the steps still to do.
+  if (b.private) for (let i = out.length - 1; i >= 0; i--) if (out[i] === ASSET_NAME_CHECK) ensureTokenEnv(out, i);
+  return out.join("\n");
 }
 
 /** The first line where two texts differ (1-based), or null when they are equal. */

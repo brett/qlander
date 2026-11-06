@@ -57,6 +57,8 @@ export interface DispatchConfig {
   ref: string;
   /** The workflow_dispatch input names qlander sets. */
   inputs: { sha: string; dryRun: string; dispatchId: string };
+  /** The release App's bot account: a run counts only if it is the run's actor and triggering actor (DESIGN.md §8.1). */
+  actor: Human;
   /** Whose `/qlander approve-release <sha>` comment counts (login and id). Never empty. */
   approvers: Human[];
   dryRunValidMinutes: number;

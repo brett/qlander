@@ -76,6 +76,8 @@ interface RawRun {
   created_at: string;
   run_started_at: string;
   display_title?: string;
+  actor?: RawAccount | null;
+  triggering_actor?: RawAccount | null;
 }
 
 const toRun = (r: RawRun): Run => ({
@@ -92,6 +94,8 @@ const toRun = (r: RawRun): Run => ({
   created_at: r.created_at,
   run_started_at: r.run_started_at ?? r.created_at,
   display_title: r.display_title ?? "",
+  actor: account(r.actor),
+  triggering_actor: account(r.triggering_actor),
 });
 
 export class TargetClient implements TargetApi {

@@ -25,6 +25,9 @@ function dispatchConfig(): string {
     "      sha: sha",
     "      dryRun: dry_run",
     "      dispatchId: dispatch_id",
+    "    actor:",
+    "      login: example-release[bot]",
+    "      id: 90000001",
     "    approvers:",
     `      - login: ${ME.login}`,
     `        id: ${ME.id}`,
@@ -41,7 +44,7 @@ function candidate(over: Partial<DispatchCandidate> = {}): DispatchCandidate {
     sha: A,
     receipt: { from: sha("release"), to: A, policyBlob: sha("blob"), proofRun: null, evidence: [] },
     since: at,
-    dry: { kind: "dry", id: `qlr-dry-${A.slice(0, 12)}-000000000000`, at, sent: "yes", run: { id: 9, url: "https://github.com/x/actions/runs/9" }, conclusion: "success", concludedAt: at },
+    dry: { kind: "dry", id: `qlr-dry-${A.slice(0, 12)}-000000000000`, at, sent: "yes", run: { id: 9, url: "https://github.com/x/actions/runs/9", createdAt: at }, conclusion: "success", concludedAt: at },
     reported: null,
     approval: null,
     real: null,
@@ -51,7 +54,7 @@ function candidate(over: Partial<DispatchCandidate> = {}): DispatchCandidate {
 }
 
 function world(c: DispatchCandidate | null = candidate(), configPath = dispatchConfig()): ControlWorld {
-  const s: ReleaseState = { ...emptyReleaseState(), dispatch: { candidate: c, window: [], history: [] } };
+  const s: ReleaseState = { ...emptyReleaseState(), dispatch: { candidate: c, highWater: c?.dry ? c.sha : null, window: [], history: [] } };
   const w = new ControlWorld(undefined, s);
   w.configPath = configPath;
   return w;

@@ -10,7 +10,9 @@ import { ConfigError, parseConfig } from "../src/config/load";
 import { policyHash } from "../src/queue";
 import { releaseTokenPermissions } from "../src/release-permissions";
 import { renderTick } from "../src/render";
-import { appSpecs } from "../src/setup/expected";
+import { appSpecs, targetRulesets } from "../src/setup/expected";
+import { rulesetBody, rulesetDiff } from "../src/setup/rulesets";
+import { branchRulesets } from "../src/audit/ruleset-checks";
 import { EXAMPLE } from "./setup-world";
 
 const base = readFileSync(EXAMPLE, "utf8");
@@ -22,6 +24,9 @@ const DISPATCH = [
   "      sha: sha",
   "      dryRun: dry_run",
   "      dispatchId: dispatch_id",
+  "    actor:",
+  "      login: acme-release[bot]",
+  "      id: 90000001",
   "    approvers:",
   "      - login: alice",
   "        id: 1001",
@@ -43,7 +48,7 @@ describe("release.mode", () => {
     const c = parseConfig(base);
     expect(c.release.mode).toBe("advance");
     expect(c.release.dispatch).toBeNull();
-    expect(releaseTokenPermissions(c.release)).toEqual({ contents: "write", workflows: "write", actions: "read", checks: "read", statuses: "read" });
+    expect(releaseTokenPermissions(c.release, false)).toEqual({ contents: "write", workflows: "write", actions: "read", checks: "read", statuses: "read" });
   });
 
   test("dispatch: the block with its defaults filled in", () => {
@@ -54,6 +59,7 @@ describe("release.mode", () => {
       ref: c.config.names.main,
       inputs: { sha: "sha", dryRun: "dry_run", dispatchId: "dispatch_id" },
       approvers: [{ login: "alice", id: 1001 }],
+      actor: { login: "acme-release[bot]", id: 90000001 },
       dryRunValidMinutes: 1440,
       appearMinutes: 30,
       runHours: 6,
@@ -72,7 +78,9 @@ describe("release.mode", () => {
     ["the block without the mode", DISPATCH.slice(1), /release.mode is not dispatch/],
     ["a ref that is neither main nor release", [...DISPATCH, "    ref: develop"], /release.dispatch.ref must be/],
     ["an input name used twice", DISPATCH.map((l) => l.replace("dispatchId: dispatch_id", "dispatchId: sha")), /inputs: sha is used twice/],
-    ["no approver", DISPATCH.slice(0, 7).concat(["    approvers: []"]), /needs at least 1/],
+    ["no approver", DISPATCH.slice(0, 10).concat(["    approvers: []"]), /needs at least 1/],
+    ["no actor", DISPATCH.filter((l, i) => i < 7 || i > 9), /missing actor/],
+    ["the job's own bot as an approver", [...DISPATCH, "      - login: acme-release[bot]", "        id: 90000001"], /must not include release.dispatch.actor/],
     ["an approver listed twice", [...DISPATCH, "      - login: alice", "        id: 1001"], /login alice is listed twice/],
     ["appearMinutes under two cron intervals", [...DISPATCH, "    appearMinutes: 5"], /appearMinutes \(5\) must be at least twice/],
     ["a GITHUB_ freeze variable", [...DISPATCH, "    freeze:", "      - variable: GITHUB_FREEZE", "        value: \"1\""], /GITHUB_/],
@@ -88,44 +96,82 @@ describe("release.mode", () => {
   });
 });
 
-describe("the release App's permissions in dispatch mode", () => {
-  test("Actions: write for the release App only; Variables: read only with a freeze", () => {
+describe("the release App's permissions in dispatch mode: least privilege", () => {
+  const FREEZE = [...DISPATCH, "    freeze:", "      - variable: RELEASE_FREEZE", "        value: \"true\""];
+  test("Actions: write and Contents: read, no Workflows; Contents: write only for the epoch fence; Variables: read only with a freeze", () => {
     const d = parseConfig(withRelease(DISPATCH));
-    expect(releaseTokenPermissions(d.release)).toEqual({ contents: "write", workflows: "write", actions: "write", checks: "read", statuses: "read" });
-    const f = parseConfig(withRelease([...DISPATCH, "    freeze:", "      - variable: RELEASE_FREEZE", "        value: \"true\""]));
-    expect(releaseTokenPermissions(f.release)).toMatchObject({ actions: "write", actions_variables: "read" });
+    expect(releaseTokenPermissions(d.release, false)).toEqual({ contents: "read", actions: "write", checks: "read", statuses: "read" });
+    expect(releaseTokenPermissions(d.release, true)).toEqual({ contents: "write", actions: "write", checks: "read", statuses: "read" });
+    expect(releaseTokenPermissions(parseConfig(withRelease(FREEZE)).release, false)).toMatchObject({ actions: "write", actions_variables: "read" });
     expect(expectedPermissions("queue", d.release)).toEqual(EXPECTED_PERMISSIONS.queue);
     expect(expectedPermissions("state", d.release)).toEqual(EXPECTED_PERMISSIONS.state);
     expect(expectedPermissions("release", parseConfig(base).release)).toEqual(EXPECTED_PERMISSIONS.release);
   });
 
   test("tick.yml requests them, setup registers them, and audit expects them", () => {
-    for (const c of [parseConfig(withRelease(DISPATCH)), parseConfig(withRelease([...DISPATCH, "    freeze:", "      - variable: RELEASE_FREEZE", "        value: \"true\""]))]) {
+    for (const c of [parseConfig(withRelease(DISPATCH)), parseConfig(withRelease(FREEZE))]) {
       const tick = renderTick(c);
       const step = tick.split(/\n(?=      - name: )/).find((s) => s.includes("secrets.RELEASE_APP_CLIENT_ID"))!;
       const requested = Object.fromEntries([...step.matchAll(/permission-([a-z-]+): (\w+)/g)].map((m) => [m[1]!.replace(/-/g, "_"), m[2]!]));
       const spec = appSpecs(c, "acme").find((s) => s.role === "release")!;
       expect(requested).toEqual(spec.tokenPermissions);
-      expect(spec.permissions).toEqual(expectedPermissions("release", c.release));
-      expect(spec.permissions.actions).toBe("write");
+      expect(spec.permissions).toEqual(expectedPermissions("release", c.release, c.runner.epochFence));
+      expect(spec.permissions).toMatchObject({ actions: "write", contents: c.runner.epochFence ? "write" : "read" });
+      expect(spec.permissions.workflows).toBeUndefined();
       expect(appSpecs(c, "acme").find((s) => s.role === "queue")!.permissions).toEqual(EXPECTED_PERMISSIONS.queue);
     }
   });
 
-  test("audit fails a release App still registered with actions: read in dispatch mode, and passes one with actions: write", async () => {
+  test("audit fails a release App with the advance permissions in dispatch mode, passes the least-privilege set, and checks the bot account", async () => {
     const c = parseConfig(withRelease(DISPATCH));
     const gh = {
-      get: async () => ({}),
+      get: async (path: string) => (path === "users/acme-release%5Bbot%5D" ? { id: 90000001 } : {}),
       list: async () => ({ items: [], truncated: false }),
     } as unknown as AuditGh;
-    const app = (permissions: Record<string, string>): AppIdentity => ({ role: "release", slug: "acme-release", id: 7, permissions });
-    const old = await appChecks(gh, "acme", [app(EXPECTED_PERMISSIONS.release)], "T11", c.release);
-    expect(old.find((f) => f.status === "FAIL")?.message).toContain("for release.mode dispatch");
-    expect(old.find((f) => f.status === "FAIL")?.details).toEqual(["actions: read, expected write"]);
-    const ok = await appChecks(gh, "acme", [app(expectedPermissions("release", c.release))], "T11", c.release);
-    expect(ok[0]!.status).toBe("PASS");
-    // And in advance mode, actions: write on the release App is one permission too many.
+    const app = (permissions: Record<string, string>, slug = "acme-release"): AppIdentity => ({ role: "release", slug, id: 7, permissions });
+    const old = await appChecks(gh, "acme", [app(EXPECTED_PERMISSIONS.release)], "T11", c.release, false);
+    const failed = old.find((f) => f.status === "FAIL" && f.message.includes("registration"));
+    expect(failed?.message).toContain("for release.mode dispatch");
+    expect(failed?.details).toEqual(["actions: read, expected write", "contents: write, expected read", "workflows: write, not expected"]);
+    const ok = await appChecks(gh, "acme", [app(expectedPermissions("release", c.release))], "T11", c.release, false);
+    expect(ok.slice(0, 2).map((f) => f.status)).toEqual(["PASS", "PASS"]);
+    expect(ok[0]!.message).toContain("release.dispatch.actor is the release App's bot acme-release[bot]");
+    const wrongBot = await appChecks(gh, "acme", [app(expectedPermissions("release", c.release), "other-release")], "T11", c.release, false);
+    expect(wrongBot[0]).toMatchObject({ status: "FAIL", message: expect.stringContaining("not the release App's bot other-release[bot]") });
+    // And in advance mode, the dispatch set is wrong too.
     const adv = await appChecks(gh, "acme", [app(expectedPermissions("release", c.release))], "T11", parseConfig(base).release);
     expect(adv[0]!.status).toBe("FAIL");
+  });
+
+  test("setup drops the release App from the release ruleset's bypass in dispatch mode, keeping the target's own promote identity", () => {
+    const d = parseConfig(withRelease(DISPATCH));
+    const spec = targetRulesets(d, true).find((r) => r.name === "release-landing")!;
+    expect(spec).toMatchObject({ bypass: [], extraBypass: "keepExceptQlander" });
+    expect(targetRulesets(parseConfig(base), true).find((r) => r.name === "release-landing")).toMatchObject({ bypass: ["release"], extraBypass: "keep" });
+    const ids = { queue: 1, release: 2, state: 3 };
+    const live = { id: 9, name: "release-landing", target: "branch", enforcement: "active", conditions: { ref_name: { include: spec.include, exclude: [] } }, rules: spec.rules, bypass_actors: [
+      { actor_id: 2, actor_type: "Integration", bypass_mode: "always" },
+      { actor_id: 444, actor_type: "Integration", bypass_mode: "always" },
+      { actor_id: 55, actor_type: "User", bypass_mode: "always" },
+    ] } as never;
+    expect(rulesetDiff(spec, live, ids)).toEqual(["unexpected bypass actor: Integration 2"]);
+    expect(rulesetBody(spec, live, ids).bypass_actors.map((a) => a.actor_id)).toEqual([444, 55]);
+  });
+
+  test("audit fails a release ruleset that still lets the release App bypass it in dispatch mode", () => {
+    const app: AppIdentity = { role: "release", slug: "acme-release", id: 2, permissions: {} };
+    const rs = (actors: { actor_id: number; actor_type: string }[]) => ({
+      rulesets: [{ id: 1, name: "release-landing", enforcement: "active", target: "branch", conditions: { ref_name: { include: ["refs/heads/release"] } }, rules: [{ type: "pull_request" }], bypass_actors: actors.map((a) => ({ ...a, bypass_mode: "always" })) }],
+      admin: true,
+      defaultBranch: "main",
+      appNames: new Map([[2, "acme-release"]]),
+    }) as never;
+    const bad = branchRulesets("T10", "release", app, rs([{ actor_id: 2, actor_type: "Integration" }, { actor_id: 444, actor_type: "Integration" }]), undefined, true, true);
+    expect(bad.some((f) => f.status === "FAIL" && f.message.includes("release.mode dispatch forbids"))).toBe(true);
+    const good = branchRulesets("T10", "release", app, rs([{ actor_id: 444, actor_type: "Integration" }]), undefined, true, true);
+    expect(good.some((f) => f.status === "PASS" && f.message.includes("does not bypass it"))).toBe(true);
+    // Advance mode is unchanged: the release App must be there.
+    const adv = branchRulesets("T10", "release", app, rs([{ actor_id: 444, actor_type: "Integration" }]), undefined, true);
+    expect(adv.some((f) => f.status === "FAIL" && f.message.includes("does not list the release App"))).toBe(true);
   });
 });

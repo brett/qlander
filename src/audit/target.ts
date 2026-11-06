@@ -142,7 +142,7 @@ async function t10Checks(out: Finding[], cfg: LoadedConfig, view: RepoView, wfs:
     if (!(e instanceof GitHubError && e.kind === "not_found")) throw e;
     out.push(sev("T10", `the release branch ${branch} does not exist${tag}`, `create ${branch} at a qualified commit of ${main}`));
   }
-  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, true), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
+  if (c) out.push(...[...branchRulesets("T10", branch, releaseApp, c, sev, true, R.mode === "dispatch"), ...landingRequirements("T10", branch, c, { contexts: releaseRequiredChecks(cfg), strict: true, mergeOnly: true }, sev)].map((f) => (f.status === "WARN" ? { ...f, message: f.message + tag } : f)));
   for (const e of cfg.config.preLanding) {
     const w = wfs.find((x) => x.path === e.path);
     if (!w?.wf) continue;
@@ -264,7 +264,7 @@ export async function auditTarget(gh: AuditGh, cfg: LoadedConfig, apps: AppIdent
   }
   out.push(...(await guard("T9", "T9", () => t9(cfg, gh, repo))));
   out.push(...(await guard("T10", "T10", () => t10(cfg, view, wfs ?? [], rc, releaseApp))));
-  out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11", cfg.release))));
+  out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11", cfg.release, cfg.runner.epochFence))));
   out.push(...(await guard("T12", "T12", () => t12(cfg, view))));
   return out;
 }

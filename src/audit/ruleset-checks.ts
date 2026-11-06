@@ -45,7 +45,7 @@ export function noBypassRule(id: string, label: string, ref: string, rule: strin
  * (`release`, DESIGN.md §9) a person merges a green PR there, which restrict
  * updates would stop.
  */
-export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail, personMerges = false): Finding[] {
+export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail, personMerges = false, appMustNotBypass = false): Finding[] {
   const out: Finding[] = [];
   const role = app?.role ?? "queue";
   const landing = c.rulesets.filter((r) => appliesTo(r, branch, c.defaultBranch) && (personMerges || hasRule(r, "update")) && hasRule(r, "pull_request"));
@@ -57,6 +57,12 @@ export function branchRulesets(id: string, branch: string, app: AppIdentity | un
       const bypass = r.bypass_actors ?? [];
       const others = bypass.filter((a) => a.actor_type !== "User" && !isApp(a, app));
       const hasApp = bypass.some((a) => isApp(a, app));
+      if (appMustNotBypass) {
+        // release.mode dispatch (DESIGN.md §8.1): the target's own promote identity bypasses release; the release App must not.
+        if (hasApp) out.push(aboutApp(fail(id, `${branch}: landing ruleset "${r.name}" lists the ${role} App (${app?.slug ?? "unknown"}) as a bypass actor, which release.mode dispatch forbids`, `remove the ${role} App from its bypass actors (setup --step target does)`), app));
+        else out.push(pass(id, `${branch}: landing ruleset "${r.name}" ${does}; the ${role} App does not bypass it (release.mode dispatch)`));
+        continue;
+      }
       if (!hasApp) out.push(aboutApp(sev(id, `${branch}: landing ruleset "${r.name}" does not list the ${role} App (${app?.slug ?? "unknown"}) as a bypass actor`, `add the ${role} App as a bypass actor`), app));
       if (others.length) out.push(aboutActors(sev(id, `${branch}: landing ruleset "${r.name}" has bypass actors other than the ${role} App and named users`, "remove them", others.map((a) => actorLabel(a, c.appNames))), app, others));
       if (hasApp && !others.length) out.push(pass(id, `${branch}: landing ruleset "${r.name}" ${does}; bypass: the ${role} App and ${bypass.filter((a) => a.actor_type === "User").length} named user(s)`));

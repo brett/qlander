@@ -90,7 +90,7 @@ export const DISPATCH_REFUSALS = 3;
 /** A run is matched only if created no earlier than this before its intent: runner and GitHub clocks differ. */
 export const CLOCK_SLACK_MS = 5 * 60_000;
 /** Pages of the workflow's runs read when looking for a dispatched run. */
-const RUN_PAGES = 2;
+const RUN_PAGES = 10;
 /** Jobs listed in a candidate report, at most; their names are the target's text, shown as data. */
 const REPORT_JOBS = 20;
 
@@ -117,7 +117,7 @@ export function describeDispatch(state: ReleaseState, decision: ReleaseDecision)
   if (c?.real || (c?.dry && c.dry.conclusion === null)) return `candidate ${c.sha}: ${candidateStage(c)}; a live tick would follow it`;
   if (decision.kind !== "advance") return `${decision.kind}: ${decision.reason}${c ? `; candidate ${c.sha}: ${candidateStage(c)}` : ""}`;
   if (!c || c.sha !== decision.to) {
-    if (state.dispatch?.history.some((h) => h.sha === decision.to)) return `${decision.to} already had its dry run; a live tick would wait for a newer commit`;
+    if (state.dispatch?.history.some((h) => h.sha === decision.to) || state.dispatch?.highWater === decision.to) return `${decision.to} already had its dry run; a live tick would wait for a newer commit`;
     return `a live tick would dispatch a dry run of ${decision.to}${c ? ` (superseding ${c.sha})` : ""}`;
   }
   return `candidate ${c.sha}: ${candidateStage(c)}`;
@@ -181,52 +181,120 @@ export class DispatchTick extends ReleaseTickBase {
 
   // ---------------------------------------------------------------- following runs
 
-  /** The runs of the configured workflow that echo `id`, started by a dispatch on the configured ref in the target itself. */
-  private async findRun(rec: DispatchRecord): Promise<{ kind: "found"; run: Run } | { kind: "none"; truncated: boolean } | { kind: "many"; ids: number[] }> {
+  /**
+   * The run a dispatch started, authenticated (DESIGN.md §8.1): the configured
+   * workflow, a workflow_dispatch on the configured ref in the target itself,
+   * created no earlier than the intent (less the clock slack), named with the
+   * dispatch id, and started and last triggered by the release App's own bot
+   * (release.dispatch.actor, login and id). The id in a run name is public
+   * text that anyone who can dispatch the workflow could copy; the actor is
+   * GitHub's. A run that carries the id from anyone else is ignored, and
+   * logged. "unsure": the listing may be cut, so a second matching run could
+   * be hidden: nothing is adopted from it. Two matches are "many", never a pick.
+   */
+  private async findRun(rec: DispatchRecord): Promise<{ kind: "found"; run: Run } | { kind: "none" } | { kind: "unsure" } | { kind: "many"; ids: number[] }> {
     const repoId = this.target.repoId;
     const created = new Date(Date.parse(rec.at) - CLOCK_SLACK_MS);
     const l: Listed<Run> = await this.target.listWorkflowRuns(this.cfg.workflow, { branch: this.cfg.ref, event: "workflow_dispatch", created, maxPages: RUN_PAGES });
-    const hits = l.items.filter(
+    const named = l.items.filter(
       (r) =>
         r.path === this.cfg.workflow &&
         r.event === "workflow_dispatch" &&
         r.head_branch === this.cfg.ref &&
         r.repository?.id === repoId &&
         r.head_repository?.id === repoId &&
+        Date.parse(r.created_at) >= created.getTime() &&
         typeof r.display_title === "string" &&
         echoesId(r.display_title, rec.id),
     );
+    const ours = (a: Run["actor"]) => !!a && a.login === this.cfg.actor.login && a.id === this.cfg.actor.id;
+    const hits = named.filter((r) => ours(r.actor) && ours(r.triggering_actor));
+    for (const r of named) if (!hits.includes(r)) this.log.push(`ignored run ${r.id}: it carries dispatch id ${rec.id} but was started by ${r.actor?.login ?? "nobody known"} (triggered by ${r.triggering_actor?.login ?? "nobody known"}), not ${this.cfg.actor.login}`);
     if (hits.length > 1) return { kind: "many", ids: hits.map((r) => r.id) };
+    if (l.truncated) return { kind: "unsure" };
     if (hits.length === 1) return { kind: "found", run: hits[0]! };
-    return { kind: "none", truncated: l.truncated };
+    return { kind: "none" };
+  }
+
+  /**
+   * When the run's latest attempt completed, from its jobs (GitHub's clock):
+   * the newest completed_at, only if every job is listed, belongs to that
+   * attempt and has completed. Null when that cannot be established.
+   */
+  private async completedAt(run: Run): Promise<string | null> {
+    const l = await this.target.listJobs(run.id);
+    if (l.truncated || l.items.length === 0) return null;
+    let last = -Infinity;
+    for (const j of l.items) {
+      if (j.status !== "completed" || !j.completed_at || (j.run_attempt !== undefined && j.run_attempt !== run.run_attempt)) return null;
+      const t = Date.parse(j.completed_at);
+      if (Number.isNaN(t)) return null;
+      last = Math.max(last, t);
+    }
+    return new Date(last).toISOString();
   }
 
   /** Record what is known now about one run in flight. Reads only, so it runs while paused too. */
   private async follow(rec: DispatchRecord, sha: string): Promise<DispatchRecord> {
     const now = this.now();
     let r = rec;
-    const done = (conclusion: string, why: string): DispatchRecord => {
+    const done = (conclusion: string, why: string, at: string = this.nowIso()): DispatchRecord => {
       this.log.push(`${r.kind} run for ${sha.slice(0, 8)}: ${conclusion} (${why})`);
-      return { ...r, conclusion, concludedAt: this.nowIso() };
+      return { ...r, conclusion, concludedAt: at };
     };
+    const late = now - Date.parse(r.at) >= this.cfg.appearMinutes * 60_000;
+    // Looked up on every tick while the run is in flight, so a second run with the same id is caught even after the first was adopted.
+    const f = await this.findRun(r);
+    if (f.kind === "many") return done("ambiguous", `runs ${f.ids.join(", ")} all carry dispatch id ${r.id} and the release App's actor`);
+    if (r.run && f.kind === "found" && f.run.id !== r.run.id) return done("ambiguous", `run ${f.run.id}, not the adopted run ${r.run.id}, now matches dispatch id ${r.id}`);
     if (!r.run) {
-      const f = await this.findRun(r);
-      if (f.kind === "many") return done("ambiguous", `runs ${f.ids.join(", ")} all carry dispatch id ${r.id}`);
-      if (f.kind === "none") {
-        if (now - Date.parse(r.at) < this.cfg.appearMinutes * 60_000) {
-          this.log.push(`${r.kind} run for ${sha.slice(0, 8)}: not found yet (${r.id}${f.truncated ? ", listing incomplete" : ""})`);
+      if (f.kind !== "found") {
+        if (!late) {
+          this.log.push(`${r.kind} run for ${sha.slice(0, 8)}: not found yet (${r.id}${f.kind === "unsure" ? ", listing incomplete" : ""})`);
           return r;
         }
-        return done("never-appeared", `no run of ${this.cfg.workflow} named with ${r.id} within ${this.cfg.appearMinutes} minutes${r.sent === "unknown" ? "; the request's response was lost" : ""}`);
+        if (f.kind === "unsure") return done("ambiguous", `the runs of ${this.cfg.workflow} could not all be listed within ${this.cfg.appearMinutes} minutes, so a run for ${r.id} cannot be told apart`);
+        return done("never-appeared", `no run of ${this.cfg.workflow} named with ${r.id} by ${this.cfg.actor.login} within ${this.cfg.appearMinutes} minutes${r.sent === "unknown" ? "; the request's response was lost" : ""}`);
       }
-      r = { ...r, run: { id: f.run.id, url: runUrl(this.deps.cfg, f.run.id) } };
+      r = { ...r, run: { id: f.run.id, url: runUrl(this.deps.cfg, f.run.id), createdAt: f.run.created_at } };
       this.log.push(`${r.kind} run for ${sha.slice(0, 8)}: found run ${f.run.id}`);
     }
     const run = await this.target.getRun(r.run!.id);
     if (!run) return done("missing", `run ${r.run!.id} can no longer be read`);
-    if (run.status === "completed") return done(run.conclusion ?? "unknown", `run ${run.id}, attempt ${run.run_attempt}`);
-    if (now - Date.parse(run.created_at) > this.cfg.runHours * 3_600_000) return done("stuck", `run ${run.id} still ${run.status} after ${this.cfg.runHours} hours`);
-    return r;
+    if (now - Date.parse(run.created_at) > this.cfg.runHours * 3_600_000 && run.status !== "completed") return done("stuck", `run ${run.id} still ${run.status} after ${this.cfg.runHours} hours`);
+    if (run.status !== "completed") return r;
+    const at = await this.completedAt(run);
+    if (run.conclusion === "success") {
+      // A green run counts only with GitHub's own completion time, which the validity window runs from.
+      if (at === null) {
+        this.log.push(`${r.kind} run ${run.id}: completed, but its jobs do not yet say when; waiting`);
+        return r;
+      }
+      return done("success", `run ${run.id}, attempt ${run.run_attempt}, completed ${at}`, at);
+    }
+    return done(run.conclusion ?? "unknown", `run ${run.id}, attempt ${run.run_attempt}`, at ?? this.nowIso());
+  }
+
+  /**
+   * Immediately before the real dispatch (DESIGN.md §8.1): the dry run is
+   * looked up again, authenticated and unique, and its latest attempt must
+   * still be a success that completed inside dryRunValidMinutes. A rerun
+   * that failed, a deleted run, or a second run carrying its id each stop it.
+   */
+  private async confirmDry(c: DispatchCandidate): Promise<{ ok: true } | { ok: false; wait: true; why: string } | { ok: false; wait: false; why: string; conclusion: string }> {
+    const dry = c.dry!;
+    const f = await this.findRun(dry);
+    if (f.kind === "unsure") return { ok: false, wait: true, why: "the dry run's listing is incomplete" };
+    if (f.kind === "many") return { ok: false, wait: false, why: `runs ${f.ids.join(", ")} all carry its dispatch id`, conclusion: "ambiguous" };
+    if (f.kind === "none" || f.run.id !== dry.run!.id) return { ok: false, wait: false, why: `run ${dry.run!.id} is no longer the one run carrying its dispatch id`, conclusion: "missing" };
+    const run = await this.target.getRun(dry.run!.id);
+    if (!run) return { ok: false, wait: false, why: `run ${dry.run!.id} can no longer be read`, conclusion: "missing" };
+    if (run.status !== "completed") return { ok: false, wait: true, why: `run ${run.id} is running again (attempt ${run.run_attempt})` };
+    if (run.conclusion !== "success") return { ok: false, wait: false, why: `run ${run.id}'s attempt ${run.run_attempt} concluded ${run.conclusion}`, conclusion: run.conclusion ?? "unknown" };
+    const at = await this.completedAt(run);
+    if (at === null) return { ok: false, wait: true, why: `run ${run.id}'s completion time cannot be read` };
+    if (this.now() - Date.parse(at) > this.cfg.dryRunValidMinutes * 60_000) return { ok: false, wait: false, why: `run ${run.id} completed at ${at}, more than ${this.cfg.dryRunValidMinutes} minutes ago`, conclusion: "expired" };
+    return { ok: true };
   }
 
   /** Step 3: the candidate's runs in flight. */
@@ -316,7 +384,7 @@ export class DispatchTick extends ReleaseTickBase {
       this.log.push(`approvals not read: ${String(e)}`);
       return null;
     }
-    const { approval, refused } = releaseApproval(comments, this.cfg.approvers, c.sha, new Date(Date.parse(c.dry!.at)));
+    const { approval, refused } = releaseApproval(comments, this.cfg.approvers, c.sha, new Date(Date.parse(c.dry!.run!.createdAt)));
     for (const r of refused) this.log.push(`approval refused: ${r}`);
     if (!approval) this.log.push(`waiting for \`${APPROVE_RELEASE} ${c.sha}\` on #${issue.number} from ${this.cfg.approvers.map((h) => h.login).join(", ")}`);
     return approval;
@@ -359,13 +427,21 @@ export class DispatchTick extends ReleaseTickBase {
       return "alert";
     }
     if (c.refused >= DISPATCH_REFUSALS) return "alert"; // its alert is already open; a newer candidate starts again
+    // The durable once-per-sha guard (DESIGN.md §8.1), whatever history has been pruned: a dry run only for a strict
+    // descendant of the last dispatched sha, a real run only for the sha whose dry run was the last dispatch.
+    const hw = this.ds().highWater;
+    if (kind === "real" ? hw !== c.sha : hw !== null && (hw === c.sha || (await this.target.compare(hw, c.sha)).status !== "ahead")) {
+      this.log.push(`not dispatching the ${kind} run for ${c.sha}: ${hw} was dispatched last, and a sha is dispatched at most once`);
+      return "none";
+    }
     const seq = this.state.seq + 1;
     const id = dispatchIdFor(kind, c.sha, seq, this.store.runId);
     const at = this.nowIso();
     const j: DispatchJournal = { seq, op: "dispatch", kind, sha: c.sha, id, at };
     const cand: DispatchCandidate = { ...c, ...also };
     // The intent, its budget reservation and the candidate it is for: one write, before anything is sent.
-    this.setDs({ ...this.ds(), candidate: cand, window: [...window, at] }, { seq, journal: j });
+    // highWater rides in the same write: once this intent is durable, no sha at or behind it is ever dispatched again.
+    this.setDs({ ...this.ds(), candidate: cand, highWater: c.sha, window: [...window, at] }, { seq, journal: j });
     await this.save();
     this.crash("after-intent");
     const i = this.cfg.inputs;
@@ -382,7 +458,8 @@ export class DispatchTick extends ReleaseTickBase {
       } else {
         // GitHub answered and refused (or the client refused before sending): nothing started, so no record. The reservation stays spent.
         const refused = e.kind === "rate_limit" ? cand.refused : cand.refused + 1;
-        this.setCandidate({ ...cand, refused }, { journal: null });
+        // Nothing started, so the high-water mark goes back to what it was: this sha may be dispatched again.
+        this.setDs({ ...this.ds(), candidate: { ...cand, refused }, highWater: hw }, { journal: null });
         await this.save();
         this.log.push(`dispatch ${kind} ${c.sha.slice(0, 8)} refused: ${String(e)}`);
         if (e.kind === "rate_limit") return "retry-later";
@@ -441,12 +518,16 @@ export class DispatchTick extends ReleaseTickBase {
       await this.alert(`release-blocked: the real run for ${c.sha} was green${run}, but release is ${cur ?? "absent"}, not at it, ${this.cfg.observeMinutes} minutes later. It is never dispatched again for this commit`);
       return "alert";
     }
-    await this.close(c, "real-failed", `the real run concluded ${r.conclusion}`);
     if (UNFOLLOWED.has(r.conclusion)) {
-      // Nobody knows whether a promotion is running: stop until a person has looked.
-      await this.pause(`the real run for ${c.sha} could not be followed (${r.conclusion}, dispatch id ${r.id})${run}; it may still be promoting. Check the target's ${this.cfg.workflow} runs before closing this issue`);
+      // Nobody knows whether a promotion is running: stop until a person has looked. Closing the
+      // candidate and the pending pause are one state write, so no interruption can drop the pause.
+      const reason = `the real run for ${c.sha} could not be followed (${r.conclusion}, dispatch id ${r.id})${run}; it may still be promoting. Check the target's ${this.cfg.workflow} runs before closing this issue`;
+      this.log.push(`pause: ${reason}`);
+      await this.close(c, "real-failed", `the real run concluded ${r.conclusion}`, { pausePending: this.pending(reason) });
+      await this.applyPause();
       return "paused";
     }
+    await this.close(c, "real-failed", `the real run concluded ${r.conclusion}`);
     await this.alert(`release-blocked: the real run for ${c.sha} concluded ${r.conclusion}${run}. It is never dispatched again for this commit; a newer qualified commit gets its own dry run`);
     return "alert";
   }
@@ -493,8 +574,10 @@ export class DispatchTick extends ReleaseTickBase {
     }
     if (!c) {
       const seen = this.ds().history.find((h) => h.sha === decision.to);
-      if (seen) {
-        this.log.push(`${decision.to.slice(0, 8)} already had its dry run (${seen.outcome}); waiting for a newer commit`);
+      const hw = this.ds().highWater;
+      const behind = hw !== null && (hw === decision.to || (await this.target.compare(hw, decision.to)).status !== "ahead");
+      if (seen || behind) {
+        this.log.push(`${decision.to.slice(0, 8)} is not newer than ${behind ? `${hw}, the last sha dispatched` : `its own earlier dry run (${seen!.outcome})`}; waiting for a newer commit`);
         return "none";
       }
       c = { sha: decision.to, receipt: decision.receipt, since: this.nowIso(), dry: null, reported: null, approval: null, real: null, refused: 0 };
@@ -521,6 +604,17 @@ export class DispatchTick extends ReleaseTickBase {
     c = await this.report(c);
     const approval = await this.approval(c);
     if (!approval) return "waiting";
+    const fresh = await this.confirmDry(c);
+    if (!fresh.ok) {
+      if (fresh.wait) {
+        this.log.push(`waiting: the dry run for ${c.sha.slice(0, 8)} cannot be confirmed yet (${fresh.why})`);
+        return "waiting";
+      }
+      const outcome = fresh.conclusion === "expired" ? "expired" : "dry-failed";
+      await this.close(c, outcome, `rechecked before the real run: ${fresh.why}`);
+      await this.alert(`release-blocked: the dry run for ${c.sha} no longer stands (${fresh.why}); no real run is dispatched for this commit`);
+      return "alert";
+    }
     return this.dispatch(c, "real", { approval: { comment: approval.id, login: approval.user.login, id: approval.user.id, at: approval.created_at } });
   }
 }

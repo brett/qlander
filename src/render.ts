@@ -329,8 +329,8 @@ export function renderTick(c: RenderInput): string {
       "    steps:",
       ...checkoutStep(n),
       "",
-      // release.mode dispatch adds actions: write (dispatching the target's release workflow) and, with a freeze, actions-variables: read.
-      ...targetTokenStep(n, "release", "RELEASE_APP", Object.entries(releaseTokenPermissions({ mode: c.release.mode ?? "advance", dispatch: c.release.dispatch ?? null })).map(([k, v]) => [k.replace(/_/g, "-"), v])),
+      // release.mode dispatch: actions: write (dispatching the target's release workflow), contents: read (write only for the epoch fence), no workflows, and, with a freeze, actions-variables: read.
+      ...targetTokenStep(n, "release", "RELEASE_APP", Object.entries(releaseTokenPermissions({ mode: c.release.mode ?? "advance", dispatch: c.release.dispatch ?? null }, r.epochFence)).map(([k, v]) => [k.replace(/_/g, "-"), v])),
       "",
       ...stateTokenStep(n),
       "",

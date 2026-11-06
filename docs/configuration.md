@@ -49,6 +49,7 @@ Qlander reads one file: `qlander.yml`, at the root of the control repo. Start fr
   - [release.qualification.commitStatus.proof](#releasequalificationcommitstatusproof)
   - [release.dispatch](#releasedispatch)
   - [release.dispatch.inputs](#releasedispatchinputs)
+  - [release.dispatch.actor](#releasedispatchactor)
   - [release.dispatch.approvers[]](#releasedispatchapprovers)
   - [release.dispatch.budget](#releasedispatchbudget)
   - [release.dispatch.freeze[]](#releasedispatchfreeze)
@@ -798,6 +799,7 @@ The dispatch mode's settings. Required when mode is dispatch, refused otherwise.
 | `release.dispatch.workflow` | [workflow path](#formats) | required | The target workflow that promotes a commit and moves release itself. It must have a workflow_dispatch trigger with the three inputs below, and a run-name that contains the dispatch id input. |
 | `release.dispatch.ref` | [branch](#formats) | none | The branch the workflow is dispatched on, whose copy of the workflow file runs: the target's main or release.branch. Absent: the target's main. |
 | `release.dispatch.inputs` | mapping | required | The workflow_dispatch input names qlander sets. See [release.dispatch.inputs](#releasedispatchinputs). |
+| `release.dispatch.actor` | mapping | required | The release App's bot account: a dispatched run counts only if GitHub reports it as both the run's actor and its triggering actor. See [release.dispatch.actor](#releasedispatchactor). |
 | `release.dispatch.approvers` | list of mappings | required | Accounts whose /qlander approve-release comment on the status issue counts. See [release.dispatch.approvers[]](#releasedispatchapprovers). |
 | `release.dispatch.dryRunValidMinutes` | integer | `1440` | How long a green dry run stays good for its real run. Past it, that commit is not released, and a newer one gets its own dry run. |
 | `release.dispatch.appearMinutes` | integer | `30` | How long after a dispatch its run may take to appear. At least twice runner.cronMinutes. |
@@ -834,6 +836,23 @@ release:
       sha: sha
       dryRun: dry_run
       dispatchId: dispatch_id
+```
+
+### `release.dispatch.actor`
+
+The release App's bot account: a dispatched run counts only if GitHub reports it as both the run's actor and its triggering actor. audit checks it against the release App.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `release.dispatch.actor.login` | string | required | The bot's login, <app slug>[bot]. |
+| `release.dispatch.actor.id` | integer | required | The bot account's id (not the App id): gh api 'users/<slug>[bot]' --jq .id. |
+
+```yaml
+release:
+  dispatch:
+    actor:
+      login: acme-release[bot]
+      id: 90000001
 ```
 
 ### `release.dispatch.approvers[]`

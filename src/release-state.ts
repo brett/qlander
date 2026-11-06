@@ -47,9 +47,11 @@ export interface DispatchRecord {
   at: string;
   /** yes: GitHub answered 204. unknown: the response was lost (or the job crashed), so the run may or may not exist. */
   sent: "yes" | "unknown";
-  run: { id: number; url: string } | null;
+  /** The authenticated run (DESIGN.md §8.1), with GitHub's created_at: the evidence that it started. */
+  run: { id: number; url: string; createdAt: string } | null;
   /** The run's conclusion once completed, or what qlander concluded: never-appeared, stuck. Null while in flight. */
   conclusion: string | null;
+  /** When the run completed, from its latest attempt's jobs (GitHub's clock); qlander's own clock only for a conclusion it drew itself. */
   concludedAt: string | null;
 }
 
@@ -81,6 +83,12 @@ export interface DispatchHistoryItem {
 /** The dispatch mode's document; absent in advance mode, so an advance state is unchanged. */
 export interface DispatchState {
   candidate: DispatchCandidate | null;
+  /**
+   * The newest sha ever dispatched, dry or real, set in the dispatch's intent.
+   * A new candidate must be a strict descendant of it, so no sha is dispatched
+   * twice however much of `history` is pruned (main only moves forward).
+   */
+  highWater: string | null;
   /** When each dispatch was reserved, for release.dispatch.budget. */
   window: string[];
   history: DispatchHistoryItem[];
@@ -96,7 +104,7 @@ export function candidateStage(c: DispatchCandidate): string {
   return c.approval ? `approved by ${c.approval.login}; real run not dispatched yet` : "dry run green; waiting for an approval";
 }
 
-export const emptyDispatchState = (): DispatchState => ({ candidate: null, window: [], history: [] });
+export const emptyDispatchState = (): DispatchState => ({ candidate: null, highWater: null, window: [], history: [] });
 
 export type ReleaseHistoryOutcome = "advanced" | "not-applied" | "moved" | "rejected";
 
@@ -209,8 +217,8 @@ function dispatchRecord(x: unknown, w: string): DispatchRecord {
     at: time(o.at, `${w}.at`),
     sent: oneOf(o.sent, `${w}.sent`, ["yes", "unknown"] as const),
     run: nullable(o.run, (r) => {
-      const ro = obj(r, `${w}.run`, ["id", "url"]);
-      return { id: posInt(ro.id, `${w}.run.id`), url: str(ro.url, `${w}.run.url`) };
+      const ro = obj(r, `${w}.run`, ["id", "url", "createdAt"]);
+      return { id: posInt(ro.id, `${w}.run.id`), url: str(ro.url, `${w}.run.url`), createdAt: time(ro.createdAt, `${w}.run.createdAt`) };
     }),
     conclusion: nullable(o.conclusion, (c) => str(c, `${w}.conclusion`)),
     concludedAt: nullable(o.concludedAt, (c) => time(c, `${w}.concludedAt`)),
@@ -218,7 +226,7 @@ function dispatchRecord(x: unknown, w: string): DispatchRecord {
 }
 
 function dispatchState(x: unknown): DispatchState {
-  const o = obj(x, "dispatch", ["candidate", "window", "history"]);
+  const o = obj(x, "dispatch", ["candidate", "highWater", "window", "history"]);
   const candidate = nullable(o.candidate, (c) => {
     const w = "dispatch.candidate";
     const co = obj(c, w, ["sha", "receipt", "since", "dry", "reported", "approval", "real", "refused"]);
@@ -259,7 +267,9 @@ function dispatchState(x: unknown): DispatchState {
       realRun: nullable(x.realRun, (r) => posInt(r, `${w}.realRun`)),
     };
   });
-  return { candidate, window, history };
+  const highWater = nullable(o.highWater, (h) => sha(h, "dispatch.highWater"));
+  if (candidate && (candidate.dry || candidate.real) && highWater !== candidate.sha) fail("dispatch: a dispatched candidate that is not the high-water mark");
+  return { candidate, highWater, window, history };
 }
 
 /** Strict: unknown fields, wrong types, a bad sha or another version are refused. */

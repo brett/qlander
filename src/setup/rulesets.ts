@@ -85,8 +85,9 @@ function ruleParams(want: Rule, got: Rule | undefined): { params: Record<string,
 
 const appActor = (id: number): BypassActor => ({ actor_id: id, actor_type: "Integration", bypass_mode: "always" });
 
-/** Bypass actors kept from the live ruleset: individual people on a landing ruleset, nobody else. */
-const keptActor = (spec: RulesetSpec, a: BypassActor) => spec.extraBypass === "keep" && a.actor_type === "User";
+/** Bypass actors kept from the live ruleset: individual people on a landing ruleset; with keepExceptQlander, anyone but qlander's own Apps. */
+const keptActor = (spec: RulesetSpec, a: BypassActor, appIds: Partial<Record<Role, number>>) =>
+  spec.extraBypass === "keepExceptQlander" ? !(a.actor_type === "Integration" && Object.values(appIds).includes(a.actor_id ?? -1)) : spec.extraBypass === "keep" && a.actor_type === "User";
 
 /** Every way `have` falls short of `spec`, one line each; empty when it matches. */
 export function rulesetDiff(spec: RulesetSpec, have: Ruleset, appIds: Partial<Record<Role, number>>): string[] {
@@ -108,7 +109,7 @@ export function rulesetDiff(spec: RulesetSpec, have: Ruleset, appIds: Partial<Re
   }
   for (const a of have.bypass_actors) {
     if (a.actor_type === "Integration" && wantIds.includes(a.actor_id ?? -1)) continue;
-    if (!keptActor(spec, a)) out.push(`unexpected bypass actor: ${a.actor_type} ${a.actor_id ?? ""}`.trim());
+    if (!keptActor(spec, a, appIds)) out.push(`unexpected bypass actor: ${a.actor_type} ${a.actor_id ?? ""}`.trim());
   }
   return out;
 }
@@ -126,7 +127,7 @@ export function rulesetBody(spec: RulesetSpec, have: Ruleset | null, appIds: Par
     if (id === undefined) throw new Error(`the ${r} App's id is unknown`);
     return appActor(id);
   });
-  for (const a of have?.bypass_actors ?? []) if (keptActor(spec, a)) bypass.push(a);
+  for (const a of have?.bypass_actors ?? []) if (keptActor(spec, a, appIds)) bypass.push(a);
   return {
     name: spec.name,
     target: "branch",

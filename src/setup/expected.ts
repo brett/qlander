@@ -5,7 +5,7 @@
 // name prefix; nothing is specific to one deployment.
 
 import type { LoadedConfig } from "../config/load";
-import { releaseTokenPermissions } from "../release-permissions";
+import { releaseAppBypassesRelease, releaseTokenPermissions } from "../release-permissions";
 
 export type Role = "queue" | "release" | "state";
 export type Level = "read" | "write";
@@ -86,8 +86,8 @@ export function appSpecs(c: LoadedConfig, prefix: string): AppSpec[] {
   });
   return [
     spec("queue", target, QUEUE_TOKEN, "QUEUE_APP"),
-    // release.mode dispatch adds Actions: write (and, with a freeze, Variables: read): src/release-permissions.ts.
-    ...(c.release.enabled ? [spec("release", target, releaseTokenPermissions(c.release), "RELEASE_APP")] : []),
+    // release.mode dispatch: least privilege, src/release-permissions.ts.
+    ...(c.release.enabled ? [spec("release", target, releaseTokenPermissions(c.release, c.runner.epochFence), "RELEASE_APP")] : []),
     spec("state", control, STATE_TOKEN, "STATE_APP"),
   ];
 }
@@ -141,6 +141,9 @@ export interface Rule {
  * says whether other bypass actors already on the ruleset (break-glass
  * humans, added by hand) are kept ("keep") or removed ("none"): a ruleset
  * whose point is that nobody else bypasses it is always "none".
+ * "keepExceptQlander" keeps every actor but qlander's own Apps: the release
+ * ruleset in dispatch mode, where the target's promote identity bypasses it
+ * and the release App must not.
  */
 export interface RulesetSpec {
   repo: Repo;
@@ -149,7 +152,7 @@ export interface RulesetSpec {
   include: string[];
   rules: Rule[];
   bypass: Role[];
-  extraBypass: "keep" | "none";
+  extraBypass: "keep" | "none" | "keepExceptQlander";
   /** The Apps that must be installed on `repo` before this ruleset can name them. */
   needsInstalled: Role[];
 }
@@ -256,9 +259,8 @@ export function targetRulesets(c: LoadedConfig, withLanding: boolean): RulesetSp
           // No `update` rule: a person merges a release PR once its checks pass (the hotfix path, DESIGN.md §9).
           { type: "required_status_checks", parameters: { required_status_checks: full, strict_required_status_checks_policy: true } },
         ],
-        bypass: ["release"],
-        extraBypass: "keep",
-        needsInstalled: ["release"],
+        // Dispatch mode: the release App never bypasses release (its id is still needed, to remove it); the target's own promote identity, added by hand, is kept.
+        ...(releaseAppBypassesRelease(c.release) ? { bypass: ["release"] as Role[], extraBypass: "keep" as const, needsInstalled: ["release"] as Role[] } : { bypass: [] as Role[], extraBypass: "keepExceptQlander" as const, needsInstalled: ["release"] as Role[] }),
       },
       { repo, name: "release-integrity", include: [heads(n.release)], rules: INTEGRITY, bypass: [], extraBypass: "none", needsInstalled: [] },
     );

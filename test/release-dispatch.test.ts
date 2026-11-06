@@ -12,9 +12,10 @@ import { dispatchOnly, echoesId, dispatchIdFor, DISPATCH_REFUSALS } from "../src
 import { parseReleaseState } from "../src/release-state";
 import { releaseDryRun } from "../src/release-runner";
 import { LostLockError } from "../src/store";
-import { APPROVER, DispatchWorld, PROMOTE, STRANGER } from "./release-world";
+import { APPROVER, BOT, DispatchWorld, PROMOTE, STRANGER } from "./release-world";
+import { CrashError } from "../src/queue";
 import { FakeTarget } from "./fake-github";
-import { NAMES, sha, TARGET, TARGET_OPTS } from "./sim";
+import { job, NAMES, sha, TARGET, TARGET_OPTS } from "./sim";
 
 const ALERT = "release-blocked";
 
@@ -143,9 +144,11 @@ describe("dispatch mode: release is never written", () => {
   });
 
   test("across every scenario below, no ref writer is called: DispatchWorld.ok() fails the test if one is", async () => {
-    const w = new DispatchWorld();
-    (w.target as unknown as { updateRef: (...a: unknown[]) => Promise<void> }).updateRef("release", w.R, w.R).catch(() => {});
-    await expect(w.ok()).rejects.toThrow("a ref writer was called in dispatch mode");
+    for (const m of ["updateRef", "advanceEpoch", "voidEpoch", "merge"] as const) {
+      const w = new DispatchWorld();
+      (w.target as unknown as Record<string, (...a: unknown[]) => Promise<void>>)[m]!("release", w.R, w.R).catch(() => {});
+      await expect(w.ok(), m).rejects.toThrow("a ref writer was called in dispatch mode");
+    }
   });
 });
 
@@ -526,9 +529,11 @@ describe("dispatch mode: pause, freeze, budget, lease and fence", () => {
     const a = w.land();
     w.qualified(a);
     expect((await w.ok()).outcome).toBe("dispatched");
-    expect(w.target.calls.some((c) => c.startsWith("advanceEpoch"))).toBe(true);
     expect(w.target.calls.some((c) => c.startsWith("epochHeld"))).toBe(true);
-    expect(w.refWrites).toEqual([]);
+    // Exactly one ref write: advanceEpoch on the job's own epoch branch. Never release, main or a batch ref.
+    expect(w.refWrites.map(([m]) => m)).toEqual(["advanceEpoch"]);
+    expect(w.target.calls.filter((c) => c.startsWith("advanceEpoch"))).toEqual([expect.stringMatching(new RegExp(`^advanceEpoch ${w.target.epochBranch} `))]);
+    expect(w.release).toBe(w.R);
   });
 });
 
@@ -619,5 +624,138 @@ describe("dispatch mode: the real clients", () => {
     await expect(c.commentIssue(3, "/qlander approve-release x")).rejects.toThrow("candidate report");
     expect(await c.commentIssue(3, `${RELEASE_REPORT_MARKER}${sha("a")} -->\nbody`)).toBe(5);
     expect(seen.filter((x) => x.method === "POST").map((x) => x.url)).toEqual([`repos/${NAMES.control.owner}/${NAMES.control.name}/issues/3/comments`]);
+  });
+});
+
+// Regressions from review: each fails on the code before its fix.
+describe("dispatch mode: review regressions", () => {
+  test("[1] a run carrying a copied dispatch id but started by anyone else is never adopted", async () => {
+    const w = new DispatchWorld();
+    w.behave = ({ kind }) => (kind === "dry" ? { appearTicks: 3 } : {});
+    const a = w.land();
+    w.qualified(a);
+    await w.ok();
+    const id = w.dispatched[0]!.id;
+    const forged = w.target.addRun({ head_sha: w.main, path: PROMOTE, event: "workflow_dispatch", head_branch: "main", created_at: w.now.toISOString(), display_title: `copy ${id}`, actor: { ...STRANGER }, triggering_actor: { ...STRANGER } }, [{ ...job("plan"), completed_at: w.now.toISOString() }], 0);
+    // Started by the bot but re-run by a stranger: the triggering actor counts too.
+    w.target.addRun({ head_sha: w.main, path: PROMOTE, event: "workflow_dispatch", head_branch: "main", created_at: w.now.toISOString(), display_title: `rerun ${id}`, actor: { ...BOT }, triggering_actor: { ...STRANGER } }, [], 0);
+    const r = await w.ok();
+    expect(r.log.some((l) => l.includes(`ignored run ${forged.id}`))).toBe(true);
+    expect(w.candidate()!.dry).toMatchObject({ run: null, conclusion: null });
+    w.approve(a);
+    await w.ok();
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`]);
+    const ok = await w.until((x) => x.outcome === "dispatched");
+    expect(ok.length).toBeGreaterThan(0);
+    expect(w.candidate()!.dry!.run!.id).toBe(w.dispatched[0]!.run!.id);
+  });
+
+  test("[1] nothing is adopted from a listing that may be cut, and two authenticated runs with one id are ambiguous", async () => {
+    const w = new DispatchWorld();
+    const a = w.land();
+    w.qualified(a);
+    await w.ok();
+    w.target.pageSize = 0; // every listing comes back truncated
+    const r = await w.ok();
+    expect(r.log.some((l) => l.includes("listing incomplete"))).toBe(true);
+    expect(w.candidate()!.dry).toMatchObject({ run: null });
+    w.target.pageSize = 100;
+    const id = w.dispatched[0]!.id;
+    w.target.addRun({ head_sha: w.main, path: PROMOTE, event: "workflow_dispatch", head_branch: "main", created_at: w.now.toISOString(), display_title: `again ${id}`, actor: { ...BOT }, triggering_actor: { ...BOT } }, [], 0);
+    await w.ok();
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "dry-failed", note: expect.stringContaining("ambiguous") });
+  });
+
+  test("[2] no sha is dispatched again once its record is pruned from history", async () => {
+    const w = new DispatchWorld({}, { historyLimit: 1 });
+    w.behave = ({ kind, sha: s }) => (kind === "real" || s !== a ? { conclusion: "failure" } : {});
+    const a = w.land();
+    w.qualified(a);
+    await w.ok();
+    await w.ok();
+    w.approve(a);
+    await w.ok();
+    expect((await w.ok()).outcome).toBe("alert"); // a: real-failed
+    const b = w.land();
+    w.qualified(b);
+    await w.ok();
+    await w.ok(); // b: dry-failed, which prunes a from history
+    expect(w.dispatchHistory().map((h) => h.sha)).toEqual([b]);
+    w.target.statuses.delete(b); // b loses its qualification: a is the newest qualified commit again
+    w.approve(a);
+    for (let i = 0; i < 4; i++) await w.ok();
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`, `dry ${b.slice(0, 8)}`]);
+  });
+
+  test("[3] closing an unfollowable real run and its pause are one write: an interruption after it cannot lose the pause", async () => {
+    const { w, a } = await greenDry();
+    w.behave = ({ kind }) => (kind === "real" ? { noRun: true } : {});
+    w.approve(a);
+    await w.ok();
+    // Interrupt the job right after the state write that closes the candidate: the write lands, its response is lost.
+    const cas = w.stateRef.cas.bind(w.stateRef);
+    let cut = false;
+    w.stateRef.cas = async (before, text) => {
+      const v = await cas(before, text);
+      const s = JSON.parse(text);
+      if (!cut && s.dispatch?.candidate === null && s.dispatch.history.at(-1)?.outcome === "real-failed") {
+        cut = true;
+        throw new CrashError("after-effect");
+      }
+      return v;
+    };
+    for (let i = 0; i < 6 && !cut; i++) await w.tick();
+    expect(cut).toBe(true);
+    w.stateRef.cas = cas;
+    expect(w.state().pausePending).not.toBeNull();
+    const b = w.land();
+    w.qualified(b);
+    w.pastLease();
+    expect((await w.ok()).outcome).toBe("paused");
+    expect(w.issues("release-pause")).toHaveLength(1);
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`, `real ${a.slice(0, 8)}`]);
+  });
+
+  test("[4] a dry run rerun to failure, or deleted, after it was recorded green stops the real run", async () => {
+    for (const change of ["rerun-red", "deleted"] as const) {
+      const { w, a } = await greenDry();
+      const run = w.dispatched[0]!.run!;
+      if (change === "rerun-red") {
+        w.target.updateRun(run, { run_attempt: 2, conclusion: "failure" });
+        w.target.jobs.set(run.id, [{ ...job("plan", "failure"), completed_at: w.now.toISOString(), run_attempt: 2 }]);
+      } else w.target.runs = w.target.runs.filter((x) => x.id !== run.id);
+      w.approve(a);
+      expect((await w.ok()).outcome, change).toBe("alert");
+      expect(w.kinds(), change).toEqual([`dry ${a.slice(0, 8)}`]);
+      expect(w.dispatchHistory().at(-1), change).toMatchObject({ sha: a, outcome: "dry-failed", note: expect.stringContaining("rechecked before the real run") });
+    }
+  });
+
+  test("[5] the validity window runs from the run's own completion, not from when qlander saw it", async () => {
+    const w = new DispatchWorld({ dryRunValidMinutes: 30 });
+    const a = w.land();
+    w.qualified(a);
+    await w.ok(); // the dry run is dispatched and, within the next interval, completes
+    w.now = new Date(w.now.getTime() + 2 * 24 * 3_600_000); // an outage: the next tick is two days later
+    w.approve(a);
+    const r = await w.ok();
+    expect(r.outcome).toBe("alert");
+    expect(w.dispatchHistory().at(-1)).toMatchObject({ sha: a, outcome: "expired" });
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`]);
+  });
+
+  test("[6] an approval posted after the intent but before the dry run started does not count", async () => {
+    const w = new DispatchWorld();
+    w.behave = () => ({ createdLagSeconds: 4 });
+    const a = w.land();
+    w.qualified(a);
+    const intentAt = w.now;
+    await w.ok();
+    expect(w.candidate()!.dry!.at).toBe(intentAt.toISOString());
+    const early = w.approve(a, APPROVER, { at: new Date(intentAt.getTime() + 2000) });
+    const r = await w.ok();
+    expect(r.outcome).toBe("waiting");
+    expect(r.log.some((l) => l.includes(`comment ${early}`) && l.includes("predates"))).toBe(true);
+    expect(w.kinds()).toEqual([`dry ${a.slice(0, 8)}`]);
   });
 });

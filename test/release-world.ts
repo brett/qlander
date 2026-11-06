@@ -144,6 +144,7 @@ export const DISPATCH: DispatchConfig = {
   ref: "main",
   inputs: { sha: "sha", dryRun: "dry_run", dispatchId: "dispatch_id" },
   approvers: [{ login: APPROVERS[0]!.login, id: APPROVERS[0]!.id }],
+  actor: { login: "example-release[bot]", id: 90000001 },
   dryRunValidMinutes: 1440,
   appearMinutes: 30,
   runHours: 6,
@@ -154,6 +155,8 @@ export const DISPATCH: DispatchConfig = {
 /** The listed approver, and an account that is not listed. */
 export const APPROVER = DISPATCH.approvers[0]!;
 export const STRANGER = { login: `${APPROVER.login}-other`, id: APPROVER.id + 7919 };
+/** The release App's bot, which GitHub reports as the actor of every run qlander dispatches. */
+export const BOT = DISPATCH.actor;
 
 /** How the target's promote workflow behaves for one dispatch (defaults: appears and finishes a tick later, green, and a green real run moves release). */
 export interface Promotion {
@@ -168,7 +171,12 @@ export interface Promotion {
   moveRelease: boolean;
   /** No run is ever created (a disabled workflow, a dispatch GitHub dropped). */
   noRun: boolean;
+  /** Seconds after the dispatch call that GitHub stamps the run's created_at. */
+  createdLagSeconds: number;
 }
+
+/** Every ref-writing method on the fake target: a dispatch-mode tick may call only advanceEpoch, on its own epoch branch, with the fence on. */
+export const REF_WRITERS = ["createRef", "deleteRef", "updateRef", "epochUpdateRefs", "advanceEpoch", "voidEpoch", "merge"] as const;
 
 export interface Dispatched {
   kind: "dry" | "real";
@@ -188,8 +196,8 @@ export interface Dispatched {
 export class DispatchWorld extends ReleaseWorld {
   behave: (d: { kind: "dry" | "real"; sha: string; id: string }) => Partial<Promotion> = () => ({});
   dispatched: Dispatched[] = [];
-  /** Every call any ref writer on the target received (createRef, deleteRef, updateRef, epochUpdateRefs). */
-  refWrites: string[] = [];
+  /** Every call any ref writer on the target received (REF_WRITERS), as [method, args]. */
+  refWrites: [string, unknown[]][] = [];
   statusIssue: number;
   private due: { at: number; d: Dispatched; p: Promotion }[] = [];
 
@@ -197,10 +205,10 @@ export class DispatchWorld extends ReleaseWorld {
     super({ mode: "dispatch", dispatch: { ...DISPATCH, ...over }, ...rel });
     this.target.role = "dispatch";
     const t = this.target;
-    for (const m of ["createRef", "deleteRef", "updateRef", "epochUpdateRefs"] as const) {
-      const orig = (t[m] as (...a: unknown[]) => Promise<void>).bind(t);
+    for (const m of REF_WRITERS) {
+      const orig = (t[m] as (...a: unknown[]) => Promise<unknown>).bind(t);
       (t as unknown as Record<string, unknown>)[m] = (...a: unknown[]) => {
-        this.refWrites.push(`${m} ${JSON.stringify(a)}`);
+        this.refWrites.push([m, a]);
         return orig(...a);
       };
     }
@@ -219,12 +227,13 @@ export class DispatchWorld extends ReleaseWorld {
     const kind = x.inputs[i.dryRun] === "true" ? "dry" : "real";
     const sha = x.inputs[i.sha]!;
     const id = x.inputs[i.dispatchId]!;
-    const p: Promotion = { appearTicks: 1, runTicks: 1, conclusion: "success", echo: true, moveRelease: true, noRun: false, ...this.behave({ kind, sha, id }) };
+    const p: Promotion = { appearTicks: 1, runTicks: 1, conclusion: "success", echo: true, moveRelease: true, noRun: false, createdLagSeconds: 0, ...this.behave({ kind, sha, id }) };
+    const created = new Date(this.now.getTime() + p.createdLagSeconds * 1000).toISOString();
     const d: Dispatched = { kind, sha, id, run: null };
     this.dispatched.push(d);
     if (p.noRun) return;
     d.run = this.target.addRun(
-      { head_sha: this.main, path: x.workflow, event: "workflow_dispatch", head_branch: x.ref, status: "queued", conclusion: null, created_at: this.now.toISOString(), run_started_at: this.now.toISOString(), display_title: p.echo ? `Promote ${sha} (${id})` : `Promote ${sha}` },
+      { head_sha: this.main, path: x.workflow, event: "workflow_dispatch", head_branch: x.ref, status: "queued", conclusion: null, created_at: created, run_started_at: created, display_title: p.echo ? `Promote ${sha} (${id})` : `Promote ${sha}`, actor: { ...BOT }, triggering_actor: { ...BOT } },
       [job(kind === "dry" ? "plan" : "promote", null, "queued")],
       p.appearTicks,
     );
@@ -247,14 +256,17 @@ export class DispatchWorld extends ReleaseWorld {
     const run = d.run!;
     if (run.status === "completed") return;
     this.target.updateRun(run, { status: "completed", conclusion: p.conclusion });
-    this.target.jobs.set(run.id, [job(d.kind === "dry" ? "plan" : "promote", p.conclusion)]);
+    this.target.jobs.set(run.id, [{ ...job(d.kind === "dry" ? "plan" : "promote", p.conclusion), completed_at: this.now.toISOString(), run_attempt: run.run_attempt }]);
     // The target workflow moves release itself, with its own credential: GitHub's ref update, below every qlander client.
     if (d.kind === "real" && p.conclusion === "success" && p.moveRelease) this.target.githubUpdateRefs("release", this.release!, d.sha);
   }
 
   override async ok(o: Parameters<ReleaseWorld["ok"]>[0] = {}): Promise<ReleaseResult> {
     const r = await super.ok(o);
-    if (this.refWrites.length) throw new Error(`a ref writer was called in dispatch mode: ${this.refWrites.join("; ")}`);
+    // The property, precisely: never the release ref (nor main, nor a batch ref); with the epoch fence on, only advanceEpoch on the job's own epoch branch.
+    const allowed = ([m]: [string, unknown[]]) => m === "advanceEpoch" && this.cfg.runner.epochFence && this.target.epochBranch !== null;
+    const bad = this.refWrites.filter((w) => !allowed(w));
+    if (bad.length) throw new Error(`a ref writer was called in dispatch mode: ${bad.map(([m, a]) => `${m} ${JSON.stringify(a)}`).join("; ")}`);
     return r;
   }
 

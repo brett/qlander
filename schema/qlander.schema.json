@@ -517,7 +517,7 @@
           "description": "The dispatch mode's settings. Required when mode is dispatch, refused otherwise.",
           "type": "object",
           "additionalProperties": false,
-          "required": ["workflow", "inputs", "approvers"],
+          "required": ["workflow", "inputs", "approvers", "actor"],
           "properties": {
             "workflow": {
               "description": "The target workflow that promotes a commit and moves release itself. It must have a workflow_dispatch trigger with the three inputs below, and a run-name that contains the dispatch id input.",
@@ -542,6 +542,16 @@
                   "$ref": "#/$defs/inputName",
                   "examples": ["dispatch_id"]
                 }
+              }
+            },
+            "actor": {
+              "description": "The release App's bot account: a dispatched run counts only if GitHub reports it as both the run's actor and its triggering actor. audit checks it against the release App.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["login", "id"],
+              "properties": {
+                "login": { "description": "The bot's login, <app slug>[bot].", "type": "string", "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\\[bot\\]$", "examples": ["acme-release[bot]"] },
+                "id": { "description": "The bot account's id (not the App id): gh api 'users/<slug>[bot]' --jq .id.", "$ref": "#/$defs/repoId", "examples": [90000001] }
               }
             },
             "approvers": {

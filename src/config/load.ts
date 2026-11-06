@@ -199,7 +199,7 @@ interface ConfigYaml {
     priority?: { preempt?: boolean };
     concurrency?: { maxActive?: number; pipelineDepth?: number };
     strategy?: { firstAlone?: boolean; skipSeenRed?: boolean; reuseGreen?: boolean; adaptive?: { greens: number; ceiling: number }; mainBaseline?: boolean };
-    landing?: { mode?: "merge" | "linear"; body?: string };
+    landing?: { mode?: "merge" | "linear"; body?: string; author?: "app" | "author"; maxRefusals?: number };
     controlLabels: { pause: string; mirror: string };
     admission: {
       fastLane: { workflow: string; event: string; job: string };
@@ -336,9 +336,12 @@ function toConfig(y: ConfigYaml, names: Names, runner: RunnerContract): Config {
     // Likewise not policy, and absent unless a key is on.
     ...strategyOf(q.strategy),
     // Policy, but only linear mode adds a key: merge mode (the default) hashes exactly as before.
-    ...(q.landing?.mode === "linear" ? { landing: { mode: "linear" as const, body: q.landing.body ?? DEFAULT_LINEAR_BODY } } : {}),
+    ...(q.landing?.mode === "linear" ? { landing: { mode: "linear" as const, body: q.landing.body ?? DEFAULT_LINEAR_BODY, author: q.landing.author ?? "app", maxRefusals: q.landing.maxRefusals ?? DEFAULT_LAND_REFUSALS } } : {}),
   };
 }
+
+/** queue.landing.maxRefusals when linear mode leaves it out. */
+export const DEFAULT_LAND_REFUSALS = 3;
 
 /** queue.landing.body when linear mode leaves it out: neutral, and naming the admitted head. */
 export const DEFAULT_LINEAR_BODY = "Squashed from #{number} at {head}.\n\nLanded-by: qlander batch {batch}";
@@ -348,6 +351,25 @@ export const LINEAR_BODY_PLACEHOLDERS = ["{number}", "{head}", "{batch}"];
 
 /** The longest queue.landing.body, in code points. */
 export const LINEAR_BODY_MAX = 2000;
+
+/**
+ * Linear landing and release advance do not combine (DESIGN.md §7.4, §9): a
+ * hotfix reaches main as a merge-back PR, and only a real merge commit makes
+ * `release` an ancestor of `main` again. Linear landing squashes it, so the
+ * release job would report `diverged` from then on. Refused whenever release
+ * is enabled in advance mode, dry runs included, since a dry run is the step
+ * before a live one. `release.mode` (advance | dispatch) is not in this
+ * schema yet; read defensively so dispatch, which moves no branch by
+ * fast-forward, stays allowed once it is.
+ */
+export function linearReleaseProblems(y: { queue: { landing?: { mode?: string } }; release: { enabled?: boolean } }): string[] {
+  if (y.queue.landing?.mode !== "linear" || y.release.enabled !== true) return [];
+  const mode = (y.release as { mode?: unknown }).mode;
+  if (mode !== undefined && mode !== "advance") return [];
+  return [
+    "queue.landing.mode linear cannot be used with release advance (release.enabled is true): the hotfix protocol's merge-back must land as a real merge commit so that release becomes an ancestor of main again, and linear landing would squash it (DESIGN.md §9, §7.4). Turn release advance off, or keep merge mode",
+  ];
+}
 
 /** Problems with a linear-mode commit body template: unknown placeholders, control characters other than a line break, length. */
 export function linearBodyProblems(body: string): string[] {
@@ -687,7 +709,8 @@ export function parseConfig(text: string, source = "qlander.yml"): LoadedConfig 
     ...tokenProblems(tokens),
     ...runsOnProblems(runsOn, runner.mode),
     ...bundleProblems(bundle, y.control.repo),
-    ...(y.queue.landing?.body !== undefined && y.queue.landing.mode !== "linear" ? ["queue.landing.body is set, but queue.landing.mode is not linear"] : []),
+    ...(["body", "author", "maxRefusals"] as const).filter((k) => y.queue.landing?.[k] !== undefined && y.queue.landing.mode !== "linear").map((k) => `queue.landing.${k} is set, but queue.landing.mode is not linear`),
+    ...linearReleaseProblems(y),
   ];
   if (meaning.length) throw new ConfigError(source, meaning);
   const comments: CommentSettings = { omit: [...new Set(y.comments?.omit ?? [])] };

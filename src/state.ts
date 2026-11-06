@@ -138,7 +138,7 @@ export type Op =
   | { kind: "build"; n: number; base: string; pins: Pin[]; depth: number; lineage: number; source: BuildSource; rebuild: boolean }
   | { kind: "rerun"; runs: RunRef[]; done?: RunRef[]; requested?: RerunRequest[]; everSent?: boolean }
   /** `heads`: linear landing only (DESIGN.md §7.4), each PR branch the same atomic update moves from its admitted head to its stack commit. */
-  | { kind: "land"; before: string; after: string; heads?: HeadMove[] }
+  | { kind: "land"; before: string; after: string; heads?: HeadMove[]; refused?: number }
   | { kind: "cancel"; runs: RunRef[]; cause: "timeout" | "starved" };
 
 /** One PR head branch a linear landing moves (DESIGN.md §7.4): `ref` from `before` (the admitted head) to `after` (its stack commit). */
@@ -576,7 +576,8 @@ function checkOp(x: unknown, where: string): string {
     const total = (o.runs as unknown[]).length + ((o.done as unknown[] | undefined)?.length ?? 0) + ((o.requested as unknown[] | undefined)?.length ?? 0);
     if (total === 0) fail(`${where}: a rerun of nothing`);
   } else if (kind === "land") {
-    const o = obj(x, where, ["kind", "before", "after"], ["heads"]);
+    const o = obj(x, where, ["kind", "before", "after"], ["heads", "refused"]);
+    if (o.refused !== undefined && (int(o.refused, `${where}.refused`, 1), o.heads === undefined)) fail(`${where}.refused: only on a linear landing`);
     sha(o.before, `${where}.before`);
     sha(o.after, `${where}.after`);
     if (o.heads !== undefined) {

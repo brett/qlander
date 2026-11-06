@@ -153,6 +153,9 @@ export class FakeTarget implements TargetApi {
    * the PR branches move, and then the whole call is rejected with main unmoved.
    */
   partialLanding = false;
+  /** The next this-many landStack calls are refused whole, with nothing moved (a refusal GitHub does not explain). */
+  refuseLandings = 0;
+  refusal: () => Error = () => new GitHubError("validation", 422, "Reference update failed");
 
   private setContent(s: string, c: Set<string>): void {
     this.content.set(s, c);
@@ -269,6 +272,30 @@ export class FakeTarget implements TargetApi {
     if (!c) throw new GitHubError("not_found", 404, `no commit ${s}`);
     const tree = this.treeOf.get(s);
     return tree ? { ...c, tree } : c;
+  }
+  /**
+   * Rulesets as GitHub applies them to branches (linear landing's admission
+   * check): which branches each covers, its rule types, and what
+   * current_user_can_bypass says for the queue App (null: absent).
+   */
+  branchRulesets: { id: number; name: string; covers: (branch: string) => boolean; types: string[]; bypass: string | null }[] = [];
+  /** Branches with classic protection. */
+  protectedBranches = new Set<string>();
+  /** branchRules fails, as a read GitHub could not answer. */
+  branchRulesError: Error | null = null;
+
+  async branchRules(branch: string) {
+    if (!isGitBranchName(branch) || isForbiddenHeadRef(this.names, branch)) throw new GitHubError("validation", null, "reserved branch");
+    if (this.branchRulesError) throw this.branchRulesError;
+    return this.branchRulesets.filter((r) => r.covers(branch)).flatMap((r) => r.types.map((type) => ({ type, rulesetId: r.id })));
+  }
+  async rulesetBypass(id: number) {
+    const r = this.branchRulesets.find((x) => x.id === id);
+    if (!r) throw new GitHubError("not_found", 404, "no ruleset");
+    return { name: r.name, bypass: r.bypass };
+  }
+  async branchProtected(branch: string) {
+    return this.protectedBranches.has(branch);
   }
   async getPrBranch(branch: string) {
     if (!isGitBranchName(branch) || isForbiddenHeadRef(this.names, branch)) throw new GitHubError("validation", null, `'${branch}' is reserved or not a branch name`);
@@ -527,19 +554,24 @@ export class FakeTarget implements TargetApi {
     this.log(`merge ${base} ${headSha}`);
     return { kind: "merged", sha: m };
   }
-  async createCommit(tree: string, parent: string, message: string): Promise<string> {
+  /** The author each created commit was given (absent: the App). */
+  createdAuthors = new Map<string, { name: string; email: string }>();
+
+  async createCommit(tree: string, parent: string, message: string, author?: { name: string; email: string }): Promise<string> {
     if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
     if (!isRealSha(tree) || !isRealSha(parent)) throw new GitHubError("validation", null, "not a real object id");
     const content = this.treeContent.get(tree);
     if (!content || !this.commits.has(parent)) throw new GitHubError("validation", 422, "Tree or parent does not exist");
     // Unique per call, like GitHub (a commit carries its timestamp).
     const s = sha(`created:${tree}:${parent}:${message}:${nextId()}`);
-    const verified = !this.unsignedCreated;
+    // GitHub signs a git data API commit only when it is its own author: one with another author is unsigned.
+    const verified = !this.unsignedCreated && !author;
     this.commits.set(s, { sha: s, parents: [parent], verified, reason: verified ? "valid" : "unsigned" });
     this.commitFiles.set(s, []);
     this.order.set(s, this.order.size);
     this.setContent(s, content);
     this.created.add(s);
+    if (author) this.createdAuthors.set(s, author);
     this.createdMessages.push(message);
     this.log(`createCommit ${s} on ${parent}`);
     return s;
@@ -571,6 +603,10 @@ export class FakeTarget implements TargetApi {
     const moveHeads = () => {
       for (const h of heads) this.prOnBranch(h.branch)!.pr.head.sha = h.after;
     };
+    if (this.refuseLandings > 0) {
+      this.refuseLandings--;
+      throw this.refusal();
+    }
     if (this.partialLanding) {
       moveHeads();
       throw new GitHubError("server", 502, "Bad gateway");

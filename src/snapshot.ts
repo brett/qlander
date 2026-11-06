@@ -12,9 +12,10 @@ import { appCheck, isPolicyChange, jobAtMain, jobAtSubject, policyApproval, type
 import type { TargetApi, Compare } from "./github/api";
 import { GitHubError } from "./github/http";
 import type { Observation } from "./ops";
+import { type BypassRead, forceUpdateOf } from "./force-update";
 import type { Active, Journal, State } from "./state";
 import type { FailedJob, JobsByRun, Run } from "./types";
-import { type Command, COMMAND_KINDS, queueRef } from "./validate";
+import { type Command, COMMAND_KINDS, isForbiddenHeadRef, isGitBranchName, queueRef } from "./validate";
 
 export interface SnapshotInput {
   api: TargetApi;
@@ -57,6 +58,8 @@ class Lookups {
   private jobs: JobsByRun = {};
   readonly incomplete = new Set<number>();
   private search: { runs: Run[]; truncated: boolean } | null = null;
+  /** Linear landing's force-update check: each ruleset read once per snapshot. */
+  readonly bypass = new Map<number, Promise<BypassRead>>();
 
   constructor(
     private readonly api: TargetApi,
@@ -165,7 +168,7 @@ async function describePr(i: SnapshotInput, n: number, l: Lookups): Promise<Live
     fastLane: notEvaluated,
     review: notEvaluated,
     policyApproval: false,
-    ...(pr.user ? { author: pr.user.login } : {}),
+    ...(pr.user ? { author: pr.user.login, authorId: pr.user.id } : {}),
     ...(pr.title !== undefined ? { title: pr.title } : {}),
   };
   if (!open || !pr.labels.includes(i.cfg.names.labels.ready)) return live;
@@ -190,6 +193,8 @@ async function describePr(i: SnapshotInput, n: number, l: Lookups): Promise<Live
   const bot = automationFor(i.cfg.trustedAutomations, pr.user);
   if (bot) live.automation = await trustOf(i, bot, pr.head.ref, head, diff);
   live.fastLane = await fastLaneProof(i, head, l);
+  // Linear landing (DESIGN.md §7.4): can the landing move this branch? Never fails the snapshot.
+  if (i.cfg.landing && isGitBranchName(pr.head.ref) && !isForbiddenHeadRef(i.cfg.names, pr.head.ref)) live.forceUpdate = await forceUpdateOf(i.api, pr.head.ref, l.bypass);
   const auth = i.state.auth[String(n)];
   live.review = i.cfg.reviewRequired
     ? await reviewProof(i, head, l, auth && auth.head === head ? auth.reviewRun : null)

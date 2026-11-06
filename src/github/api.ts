@@ -13,6 +13,12 @@ export interface Commit {
   tree?: string;
 }
 
+/** A commit's author as the git data API takes it (linear landing, `queue.landing.author: author`). The committer is always the App. */
+export interface CommitAuthor {
+  name: string;
+  email: string;
+}
+
 /** A GitHub account as the API resolves it (a commit's author is null when its email maps to no account). */
 export interface Account {
   login: string;
@@ -195,6 +201,17 @@ export interface TargetApi {
    * release, the batch refs and anything else qlander reserves.
    */
   getPrBranch(branch: string): Promise<string | null>;
+  /**
+   * Linear landing's admission check (src/force-update.ts): the rules GitHub
+   * applies to a PR branch (GET /rules/branches/{branch}, repository and
+   * organization rulesets alike), each with its ruleset id (null if GitHub
+   * names none). Metadata read; never a reserved branch.
+   */
+  branchRules(branch: string): Promise<{ type: string; rulesetId: number | null }[]>;
+  /** A ruleset that applies to the repo (its own or its organization's): its name and `current_user_can_bypass` for this App (null when absent). */
+  rulesetBypass(id: number): Promise<{ name: string; bypass: string | null }>;
+  /** A PR branch's `protected` flag (classic branch protection); false if the branch does not exist. */
+  branchProtected(branch: string): Promise<boolean>;
 
   // writes (each refused unless the client's role allows it)
   createRef(branch: string, sha: string): Promise<void>;
@@ -206,7 +223,7 @@ export interface TargetApi {
    * one parent, through the git data API, with GitHub's own author and
    * signature. Returns its sha. Queue only.
    */
-  createCommit(tree: string, parent: string, message: string): Promise<string>;
+  createCommit(tree: string, parent: string, message: string, author?: CommitAuthor): Promise<string>;
   /**
    * Linear landing (DESIGN.md §7.4): one atomic GraphQL updateRefs that moves
    * main by fast-forward (`force: false`, beforeOid `main.before`) and every

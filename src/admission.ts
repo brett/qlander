@@ -4,6 +4,7 @@
 import type { AutomationTrust } from "./automation";
 import type { Config } from "./config";
 import type { Proof } from "./evidence";
+import type { ForceUpdate } from "./force-update";
 import type { Auth, Waiver } from "./state";
 import { isForbiddenHeadRef, isGitBranchName, isSha } from "./validate";
 
@@ -29,6 +30,8 @@ export interface LivePr {
   policyApproval: boolean;
   /** The PR author's login, for hook payloads only. */
   author?: string;
+  /** The PR author's account id: with `author`, their noreply address for a linear stack commit (DESIGN.md §7.4). */
+  authorId?: number;
   /** The PR's title (untrusted), for the merge commit message only. Admission never reads it. */
   title?: string;
   /** Set when a configured trusted automation opened the PR (src/automation.ts); absent otherwise. */
@@ -41,6 +44,12 @@ export interface LivePr {
   priority?: { actorLogin: string; at: string };
   /** Why a priority label on this PR does not count (for the log); absent when there is none or it counts. */
   priorityIgnored?: string;
+  /**
+   * Linear landing only (DESIGN.md §7.4): whether the queue App may
+   * force-update the head branch (src/force-update.ts). `denied` holds the
+   * PR; `unknown` is advisory. Absent in merge mode.
+   */
+  forceUpdate?: ForceUpdate;
   /** Why `ready` is null although the PR carries the label (for the tick's verdict only); admission never reads it. */
   readyUnreadable?: string;
 }
@@ -51,6 +60,9 @@ export type Admission =
 
 /** The wait reason of a policy PR that has everything but its §4.3 approval (emits approval_needed). */
 export const NEEDS_APPROVAL = "CI-policy change needs a SHA-bound approval";
+
+/** The wait reason of a PR whose head branch the linear landing could not move (DESIGN.md §7.4). */
+export const FORCE_DENIED = "linear landing cannot move its head branch";
 
 export const WRITERS = new Set(["write", "maintain", "admin"]);
 
@@ -84,6 +96,7 @@ export function admit(pr: LivePr, cfg: Config): Admission {
   if (!pr.commitsVerified) return unready("has unsigned commits");
   if (!pr.fastLane.ok) return wait(`fast lane: ${pr.fastLane.why}`);
   if (!pr.review.ok) return wait(`review: ${pr.review.why}`);
+  if (cfg.landing && pr.forceUpdate?.kind === "denied") return wait(`${FORCE_DENIED}: ${pr.forceUpdate.rule}`);
   if (pr.policyPr && !pr.policyApproval && !trusted) {
     const why = pr.automation && !pr.automation.ok ? ` (trusted automation: ${pr.automation.why})` : "";
     return wait(`${NEEDS_APPROVAL}${why}`);

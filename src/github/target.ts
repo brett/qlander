@@ -9,7 +9,7 @@ import type { Names } from "../config";
 import { refsOverlap } from "../config/runner";
 import { EVENT_TYPE_RE } from "../hooks";
 import { BRANCH_NAME_RE, isBuildRef, isCommandLabel, isForbiddenHeadRef, isGitBranchName, isQlanderBranch, isPrNumber, isRealSha, isSha, isWritableRef, ZERO_SHA } from "../validate";
-import type { Account, TargetApi, Commit, Compare, LabelEvent, Listed, MergeResult, PullRequest, RefActivity, RefUpdate, Review, Status, StatusEntry } from "./api";
+import type { Account, CommitAuthor, TargetApi, Commit, Compare, LabelEvent, Listed, MergeResult, PullRequest, RefActivity, RefUpdate, Review, Status, StatusEntry } from "./api";
 
 /** git's empty tree: every epoch commit has it (docs/deployment.md §3.4). */
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -31,6 +31,11 @@ export type Role = "queue" | "release" | "read";
 const NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
 const WORKFLOW_RE = /^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/;
 const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(\[bot\])?$/;
+
+/** An account's GitHub noreply address (`<id>+<login>@users.noreply.github.com`), or null for anything that is not a login and an id. */
+export function noreplyEmail(login: string, id: number): string | null {
+  return LOGIN_RE.test(login) && Number.isSafeInteger(id) && id > 0 ? `${id}+${login}@users.noreply.github.com` : null;
+}
 
 /** Pages of branch activity read when judging a trusted automation's PR; more than that fails closed. */
 const ACTIVITY_PAGES = 5;
@@ -204,11 +209,37 @@ export class TargetClient implements TargetApi {
   async getPrBranch(branch: string): Promise<string | null> {
     try {
       // Each component encoded: git allows `#`, `%` and `+` in a branch name, which a URL path does not take as they are.
-      const path = this.prBranch(branch).split("/").map(encodeURIComponent).join("/");
+      const path = this.branchPath(branch);
       const r = await this.http.request<{ object: { sha: string } }>("GET", `${this.path}/git/ref/heads/${path}`);
       return sha(r.json.object.sha, `ref ${branch}`);
     } catch (e) {
       if (e instanceof GitHubError && e.kind === "not_found") return null;
+      throw e;
+    }
+  }
+
+  /** A PR branch, as a URL path: each component encoded. */
+  private branchPath(b: string): string {
+    return this.prBranch(b).split("/").map(encodeURIComponent).join("/");
+  }
+
+  async branchRules(branch: string): Promise<{ type: string; rulesetId: number | null }[]> {
+    const { items, truncated } = await this.http.paginate(`${this.path}/rules/branches/${this.branchPath(branch)}`, {}, (p) => p as { type: string; ruleset_id?: number }[]);
+    if (truncated) bad(`the rules for ${branch} were not read completely`);
+    return items.map((r) => ({ type: String(r.type), rulesetId: Number.isSafeInteger(r.ruleset_id) ? r.ruleset_id! : null }));
+  }
+
+  async rulesetBypass(id: number): Promise<{ name: string; bypass: string | null }> {
+    if (!Number.isSafeInteger(id) || id <= 0) bad(`not a ruleset id: ${id}`);
+    const r = (await this.http.request<{ name?: unknown; current_user_can_bypass?: unknown }>("GET", `${this.path}/rulesets/${id}`, { query: { includes_parents: "true" } })).json;
+    return { name: typeof r.name === "string" ? r.name : `#${id}`, bypass: typeof r.current_user_can_bypass === "string" ? r.current_user_can_bypass : null };
+  }
+
+  async branchProtected(branch: string): Promise<boolean> {
+    try {
+      return (await this.http.request<{ protected?: unknown }>("GET", `${this.path}/branches/${this.branchPath(branch)}`)).json.protected === true;
+    } catch (e) {
+      if (e instanceof GitHubError && e.kind === "not_found") return false;
       throw e;
     }
   }
@@ -530,10 +561,12 @@ export class TargetClient implements TargetApi {
     }
   }
 
-  async createCommit(tree: string, parent: string, message: string): Promise<string> {
+  async createCommit(tree: string, parent: string, message: string, author?: CommitAuthor): Promise<string> {
     this.can("queueOps");
     if (message.length === 0 || message.length > 65_000 || message.includes("\0")) bad("bad commit message");
-    const r = await this.http.request<{ sha: string }>("POST", `${this.path}/git/commits`, { body: { message, tree: oid(tree, "tree"), parents: [oid(parent, "parent")] } });
+    // Only a GitHub noreply identity: never a real address.
+    if (author && !(LOGIN_RE.test(author.name) && author.email === noreplyEmail(author.name, Number(author.email.split("+")[0])))) bad("a commit author must be a login at its GitHub noreply address");
+    const r = await this.http.request<{ sha: string }>("POST", `${this.path}/git/commits`, { body: { message, tree: oid(tree, "tree"), parents: [oid(parent, "parent")], ...(author ? { author } : {}) } });
     return oid(r.json.sha, "commit");
   }
 

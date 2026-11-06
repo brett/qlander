@@ -32,6 +32,7 @@ import type { BuildRecord, Executor, Op, StackCommit, State } from "./state";
 import { CorruptStateError, LeaseHeldError, LostLockError, mirror, queueCodec, StateStore } from "./store";
 import { buildRef, queueRef } from "./validate";
 import { retickAt, type Wake, wakeFor } from "./wake";
+import { noreplyEmail } from "./github/target";
 
 /** How long a GitHub-internal GraphQL error counts towards a pause (Tick.countInternalError). */
 export const INTERNAL_ERROR_WINDOW_MS = 60 * 60_000;
@@ -152,10 +153,24 @@ export function mergeMessage(pr: number, head: string, n: number, title?: string
  * `Pull request #<pr>` when there is none), a blank line, then
  * queue.landing.body with its placeholders filled in.
  */
-export function linearMessage(pr: number, head: string, n: number, title: string | undefined, body: string): string {
+export function linearMessage(pr: number, head: string, n: number, title: string | undefined, body: string, coAuthor?: { login: string; email: string }): string {
   const t = mergeTitle(title);
   const subject = t === null ? `Pull request #${pr}` : `${t} (#${pr})`;
-  return `${subject}\n\n${body.replaceAll("{number}", String(pr)).replaceAll("{head}", head).replaceAll("{batch}", String(n))}`;
+  const trailer = coAuthor ? `\n\nCo-authored-by: ${coAuthor.login} <${coAuthor.email}>` : "";
+  return `${subject}\n\n${body.replaceAll("{number}", String(pr)).replaceAll("{head}", head).replaceAll("{batch}", String(n))}${trailer}`;
+}
+
+/**
+ * Who a stack commit credits (DESIGN.md §7.4): the PR's author at their
+ * GitHub noreply address, or null when GitHub returned no usable account.
+ * With `author: app` it is a Co-authored-by trailer on an App-authored,
+ * signed commit; with `author: author` it is the commit's author, and the
+ * commit is unsigned. Never a real address.
+ */
+export function prAuthor(live: { author?: string; authorId?: number } | undefined): { login: string; email: string } | null {
+  if (!live?.author || live.authorId === undefined) return null;
+  const email = noreplyEmail(live.author, live.authorId);
+  return email ? { login: live.author, email } : null;
 }
 
 const stableId = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
@@ -315,6 +330,13 @@ class Tick {
       await this.apply({ kind: "built", head: r.head });
       return;
     }
+    // A linear landing is resent only as a fresh one would be sent: main still its base, every PR revalidated (§4.2).
+    if (r.kind === "retryLand" && op.kind === "land") {
+      if (snap.main !== op.before || !valid((op.heads ?? []).map((h) => ({ pr: h.pr, head: h.before })))) {
+        await this.apply({ kind: "opDropped", reason: "the batch no longer revalidates on this main" });
+        return;
+      }
+    }
     if (op.kind === "rerun" && !valid((this.state.active?.prs ?? []).map((pr) => ({ pr })))) {
       await this.apply({ kind: "opDropped", reason: "the batch is no longer valid" });
       return;
@@ -385,7 +407,8 @@ class Tick {
           else {
             const heads: Record<string, string | null> = {};
             for (const h of op.heads ?? []) heads[String(h.pr)] = await c.getPrBranch(h.ref);
-            result = headsVerdict(op.heads, op.heads ? heads : undefined, { since: j.at, now: this.d.now(), reconcileMinutes: this.d.cfg.reconcileMinutes }) ?? { kind: "landRejected", retry: isTransient(e), reason: String(e) };
+            // Linear (DESIGN.md §7.4): every ref where the batch left it is a refusal the next tick retries; merge mode is unchanged.
+            result = headsVerdict(op.heads, op.heads ? heads : undefined, { since: j.at, now: this.d.now(), reconcileMinutes: this.d.cfg.reconcileMinutes }) ?? (op.heads ? { kind: "landRefused", counted: !isTransient(e), reason: String(e) } : { kind: "landRejected", retry: isTransient(e), reason: String(e) });
           }
         }
         await this.apply(result);
@@ -424,6 +447,8 @@ class Tick {
     const landing = this.d.cfg.landing;
     // Linear (DESIGN.md §7.4): the merge chain stays on the build ref; the stack, one commit per PR on its tree, is what is pushed.
     const stack: StackCommit[] = [];
+    /** Stack commits with the PR's author as author: GitHub does not sign those (queue.landing.author: author). */
+    const authored = new Set<string>();
     if (landing) {
       let parent = op.base;
       for (const [i, m] of merges.entries()) {
@@ -433,14 +458,20 @@ class Tick {
           await this.apply({ kind: "buildFailed", reason: `merge commit ${m} for #${pin.pr} came back without a tree` });
           return;
         }
-        const commit = await c.createCommit(tree, parent, linearMessage(pin.pr, pin.head, op.n, snap.prs[String(pin.pr)]?.title, landing.body));
+        const live = snap.prs[String(pin.pr)];
+        const who = prAuthor(live);
+        const byAuthor = landing.author === "author" && who !== null;
+        // author mode credits through authorship, so a trailer naming the same person again would add nothing.
+        const message = linearMessage(pin.pr, pin.head, op.n, live?.title, landing.body, !byAuthor && who ? who : undefined);
+        const commit = await c.createCommit(tree, parent, message, byAuthor ? { name: who.login, email: who.email } : undefined);
+        if (byAuthor) authored.add(commit);
         stack.push({ pr: pin.pr, commit, parent, tree });
         parent = commit;
       }
       this.crash("after-stack");
     }
     // What reaches main must be signed: the merge commits in merge mode, the stack commits in linear mode.
-    for (const m of landing ? stack.map((x) => x.commit) : merges) {
+    for (const m of landing ? stack.map((x) => x.commit).filter((x) => !authored.has(x)) : merges) {
       const commit = await c.getCommit(m);
       if (!commit.verified || commit.reason !== "valid") {
         await this.apply({ kind: "buildFailed", reason: `${landing ? "stack" : "merge"} commit ${m} is not signed and verified (${commit.reason})` });

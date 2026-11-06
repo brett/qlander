@@ -3,7 +3,10 @@
 // outbox, and at most one external effect is journalled per tick. The runner
 // performs that op and feeds the outcome to applyOpResult() (ops.ts).
 
-import { admit, type LivePr, NEEDS_APPROVAL, revalidate, waiverFor } from "./admission";
+import { admit, FORCE_DENIED, type LivePr, NEEDS_APPROVAL, revalidate, waiverFor } from "./admission";
+
+/** A short stable key for a comment marker. */
+const stableKey = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
 import { describeWaiver } from "./automation";
 import { baselineResult, mainFailures, NOT_RED, ownFailures } from "./baseline";
 import { flakyItems, GIVE_UP_HOURS, jobId } from "./flaky";
@@ -536,6 +539,8 @@ function admitAndRevalidate(c: Ctx): void {
       const waiver = waiverFor(live, c.cfg);
       if (waiver) c.s.auth[key] = { ...c.s.auth[key]!, waiver };
       c.log.push(`admit #${live.number} at ${live.head}${waiver ? ` (${describeWaiver(waiver)})` : ""}`);
+      // Advisory only: a landing GitHub refuses is classified and retried (DESIGN.md §7.4).
+      if (live.forceUpdate?.kind === "unknown") c.log.push(`#${live.number}: whether the queue App may force-update ${live.headRef} is unknown: ${live.forceUpdate.why}`);
       const au = c.s.auth[key]!;
       emit(c, { event: "admitted", key: `admitted:${key}:${au.head}:${au.admittedAt}`, batch: null, prs: [hookPr(c, live.number)], details: { policyPr: au.policyPr, ...(au.priority ? { priority: { by: au.priority.by } } : {}), ...(au.waiver ? { waiver: { rule: au.waiver.rule, login: au.waiver.login, readyByBot: au.waiver.readyByBot, policyWaived: au.waiver.policyWaived } } : {}) } });
       const e = c.s.eligibleSince?.[key];
@@ -547,6 +552,10 @@ function admitAndRevalidate(c: Ctx): void {
       comment(c, live.number, `adm:${live.head}`, `Not queued: ${a.reason}. Fix it and re-add \`ready\`.`);
     } else if (a.kind === "wait") {
       c.log.push(`#${live.number} waits: ${a.reason}`);
+      // Linear landing (DESIGN.md §7.4): said at once, once per head and rule; `ready` stays, so it is evaluated again every tick.
+      if (live.forceUpdate?.kind === "denied" && a.reason.startsWith(FORCE_DENIED)) {
+        comment(c, live.number, `force:${live.head}:${stableKey(live.forceUpdate.rule)}`, `Labelled \`ready\` but not queued: this queue lands linear, which moves the PR's head branch \`${live.headRef}\` to its squashed commit, and that branch has ${live.forceUpdate.rule}. Let the queue App bypass that rule for this branch (bypass mode "always"), or push the change from a branch it does not cover. \`ready\` stays on: the PR is queued once the rule allows it.`);
+      }
       if (live.mergeable === null) waitNotice(c, live, "merge", hold(c, live.number, live.head));
       else if (live.fastLane.red) waitNotice(c, live, "fast", Date.parse(live.ready!.at), live.fastLane.why);
       if (a.reason.startsWith(NEEDS_APPROVAL)) {

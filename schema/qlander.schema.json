@@ -215,6 +215,19 @@
               "default": "merge",
               "examples": ["linear"]
             },
+            "author": {
+              "description": "linear mode only: who authors each squashed commit. app: the queue App is author and committer, the commit is signed by GitHub, and the PR's author is credited with a Co-authored-by trailer. author: the PR's author is the commit's author, at their GitHub noreply address, and the App is the committer; such a commit is not signed, so audit fails it when the target requires signed commits on main. See DESIGN.md §7.4.",
+              "type": "string",
+              "enum": ["app", "author"],
+              "default": "app",
+              "examples": ["app"]
+            },
+            "maxRefusals": {
+              "description": "linear mode only: refused landings in a row, with main and every PR branch still where the batch left them, before the queue pauses. Each refusal is retried on the next tick; none costs a CI run.",
+              "$ref": "#/$defs/positive",
+              "default": 3,
+              "examples": [3]
+            },
             "body": {
               "description": "linear mode only: the body of each squashed commit, below the subject `<PR title> (#<number>)`. Placeholders: {number}, {head} (the admitted head SHA) and {batch}. A \\n in a double-quoted string is a line break.",
               "type": "string",

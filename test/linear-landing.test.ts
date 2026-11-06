@@ -13,19 +13,20 @@
 
 import { describe, expect, test } from "bun:test";
 import type { Config } from "../src/config";
-import { DEFAULT_LINEAR_BODY, parseConfig } from "../src/config/load";
+import { DEFAULT_LINEAR_BODY, linearReleaseProblems, parseConfig } from "../src/config/load";
 import { fenced } from "../src/fenced";
+import { forceUpdateOf } from "../src/force-update";
 import { TargetClient } from "../src/github/target";
 import { headsVerdict } from "../src/ops";
 import { type CrashPoint, linearMessage, policyHash } from "../src/queue";
 import { parseState } from "../src/state";
 import { LostLockError } from "../src/store";
 import { isGitBranchName } from "../src/validate";
-import { FakeTarget } from "./fake-github";
+import { FakeTarget, WRITER } from "./fake-github";
 import { APPROVERS, job, NAMES, OPT_IN_FREE_HASH, OPT_IN_FREE_YAML, pathRe, sha, TARGET, TARGET_OPTS, TARGET_SLUG } from "./sim";
 import { type BatchCi, type CiOutcome, World } from "./world";
 
-const LINEAR: NonNullable<Config["landing"]> = { mode: "linear", body: DEFAULT_LINEAR_BODY };
+const LINEAR: NonNullable<Config["landing"]> = { mode: "linear", body: DEFAULT_LINEAR_BODY, author: "app", maxRefusals: 3 };
 
 function linearWorld(oracle: (b: BatchCi) => CiOutcome = () => "pass", over: Partial<Config> = {}): World {
   return new World(oracle, { landing: LINEAR, ...over });
@@ -82,7 +83,10 @@ describe("a batch lands as a linear stack", () => {
       if (i > 0) expect(w.target.content.get(stack[i - 1]!.sha)!.has(change)).toBe(false);
     }
     const batch = w.state().history.find((x) => x.outcome === "landed")!.n;
-    expect(w.target.createdMessages).toEqual([1, 2, 3].map((n, i) => `Change number ${n} (#${n})\n\nSquashed from #${n} at ${heads[i]}.\n\nLanded-by: qlander batch ${batch}`));
+    // The App is the author (signed); the PR's author is credited by a trailer at their noreply address.
+    const by = `Co-authored-by: ${WRITER.login} <${WRITER.id}+${WRITER.login}@users.noreply.github.com>`;
+    expect(w.target.createdMessages).toEqual([1, 2, 3].map((n, i) => `Change number ${n} (#${n})\n\nSquashed from #${n} at ${heads[i]}.\n\nLanded-by: qlander batch ${batch}\n\n${by}`));
+    expect(w.target.createdAuthors.size).toBe(0);
 
     // One atomic landing: main from the root, each branch from its admitted head to its own commit.
     expect(w.target.landings).toHaveLength(1);
@@ -604,7 +608,12 @@ describe("state", () => {
 });
 
 describe("config", () => {
-  const withLanding = (block: string) => OPT_IN_FREE_YAML.replace(/^( {2}controlLabels:)/m, `  landing:\n${block}\n$1`);
+  const releaseOff = (t: string) => {
+    const out = t.replace(/^( {2}enabled: )true$/m, "$1false");
+    if (out === t) throw new Error("the example config no longer enables release advance");
+    return out;
+  };
+  const withLanding = (block: string, base = releaseOff(OPT_IN_FREE_YAML)) => base.replace(/^( {2}controlLabels:)/m, `  landing:\n${block}\n$1`);
   const problems = (text: string) => {
     try {
       parseConfig(text);
@@ -616,26 +625,46 @@ describe("config", () => {
 
   test("absent, or mode merge: no key, and the policy hash is unchanged", () => {
     expect("landing" in parseConfig(OPT_IN_FREE_YAML).config).toBe(false);
-    const merge = parseConfig(withLanding("    mode: merge")).config;
+    const merge = parseConfig(withLanding("    mode: merge", OPT_IN_FREE_YAML)).config;
     expect("landing" in merge).toBe(false);
     expect(policyHash(merge)).toBe(OPT_IN_FREE_HASH);
   });
 
-  test("linear: the key, with the default body, in the policy hash", () => {
+  test("linear: the key, with the defaults, in the policy hash", () => {
     const c = parseConfig(withLanding("    mode: linear")).config;
-    expect(c.landing).toEqual({ mode: "linear", body: DEFAULT_LINEAR_BODY });
+    expect(c.landing).toEqual({ mode: "linear", body: DEFAULT_LINEAR_BODY, author: "app", maxRefusals: 3 });
     expect(DEFAULT_LINEAR_BODY).toBe("Squashed from #{number} at {head}.\n\nLanded-by: qlander batch {batch}");
-    expect(policyHash(c)).not.toBe(OPT_IN_FREE_HASH);
-    const custom = parseConfig(withLanding('    mode: linear\n    body: "Batch {batch}\\nHead {head}"')).config;
-    expect(custom.landing!.body).toBe("Batch {batch}\nHead {head}");
+    const custom = parseConfig(withLanding('    mode: linear\n    body: "Batch {batch}\\nHead {head}"\n    author: author\n    maxRefusals: 5')).config;
+    expect(custom.landing).toEqual({ mode: "linear", body: "Batch {batch}\nHead {head}", author: "author", maxRefusals: 5 });
     expect(policyHash(custom)).not.toBe(policyHash(c));
   });
 
-  test("refuses an unknown placeholder, a control character, a body in merge mode, and an unknown mode", () => {
+  test("refuses an unknown placeholder, a control character, a linear-only key in merge mode, and unknown values", () => {
     expect(problems(withLanding('    mode: linear\n    body: "by {author}"'))).toContain("unknown placeholder {author}");
     expect(problems(withLanding('    mode: linear\n    body: "a\\tb"'))).toContain("control characters");
-    expect(problems(withLanding('    body: "x"'))).toContain("queue.landing.body is set, but queue.landing.mode is not linear");
+    for (const k of ['body: "x"', "author: app", "maxRefusals: 2"]) expect(problems(withLanding(`    ${k}`))).toContain(`queue.landing.${k.split(":")[0]} is set, but queue.landing.mode is not linear`);
     expect(problems(withLanding("    mode: rebase"))).not.toBe("");
+    expect(problems(withLanding("    mode: linear\n    author: someone"))).not.toBe("");
+    expect(problems(withLanding("    mode: linear\n    maxRefusals: 0"))).not.toBe("");
+  });
+
+  test("refuses linear with release advance enabled, dry run included, to protect the hotfix merge-back", () => {
+    for (const dry of [true, false]) {
+      const text = withLanding("    mode: linear", OPT_IN_FREE_YAML.replace(/^( {2}dryRun: ).*$/m, `$1${dry}`));
+      const why = problems(text);
+      expect(why).toContain("queue.landing.mode linear cannot be used with release advance");
+      expect(why).toContain("merge-back");
+    }
+    expect(problems(withLanding("    mode: linear"))).toBe(""); // release disabled: allowed
+    expect(problems(withLanding("    mode: merge", OPT_IN_FREE_YAML))).toBe("");
+  });
+
+  test("a future release.mode: dispatch is allowed, advance (or absent) is not", () => {
+    const y = (mode?: string) => ({ queue: { landing: { mode: "linear" } }, release: { enabled: true, ...(mode ? { mode } : {}) } });
+    expect(linearReleaseProblems(y())).toHaveLength(1);
+    expect(linearReleaseProblems(y("advance"))).toHaveLength(1);
+    expect(linearReleaseProblems(y("dispatch"))).toEqual([]);
+    expect(linearReleaseProblems({ queue: { landing: { mode: "linear" } }, release: { enabled: false } })).toEqual([]);
   });
 });
 
@@ -712,5 +741,185 @@ describe("the real client", () => {
     await expect(c.getPrBranch("feat/a..b")).rejects.toThrow("bad branch name");
     await expect(c.getPrBranch(NAMES.main)).rejects.toThrow("reserved");
     await expect(c.getPrBranch(`${NAMES.queuePrefix}3`)).rejects.toThrow("reserved");
+  });
+});
+
+describe("authorship (queue.landing.author)", () => {
+  test("app (default): the App authors and GitHub signs; the PR's author is credited by trailer; no author at all means no trailer", async () => {
+    const w = linearWorld();
+    pr(w, 1);
+    pr(w, 2).pr.user = null;
+    await w.runUntilIdle();
+    expect(w.landed()).toEqual([[1, 2]]);
+    expect(w.target.createdAuthors.size).toBe(0);
+    expect(w.target.createdMessages[0]).toEndWith(`\n\nCo-authored-by: ${WRITER.login} <${WRITER.id}+${WRITER.login}@users.noreply.github.com>`);
+    expect(w.target.createdMessages[1]).not.toContain("Co-authored-by");
+  });
+
+  test("author: the PR's author at their noreply address is the author, with no trailer; the unsigned commit is expected, so the build goes on", async () => {
+    const w = linearWorld(() => "pass", { landing: { ...LINEAR, author: "author" } });
+    pr(w, 1);
+    pr(w, 2).pr.user = null; // no account to credit: the App authors it, signed, as in app mode
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[1, 2]]);
+    const [s1, s2] = history(w).slice(0, 2).reverse();
+    expect(w.target.createdAuthors.get(s1!.sha)).toEqual({ name: WRITER.login, email: `${WRITER.id}+${WRITER.login}@users.noreply.github.com` });
+    expect(w.target.commits.get(s1!.sha)!.verified).toBe(false);
+    expect(w.target.createdAuthors.has(s2!.sha)).toBe(false);
+    expect(w.target.commits.get(s2!.sha)!.verified).toBe(true);
+    for (const m of w.target.createdMessages) expect(m).not.toContain("Co-authored-by");
+  });
+
+  test("author: an App-authored commit that is unsigned still fails the build", async () => {
+    const w = linearWorld(() => "pass", { landing: { ...LINEAR, author: "author" } });
+    pr(w, 1).pr.user = null;
+    w.target.unsignedCreated = true;
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(true);
+    expect(w.verdicts).toEqual([]);
+  });
+
+  test("linearMessage puts the trailer last, after a blank line", () => {
+    expect(linearMessage(7, sha("h"), 3, "T", "body", { login: "alice", email: "1001+alice@users.noreply.github.com" })).toBe("T (#7)\n\nbody\n\nCo-authored-by: alice <1001+alice@users.noreply.github.com>");
+  });
+});
+
+describe("force-update compatibility at admission", () => {
+  const blockAll = (bypass: string | null) => [{ id: 41, name: "no-force", covers: (b: string) => b.startsWith("feat/"), types: ["non_fast_forward"], bypass }];
+
+  test("denied: the PR waits with a comment naming the rule, keeps ready, and is queued once the rule lets the App bypass it", async () => {
+    for (const bypass of ["never", "pull_requests_only"]) {
+      const w = linearWorld();
+      pr(w, 1);
+      w.target.branchRulesets = blockAll(bypass);
+      for (let i = 0; i < 4; i++) await w.tick();
+      expect(w.state().auth["1"]).toBeUndefined();
+      const said = w.comments(1).filter((c) => c.startsWith("Labelled `ready` but not queued: this queue lands linear"));
+      expect(said).toHaveLength(1); // once per head and rule
+      expect(said[0]).toContain('non_fast_forward in ruleset "no-force" (41)');
+      expect(w.target.prs.get(1)!.pr.labels.includes(NAMES.labels.ready)).toBe(true);
+      w.target.branchRulesets = blockAll("always");
+      await w.runUntilIdle();
+      expect(w.landed()).toEqual([[1]]);
+    }
+  });
+
+  test("an admitted PR whose branch becomes denied is dropped without losing ready, and comes back once allowed", async () => {
+    const w = linearWorld();
+    w.ciTicks = 3;
+    pr(w, 1);
+    await w.untilBuilt();
+    w.target.branchRulesets = blockAll("never");
+    for (let i = 0; i < 4; i++) await w.tick();
+    expect(w.target.landings).toEqual([]);
+    expect(w.state().auth["1"]).toBeUndefined();
+    expect(w.target.prs.get(1)!.pr.labels.includes(NAMES.labels.ready)).toBe(true);
+    w.target.branchRulesets = [];
+    await w.runUntilIdle();
+    expect(w.landed()).toEqual([[1]]);
+  });
+
+  test("unknown (unreadable bypass, classic protection, a failed read) is advisory: the PR is admitted and lands", async () => {
+    const cases: ((w: World) => void)[] = [
+      (w) => (w.target.branchRulesets = blockAll(null)),
+      (w) => w.target.protectedBranches.add("feat/pr-1"),
+      (w) => (w.target.branchRulesError = new (require("../src/github/http").GitHubError)("server", 502, "Bad gateway")),
+    ];
+    for (const setup of cases) {
+      const w = linearWorld();
+      pr(w, 1);
+      setup(w);
+      const logs: string[] = [];
+      for (let i = 0; i < 40; i++) {
+        const r = await w.tick();
+        if (r !== "crashed") logs.push(...r.log);
+        if (w.landed().length > 0 && w.state().verify.length === 0) break;
+      }
+      expect(w.landed()).toEqual([[1]]);
+      expect(logs.some((l) => l.includes("whether the queue App may force-update feat/pr-1 is unknown"))).toBe(true);
+    }
+  });
+
+  test("forceUpdateOf: exempt and always pass, each ruleset is read once per snapshot", async () => {
+    const t = new FakeTarget();
+    let reads = 0;
+    t.branchRulesets = [
+      { id: 1, name: "a", covers: () => true, types: ["non_fast_forward", "update"], bypass: "exempt" },
+      { id: 2, name: "b", covers: () => true, types: ["deletion"], bypass: "never" },
+    ];
+    const read = t.rulesetBypass.bind(t);
+    t.rulesetBypass = async (id) => (reads++, read(id));
+    const cache = new Map();
+    expect(await forceUpdateOf(t, "feat/x", cache)).toEqual({ kind: "allowed" });
+    expect(await forceUpdateOf(t, "feat/y", cache)).toEqual({ kind: "allowed" });
+    expect(reads).toBe(1); // only ruleset 1 blocks a forced update, and it is cached
+  });
+});
+
+describe("a refused landing is classified, not a pause", () => {
+  test("refused with everything where the batch left it: retried next tick, and lands, without a pause", async () => {
+    const w = linearWorld();
+    for (const n of [1, 2]) pr(w, n);
+    w.target.refuseLandings = 2; // fewer than maxRefusals (3)
+    const logs: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      const r = await w.tick();
+      if (r !== "crashed") logs.push(...r.log);
+      if (w.landed().length > 0 && w.state().verify.length === 0) break;
+    }
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[1, 2]]);
+    expect(logs.filter((l) => l.startsWith("landing refused"))).toHaveLength(2);
+    expect(w.verdicts).toHaveLength(1); // retries cost no CI run
+    expect(w.target.landings).toHaveLength(1);
+  });
+
+  test("maxRefusals unexplained refusals in a row pause, keeping the journal; resuming retries it", async () => {
+    const w = linearWorld();
+    pr(w, 1);
+    w.target.refuseLandings = 3;
+    for (let i = 0; i < 20 && !w.paused(); i++) await w.tick();
+    expect(w.paused()).toBe(true);
+    const body = w.repo.issues.filter((i) => i.open).map((i) => i.body).join(" ");
+    expect(body).toContain("refused 3 times in a row");
+    expect(w.state().journal?.op).toMatchObject({ kind: "land", refused: 3 });
+    for (const i of w.repo.issues) i.open = false;
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[1]]);
+  });
+
+  test("transient errors are retried and not counted; the op's retry budget (maxOpTries) still bounds them", async () => {
+    const transient = () => new (require("../src/github/http").GitHubError)("server", 502, "Bad gateway");
+    const w = linearWorld();
+    pr(w, 1);
+    w.target.refuseLandings = 2;
+    w.target.refusal = transient;
+    await w.runUntilIdle();
+    expect(w.paused()).toBe(false);
+    expect(w.landed()).toEqual([[1]]);
+    // Past maxOpTries resends, the queue pauses: the budget is spent, not a refusal count.
+    const v = linearWorld();
+    pr(v, 1);
+    v.target.refuseLandings = 100;
+    v.target.refusal = transient;
+    for (let i = 0; i < 20 && !v.paused(); i++) await v.tick();
+    expect(v.paused()).toBe(true);
+    expect(v.repo.issues.filter((i) => i.open).map((i) => i.body).join(" ")).toContain(`re-executed ${v.config.maxOpTries} times`);
+    expect(v.target.landings).toEqual([]);
+  });
+
+  test("a resend revalidates first: a PR whose policy hash changed meanwhile is not landed", async () => {
+    const w = linearWorld();
+    pr(w, 1);
+    w.target.refuseLandings = 1;
+    const refusedOnce = () => w.stateRef.current !== null && (w.state().journal?.op as { refused?: number } | undefined)?.refused === 1;
+    for (let i = 0; i < 20 && !refusedOnce(); i++) await w.tick();
+    expect(w.state().journal?.op).toMatchObject({ kind: "land", refused: 1 });
+    w.config = { ...w.config, maxBatch: w.config.maxBatch + 1 }; // a policy change
+    await w.tick();
+    expect(w.target.landings).toEqual([]);
+    expect(w.state().journal).toBeNull();
   });
 });

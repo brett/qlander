@@ -45,7 +45,7 @@ export function noBypassRule(id: string, label: string, ref: string, rule: strin
  * (`release`, DESIGN.md §9) a person merges a green PR there, which restrict
  * updates would stop.
  */
-export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail, personMerges = false): Finding[] {
+export function branchRulesets(id: string, branch: string, app: AppIdentity | undefined, c: RulesetCtx, sev: Sev = fail, personMerges = false, integrity: string[] = ["required_signatures", "non_fast_forward", "deletion"]): Finding[] {
   const out: Finding[] = [];
   const role = app?.role ?? "queue";
   const landing = c.rulesets.filter((r) => appliesTo(r, branch, c.defaultBranch) && (personMerges || hasRule(r, "update")) && hasRule(r, "pull_request"));
@@ -61,7 +61,7 @@ export function branchRulesets(id: string, branch: string, app: AppIdentity | un
       if (others.length) out.push(aboutActors(sev(id, `${branch}: landing ruleset "${r.name}" has bypass actors other than the ${role} App and named users`, "remove them", others.map((a) => actorLabel(a, c.appNames))), app, others));
       if (hasApp && !others.length) out.push(pass(id, `${branch}: landing ruleset "${r.name}" ${does}; bypass: the ${role} App and ${bypass.filter((a) => a.actor_type === "User").length} named user(s)`));
     }
-  for (const rule of ["required_signatures", "non_fast_forward", "deletion"]) out.push(noBypassRule(id, branch, branch, rule, c, sev));
+  for (const rule of integrity) out.push(noBypassRule(id, branch, branch, rule, c, sev));
   return out;
 }
 

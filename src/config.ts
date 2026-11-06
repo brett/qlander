@@ -198,7 +198,14 @@ export interface Config {
    * its own stack commit in the same atomic update as main. Policy: in the
    * hash when present, so switching it drops every admitted PR.
    */
-  landing?: { mode: "linear"; body: string };
+  landing?: {
+    mode: "linear";
+    body: string;
+    /** Who authors a stack commit: the App (signed, PR author credited by trailer), or the PR's author (unsigned). */
+    author: "app" | "author";
+    /** Unexplained refused landings in a row before the queue pauses (DESIGN.md §7.4). */
+    maxRefusals: number;
+  };
 }
 
 /** queue.strategy: each key is present only when on. */

@@ -39,6 +39,13 @@ export type OpResult =
   | { kind: "headMoved"; prs: number[] }
   /** Linear landing (DESIGN.md §7.4): reads disagree on whether it applied. The journal stays; `overdue` also pauses. */
   | { kind: "landUnsettled"; overdue: boolean; reason: string }
+  /**
+   * Linear landing (DESIGN.md §7.4): refused with main and every PR branch
+   * reading where the batch left them. The journal stays and the next tick
+   * resends it after revalidating; `counted` (not a transient error) adds one
+   * to the op's `refused`, and maxRefusals in a row pause.
+   */
+  | { kind: "landRefused"; counted: boolean; reason: string }
   | { kind: "baseMoved" }
   | { kind: "cancelled" }
   | { kind: "retryOp" };
@@ -120,6 +127,13 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
     return withEvents(c, { state: s, log: [...c.log, line] });
   };
   if (result.kind === "retryOp") return { state: s, log: [`retry ${op.kind}`] };
+  if (result.kind === "landRefused" && op.kind === "land") {
+    const refused = (op.refused ?? 0) + (result.counted ? 1 : 0);
+    s.journal = { ...j, op: { ...op, ...(refused > 0 ? { refused } : {}) } };
+    const max = cfg.landing?.maxRefusals ?? 1;
+    if (refused >= max) pause(c, `batch ${s.active?.n ?? "?"}: the linear landing was refused ${refused} times in a row with main and every PR branch where the batch left them: ${result.reason}`);
+    return withEvents(c, { state: s, log: [...c.log, `landing refused (${refused} of ${max} in a row): ${result.reason}; retried next tick`] });
+  }
   if (result.kind === "landUnsettled" && op.kind === "land") {
     // Never terminal: the journal stays, so the next tick observes again, paused or not.
     if (result.overdue) pause(c, `batch ${s.active?.n ?? "?"}: ${result.reason}`);
@@ -336,6 +350,12 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
       return finish(`landing not applied: ${result.reason}`);
     }
     if (result.kind === "baseMoved") return finish("main moved before landing; the next tick rebuilds");
+    // Linear (DESIGN.md §7.4): resent too often (maxOpTries), or no longer valid to resend: the next decision starts afresh.
+    if (result.kind === "opAbandoned") {
+      pause(c, `batch ${a?.n ?? "?"}: ${result.reason}`);
+      return finish(`landing abandoned: ${result.reason}`);
+    }
+    if (result.kind === "opDropped") return finish(`landing not resent: ${result.reason}`);
     // Nothing moved: the next tick's revalidation sees the new head, drops that PR and rebuilds the rest (§5.3 rule 3).
     if (result.kind === "headMoved") return finish(`landing not applied: ${result.prs.map((p) => `#${p}`).join(" ")} moved since admission; the next tick drops ${result.prs.length > 1 ? "them" : "it"} and rebuilds the rest`);
   }
@@ -392,11 +412,11 @@ export interface Observation {
   heads?: Record<string, string | null>;
 }
 
-export type Recovery = OpResult | { kind: "resumeBuild"; head: string };
+export type Recovery = OpResult | { kind: "resumeBuild"; head: string } | { kind: "retryLand" };
 
 /** Recovery results that only record effects that already happened (allowed while paused). */
 export function isObservedOutcome(r: Recovery): boolean {
-  return !(r.kind === "resumeBuild" || r.kind === "retryOp");
+  return !(r.kind === "resumeBuild" || r.kind === "retryOp" || r.kind === "retryLand");
 }
 
 /**
@@ -451,7 +471,8 @@ export function interpretObservation(
     }
     case "land":
       if (o.afterReachable === true) return { kind: "landed" };
-      if (o.main === op.before) return headsVerdict(op.heads, o.heads, { since: j.at, now: timing?.now ?? new Date(0), reconcileMinutes: timing?.reconcileMinutes ?? 0 }) ?? { kind: "landRejected", retry: true, reason: "not applied" };
+      // Linear (DESIGN.md §7.4): every ref where the batch left it is resent, after revalidation, by the runner (retryLand); merge mode decides again.
+      if (o.main === op.before) return headsVerdict(op.heads, o.heads, { since: j.at, now: timing?.now ?? new Date(0), reconcileMinutes: timing?.reconcileMinutes ?? 0 }) ?? (op.heads ? { kind: "retryLand" } : { kind: "landRejected", retry: true, reason: "not applied" });
       return { kind: "baseMoved" };
     case "cancel":
       return { kind: "retryOp" };

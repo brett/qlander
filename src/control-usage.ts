@@ -9,10 +9,11 @@ export const CONTROL_USAGE = [
   "  unquiesce [--all]                              enable tick.yml, check a paused tick, resume, check a live tick",
   "  remove|requeue|prioritise <pr>                 label the PR bounce, ready or priority",
   "  approve-policy <pr> <sha>                      post the CI-policy approval for that exact head",
+  "  approve-release <sha>                          post the release approval for that exact candidate (release.mode dispatch)",
   "                                                 each also takes --dry-run and --config <file>",
   "                                                 (token: GH_TOKEN or GITHUB_TOKEN, the operator's own)",
 ].join("\n");
 
-export const CONTROL_COMMANDS = ["pause", "resume", "quiesce", "unquiesce", "remove", "requeue", "prioritise", "approve-policy"] as const;
+export const CONTROL_COMMANDS = ["pause", "resume", "quiesce", "unquiesce", "remove", "requeue", "prioritise", "approve-policy", "approve-release"] as const;
 export type ControlCommand = (typeof CONTROL_COMMANDS)[number];
 export const isControlCommand = (c: string | undefined): c is ControlCommand => CONTROL_COMMANDS.includes(c as ControlCommand);

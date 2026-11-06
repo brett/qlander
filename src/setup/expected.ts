@@ -5,6 +5,7 @@
 // name prefix; nothing is specific to one deployment.
 
 import type { LoadedConfig } from "../config/load";
+import { releaseTokenPermissions } from "../release-permissions";
 
 export type Role = "queue" | "release" | "state";
 export type Level = "read" | "write";
@@ -58,7 +59,6 @@ export function permissionDiff(have: Permissions, want: Permissions): { name: st
 }
 
 const QUEUE_TOKEN: Permissions = { contents: "write", workflows: "write", pull_requests: "write", actions: "write", checks: "read", statuses: "read" };
-const RELEASE_TOKEN: Permissions = { contents: "write", workflows: "write", actions: "read", checks: "read", statuses: "read" };
 const STATE_TOKEN: Permissions = { contents: "write" };
 
 /** The Apps a config needs: queue and state always, release when release advance is enabled. */
@@ -86,7 +86,8 @@ export function appSpecs(c: LoadedConfig, prefix: string): AppSpec[] {
   });
   return [
     spec("queue", target, QUEUE_TOKEN, "QUEUE_APP"),
-    ...(c.release.enabled ? [spec("release", target, RELEASE_TOKEN, "RELEASE_APP")] : []),
+    // release.mode dispatch adds Actions: write (and, with a freeze, Variables: read): src/release-permissions.ts.
+    ...(c.release.enabled ? [spec("release", target, releaseTokenPermissions(c.release), "RELEASE_APP")] : []),
     spec("state", control, STATE_TOKEN, "STATE_APP"),
   ];
 }

@@ -5,16 +5,23 @@
 // pending acceptance (docs/deployment.md §4.2, §5.3).
 
 import { GitHubError } from "../github/http";
+import type { ReleaseConfig } from "../release-config";
+import { releaseTokenPermissions } from "../release-permissions";
 import { type AuditGh, fail, type Finding, pass, readFailed, skipped, unread } from "./types";
 
 export type AppRole = "queue" | "release" | "state";
 
-/** Exactly these permissions, not fewer and not more (DESIGN.md §12.1). */
+/** Exactly these permissions, not fewer and not more (DESIGN.md §12.1), for release advance (release.mode advance). */
 export const EXPECTED_PERMISSIONS: Record<AppRole, Record<string, string>> = {
   queue: { contents: "write", workflows: "write", pull_requests: "write", actions: "write", checks: "read", statuses: "read", metadata: "read" },
-  release: { contents: "write", workflows: "write", actions: "read", checks: "read", statuses: "read", metadata: "read" },
+  release: { ...releaseTokenPermissions({ mode: "advance", dispatch: null }), metadata: "read" },
   state: { contents: "write", metadata: "read" },
 };
+
+/** The permissions one App must have under this release config: release.mode dispatch adds Actions: write to the release App only (and Variables: read with a freeze). */
+export function expectedPermissions(role: AppRole, release: Pick<ReleaseConfig, "mode" | "dispatch">): Record<string, string> {
+  return role === "release" ? { ...releaseTokenPermissions(release), metadata: "read" } : EXPECTED_PERMISSIONS[role];
+}
 
 export interface AppIdentity {
   role: AppRole;
@@ -64,7 +71,7 @@ export async function readApps(gh: AuditGh, slugs: { role: AppRole; slug: string
  * accepted permissions and repository selection. Which repos an
  * installation covers needs the App's own JWT, so that line is SKIPPED.
  */
-export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], id = "T11"): Promise<Finding[]> {
+export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], id = "T11", release: Pick<ReleaseConfig, "mode" | "dispatch"> = { mode: "advance", dispatch: null }): Promise<Finding[]> {
   const out: Finding[] = [];
   let installs: Installation[] | null = null;
   let installErr = "";
@@ -78,7 +85,7 @@ export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], i
     installErr = e instanceof GitHubError && e.kind === "auth" ? "the token cannot list the organization's installations (it needs org admin read)" : why(e);
   }
   for (const app of apps) {
-    const want = EXPECTED_PERMISSIONS[app.role];
+    const want = expectedPermissions(app.role, release);
     const label = `${app.role} App ${app.slug}`;
     if (app.id === null || !app.permissions) {
       const f = fail(id, `${label}: cannot read its registration (${app.error ?? "no permissions in the response"})`, `check the slug (--${app.role}-app) and that the App exists`);
@@ -88,7 +95,7 @@ export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], i
     const reg = permissionDiff(want, app.permissions);
     out.push(
       reg.length
-        ? fail(id, `${label}: registration permissions differ from DESIGN §12.1`, `set exactly these in the App's settings: ${fmt(want)}`, reg)
+        ? fail(id, `${label}: registration permissions differ from DESIGN §12.1${app.role === "release" && release.mode === "dispatch" ? " for release.mode dispatch" : ""}`, `set exactly these in the App's settings: ${fmt(want)}`, reg)
         : pass(id, `${label}: registration permissions are exactly ${fmt(want)}`),
     );
     if (!installs) {

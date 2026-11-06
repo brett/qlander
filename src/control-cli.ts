@@ -6,6 +6,7 @@
 //   bun src/cli.ts unquiesce [--all]
 //   bun src/cli.ts remove|requeue|prioritise <pr>
 //   bun src/cli.ts approve-policy <pr> <sha>
+//   bun src/cli.ts approve-release <sha>
 //
 // Each takes --dry-run (read what it would check, print every step, change
 // nothing) and --config <file>. The token is the operator's own, from
@@ -91,6 +92,7 @@ export function parseControlArgs(cmd: ControlCommand, args: string[], defaultCon
   if ((cmd === "quiesce" || cmd === "unquiesce") && p.length) throw `${cmd} takes no arguments`;
   if ((cmd === "remove" || cmd === "requeue" || cmd === "prioritise") && (p.length !== 1 || !isPr(p[0]))) throw `${cmd} needs one PR number`;
   if (cmd === "approve-policy" && (p.length !== 2 || !isPr(p[0]) || !/^[0-9a-f]{40}$/.test(p[1]!))) throw "approve-policy needs a PR number and its full 40-character head sha";
+  if (cmd === "approve-release" && (p.length !== 1 || !/^[0-9a-f]{40}$/.test(p[0]!))) throw "approve-release needs the release candidate's full 40-character sha";
   return a;
 }
 
@@ -303,6 +305,30 @@ async function approvePolicy(r: Run, me: { login: string; id: number }, n: numbe
   await r.step(`comment on #${n}: ${body}`, () => r.api.commentPr(n, body));
 }
 
+/**
+ * The release approval (DESIGN.md §8.1): the comment the release job looks
+ * for on the status issue. Refused, changing nothing, unless the dispatch
+ * mode is on, the token's account is a listed approver (login and id), and
+ * the release state's candidate is exactly this sha with a green dry run and
+ * no real run yet: the job would refuse anything else too.
+ */
+async function approveRelease(r: Run, me: { login: string; id: number }, sha: string): Promise<void> {
+  const d = r.cfg.releaseDispatch ?? r.refuse("release.mode is not dispatch, so there is no release to approve");
+  if (!d.approvers.some((h) => h.login === me.login && h.id === me.id)) r.refuse(`${me.login} is not on release.dispatch.approvers, so the release job would not count this approval`);
+  const N = r.cfg.names;
+  const rel = (await readStateDocs(r.api, N)).release;
+  if (rel.kind !== "ok") r.refuse(`${N.releaseStateBranch} could not be read (${rel.kind}${"reason" in rel ? `: ${rel.reason}` : ""}), so the candidate is unknown`);
+  const c = rel.state.dispatch?.candidate ?? null;
+  if (!c) r.refuse("the release job has no candidate now");
+  if (c.sha !== sha) r.refuse(`the candidate is ${c.sha}, not ${sha}: an approval counts for that exact sha only`);
+  if (c.real) r.refuse(`${sha} already has its real run`);
+  if (c.dry?.conclusion !== "success") r.refuse(`${sha}'s dry run is not green yet (${c.dry?.conclusion ?? (c.dry ? "in flight" : "not dispatched")})`);
+  const label = N.watchdogLabels.status;
+  const status = (await r.api.listOpenIssues(label)).issues[0] ?? r.refuse(`no open ${label} issue to post the approval on`);
+  const body = `/qlander approve-release ${sha}`;
+  await r.step(`comment on #${status.number}: ${body}`, () => r.api.comment(status.number, body));
+}
+
 /** Run one control command; resolves to the exit code (2: usage, 1: refused or failed, 0: done). */
 export async function controlCommand(cmd: ControlCommand, args: string[], io: OperatorIo, deps: ControlDeps, defaultConfig: string, resolvePath: (p: string) => string): Promise<number> {
   let a: ControlArgs;
@@ -315,7 +341,7 @@ export async function controlCommand(cmd: ControlCommand, args: string[], io: Op
   }
   const opened = openTokenAndConfig(a.config, io, deps.env, "the operator's own token");
   if (typeof opened === "number") return opened;
-  const cfg: ControlConfig = { ...opened.config, releaseWritesState: opened.release.enabled && !opened.release.dryRun };
+  const cfg: ControlConfig = { ...opened.config, releaseWritesState: opened.release.enabled && !opened.release.dryRun, releaseDispatch: opened.release.mode === "dispatch" ? opened.release.dispatch : null };
   io = opened.io;
   const redact = opened.redact;
   let api: ControlApi;
@@ -366,6 +392,9 @@ export async function controlCommand(cmd: ControlCommand, args: string[], io: Op
       }
       case "approve-policy":
         await approvePolicy(r, me, Number(p[0]), p[1]!);
+        break;
+      case "approve-release":
+        await approveRelease(r, me, p[0]!);
         break;
     }
   } catch (e) {

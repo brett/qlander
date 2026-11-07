@@ -365,7 +365,7 @@ export function evaluate(o: Observation, t: Thresholds = THRESHOLDS): Evaluation
       kind: "main-broken",
       key: `${o.mainRed.base}:${o.mainRed.held.join(",")}`,
       detail: o.mainRed.onAndOff
-        ? `main ${esc(o.mainRed.base, 40)} most likely fails on and off: two PRs each failed exactly this alone on it, though its own run with no PR in it did not: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Tested alone once more instead of bounced: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`
+        ? `main ${esc(o.mainRed.base, 40)} most likely fails on and off: two PRs each failed this alone on it, though its own run with no PR in it did not: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Tested alone once more instead of bounced: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`
         : `main ${esc(o.mainRed.base, 40)} fails with no PR in it: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Held, still admitted: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`,
     });
   }

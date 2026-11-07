@@ -186,7 +186,7 @@
               "examples": [true]
             },
             "mainBaseline": {
-              "description": "Before bouncing a PR that failed alone, run the suite on main with no PR in it. A PR whose failing tests all fail there too stays admitted, is not bounced or counted, and is retried once main moves. A PR whose failures main's run does not show, but another PR already failed them all alone on the same main, is tested alone once more instead of bounced, as main most likely fails them on and off. Nothing lands on a red suite. The watchdog alerts, and breakerBounces held PRs pause the queue. See DESIGN.md §5.7.",
+              "description": "Before bouncing a PR that failed alone, run the suite on main with no PR in it. A PR whose failing tests all fail there too stays admitted, is not bounced or counted, and is retried once main moves. When main's run is not red, a PR that fails only what another PR already failed alone on the same main is tested alone once more instead of bounced, as main most likely fails those tests on and off. Nothing lands on a red suite. The watchdog alerts, and breakerBounces held PRs pause the queue. See DESIGN.md §5.7.",
               "type": "boolean",
               "default": false,
               "examples": [true]

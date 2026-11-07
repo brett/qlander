@@ -118,7 +118,15 @@ function countGreen(s: State, a: Active, cfg: Config): void {
   s.adaptive = greens >= ad.greens ? { size: Math.min(ad.ceiling, limit * 2), greens: 0 } : { size: limit, greens };
 }
 
-export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: Date, comments: CommentSettings = { omit: [] }): Decision {
+/** How long a landed PR's closeIssues notice keeps trying (src/outbox.ts). A timing constant, not policy. */
+export const LINKED_ISSUES_GIVE_UP_HOURS = 24;
+
+/**
+ * `closeLinkedIssues` (qlander.yml `linkedIssues.close`, not policy): a
+ * landing also closes the issues each landed PR says it closes, as a merge
+ * by a person would (src/outbox.ts closeIssues).
+ */
+export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: Date, comments: CommentSettings = { omit: [] }, closeLinkedIssues = false): Decision {
   const j = prev.journal;
   if (!j) throw new Error("applyOpResult: no journal");
   const s = structuredClone(prev);
@@ -201,7 +209,7 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
         const problem = buildRecordProblem(op, rec, s.auth);
         if (problem) {
           // queue/<n> exists: handle it as a mismatch, never as a batch.
-          return applyOpResult(prev, { kind: "queueMismatch", head: result.head, reason: `build record rejected: ${problem}` }, cfg, now, comments);
+          return applyOpResult(prev, { kind: "queueMismatch", head: result.head, reason: `build record rejected: ${problem}` }, cfg, now, comments, closeLinkedIssues);
         }
         applyDrops();
         // Pipelining (DESIGN.md §5.6): a batch built on a running batch's head is stacked on it.
@@ -350,6 +358,8 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
         const waived = auth.waiver ? `\n\nLanded under a ${describeWaiver(auth.waiver)}. It ran the full pre-landing suite in a batch of its own.` : "";
         const as = moved ? `, squashed as \`${moved.after}\`, which its branch now points at` : "";
         if (!comments.omit.includes("landed")) comment(c, pr, `landed:${a.n}`, `Landed in ${cfg.names.main} at \`${op.after}\` (batch ${a.n}, pin \`${auth.head}\`${as}).${prioritised(auth)}${waived}`);
+        // Only here, once main holds the landing: a refused, restored or unsettled landing never closes anything.
+        if (closeLinkedIssues) notify(c, { id: `li:${pr}:${a.n}`, kind: "closeIssues", pr, landedIn: op.after, giveUpAt: new Date(now.getTime() + LINKED_ISSUES_GIVE_UP_HOURS * 3_600_000).toISOString() });
         delete s.auth[String(pr)];
       }
       record(c, { n: a.n, outcome: "landed", prs: a.prs, head: op.after, note: `main ${op.before} -> ${op.after}` });

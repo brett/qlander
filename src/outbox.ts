@@ -20,6 +20,11 @@
 //   retried notice never adds a line twice. Best effort: its failures never
 //   pause and never hold up the notices behind it; it is dropped at giveUpAt.
 //
+// - closeIssues: the issues a landed PR says it closes (linkedIssues.close),
+//   each commented on once and closed. An issue is recorded as sent before
+//   its comment is posted, so a retry never posts it twice. Best effort, like
+//   flaky: never a pause, dropped at giveUpAt.
+//
 // Failures are classified: absent targets are dropped, transient errors defer
 // the notice, and anything else keeps it and raises a pause keyed to it.
 // Errors that are not GitHub API errors (bugs, crashes) propagate.
@@ -100,7 +105,7 @@ export interface DrainDeps {
 
 type Outcome = "done" | "again" | "uncertain" | "giveUp";
 
-async function perform(n: Notice, d: DrainDeps, outbox: Notice[]): Promise<Outcome> {
+async function perform(n: Notice, d: DrainDeps, outbox: Notice[], log: string[]): Promise<Outcome> {
   const { target, repo } = d;
   switch (n.kind) {
     case "comment": {
@@ -184,7 +189,53 @@ async function perform(n: Notice, d: DrainDeps, outbox: Notice[]): Promise<Outco
       // Past its deadline it is dropped before anything is written.
       if (d.now.getTime() >= Date.parse(n.giveUpAt)) return "uncertain";
       return (await recordFlaky(repo, n, d, outbox)) ? "done" : "again";
+    case "closeIssues":
+      if (d.now.getTime() >= Date.parse(n.giveUpAt)) return "uncertain";
+      return (await closeLinked(target, n, d, outbox, log)) ? "done" : "again";
   }
+}
+
+/**
+ * `linkedIssues.close`: close each open issue in the target that the landed
+ * PR says it closes, after a comment naming the PR. An issue is marked `sent`
+ * (and saved) before its comment is posted, so a retry never posts it again,
+ * even when a lagging read would not show it; the close itself is idempotent.
+ * An issue already closed, by GitHub or a person, is left as it is. Each
+ * issue's receipt is saved as soon as it is finished.
+ */
+async function closeLinked(target: TargetApi, n: Extract<Notice, { kind: "closeIssues" }>, d: DrainDeps, outbox: Notice[], log: string[]): Promise<boolean> {
+  const started = (d.clock ?? Date.now)();
+  const refs = await target.closingIssues(n.pr);
+  const sent = new Set(n.sent ?? []);
+  const done = new Set(n.done ?? []);
+  const save = async () => {
+    const i = outbox.findIndex((x) => x.id === n.id);
+    outbox[i] = { ...n, ...(sent.size > 0 ? { sent: [...sent] } : {}), ...(done.size > 0 ? { done: [...done] } : {}) };
+    await d.save(outbox);
+  };
+  for (const issue of refs.items) {
+    if (done.has(issue.number)) continue;
+    // Bounded per tick (it runs before landing): what is left waits for the next tick.
+    if ((d.clock ?? Date.now)() - started > WRITE_BUDGET_MS) return false;
+    if (issue.open) {
+      try {
+        if (!sent.has(issue.number)) {
+          sent.add(issue.number);
+          await save();
+          await target.comment(issue.number, `Closed by #${n.pr}, which qlander landed in \`${d.names.main}\` at \`${n.landedIn}\`.\n\n${marker(`${n.id}:${issue.number}`)}`);
+        }
+        await target.closeIssue(issue.number);
+      } catch (e) {
+        // One issue GitHub refuses (gone, transferred, locked) is skipped; a missing permission or a transient error is the whole notice's (drain).
+        if (!(e instanceof GitHubError) || isTransient(e) || e.kind === "auth") throw e;
+      }
+    }
+    done.add(issue.number);
+    await save();
+  }
+  // Past the client's page limit: the rest can't be read, so say so instead of passing for the whole set.
+  if (refs.truncated) log.push(`closeIssues ${n.id}: #${n.pr} names more issues than could be read; closed the first ${refs.items.length}, left the rest open`);
+  return true;
 }
 
 /**
@@ -239,7 +290,7 @@ export async function drain(state: State, d: DrainDeps): Promise<Drained> {
     if (deferred && n.kind !== "pause") continue; // a pause never waits behind another notice
     const current = outbox.find((x) => x.id === n.id)!;
     try {
-      const outcome = await perform(current, d, outbox);
+      const outcome = await perform(current, d, outbox, log);
       d.afterEach?.();
       if (outcome === "done" || outcome === "uncertain") {
         outbox.splice(outbox.findIndex((x) => x.id === n.id), 1);
@@ -250,6 +301,14 @@ export async function drain(state: State, d: DrainDeps): Promise<Drained> {
       } else log.push(`again ${n.kind} ${n.id}`);
     } catch (e) {
       if (!(e instanceof GitHubError)) throw e;
+      if (n.kind === "closeIssues") {
+        // Best effort, like flaky: never a pause, never a reason to defer other notices.
+        if (d.now.getTime() >= Date.parse(n.giveUpAt) || !isTransient(e)) {
+          outbox.splice(outbox.findIndex((x) => x.id === n.id), 1);
+          log.push(`dropped closeIssues ${n.id}: ${String(e)}${e.kind === "auth" ? " (closing linked issues needs the queue App's Issues: write permission)" : ""}`);
+        } else log.push(`again closeIssues ${n.id}: ${String(e)}`);
+        continue;
+      }
       if (n.kind === "flaky") {
         // Bookkeeping only: never a pause, never a reason to defer other notices.
         if (d.now.getTime() >= Date.parse(n.giveUpAt) || !(isTransient(e) || e.kind === "auth")) {

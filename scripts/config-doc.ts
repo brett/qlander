@@ -152,7 +152,7 @@ export function renderConfigDoc(schema: S, fixture: unknown): { text: string; mi
     "Qlander reads one file: `qlander.yml`, at the root of the control repo. Start from the template's copy and change what you need. This page lists every key.",
     "",
     "- **Default** is the value used when you leave the key out. `required` means you must set it. `none` means no single default: the meaning, or the block's own section, says what leaving it out does.",
-    "- **Policy.** Most keys are in the policy hash: changing one makes every admitted PR lose `ready` at the next tick. Outside the hash: `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `hooks`, `tokens`, `bundle`, `notify`, `comments`, `runner` except its timings, and `release` except `branch`, `stateBranch` and `labels`. See [the policy hash](deployment.md#82-the-policy-hash).",
+    "- **Policy.** Most keys are in the policy hash: changing one makes every admitted PR lose `ready` at the next tick. Outside the hash: `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `hooks`, `tokens`, `bundle`, `notify`, `comments`, `linkedIssues`, `runner` except its timings, and `release` except `branch`, `stateBranch` and `labels`. See [the policy hash](deployment.md#82-the-policy-hash).",
     "- **Checking.** Run `bun \"${bundle:?}\" validate --config qlander.yml` to check a config. After any change, run `bun \"${bundle:?}\" render --config qlander.yml` and commit the workflows with it. (In the qlander source repo, `bun src/cli.ts` in place of the bundle.)",
     "",
     "## Contents",

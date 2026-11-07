@@ -23,7 +23,7 @@
 // Each job refuses to start if it can see the other App's token (DESIGN.md §12.1).
 
 import { appendFileSync, readFileSync } from "node:fs";
-import { type Config, defaultComments, defaultConfig, defaultHooks, defaultNotify, epochBranchFor, type Names } from "./config";
+import { type Config, defaultCloseLinkedIssues, defaultComments, defaultConfig, defaultHooks, defaultNotify, epochBranchFor, type Names } from "./config";
 import type { AssignOn } from "./github/http";
 import type { TargetApi, StateRefApi, StateRepoApi } from "./github/api";
 import { TargetClient } from "./github/target";
@@ -153,7 +153,7 @@ export async function runQueue(
   const executor = executorFromEnv(env);
   if (!executor) throw new Error("refusing to run live outside Actions: GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are required");
   const clients = await connect(env);
-  const result = await tick({ ...clients, cfg, hooks: defaultHooks, comments: defaultComments, now: () => new Date(), runId, executor });
+  const result = await tick({ ...clients, cfg, hooks: defaultHooks, comments: defaultComments, closeLinkedIssues: defaultCloseLinkedIssues, now: () => new Date(), runId, executor });
   await after?.(result, clients);
   return result;
 }

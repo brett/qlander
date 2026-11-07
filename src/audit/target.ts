@@ -275,7 +275,7 @@ export async function auditTarget(gh: AuditGh, cfg: LoadedConfig, apps: AppIdent
   }
   out.push(...(await guard("T9", "T9", () => t9(cfg, gh, repo))));
   out.push(...(await guard("T10", "T10", () => t10(cfg, view, wfs ?? [], rc, releaseApp, apps.filter((a) => a.role !== "release")))));
-  out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11", cfg.release, cfg.runner.epochFence))));
+  out.push(...(await guard("T11", "T11", () => appChecks(gh, N.target.owner, apps.filter((a) => a.role === "queue" || (a.role === "release" && cfg.release.enabled)), "T11", cfg.release, cfg.runner.epochFence, cfg.closeLinkedIssues))));
   out.push(...(await guard("T12", "T12", () => t12(cfg, view))));
   out.push(...(await guard("T13", "T13", () => t13(cfg, gh, repo, rc, queueApp, admin))));
   return out;

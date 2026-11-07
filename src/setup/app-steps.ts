@@ -14,6 +14,7 @@ const PERMISSION_TITLE: Record<string, string> = {
   actions: "Actions",
   checks: "Checks",
   contents: "Contents",
+  issues: "Issues",
   metadata: "Metadata",
   pull_requests: "Pull requests",
   statuses: "Commit statuses",

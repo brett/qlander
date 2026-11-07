@@ -540,7 +540,7 @@ class Tick {
           if (e instanceof CrashError || e instanceof LostLockError) throw e;
           if (op.heads) {
             // Linear: every ref where the batch left it is a refusal the next tick retries.
-            result = (await this.settle(op, j.at)) ?? { kind: "landRefused", counted: !isTransient(e), reason: String(e) };
+            result = (await this.settle(op, j.at)) ?? { kind: "landRefused", counted: isGraphqlInternal(e) || !isTransient(e), reason: String(e) };
           } else {
             // Judge by the ref, not the error text: did it move, and where to?
             const now = await c.getRef(main);

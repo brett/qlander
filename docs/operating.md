@@ -37,7 +37,7 @@ Qlander opens a `pause` issue itself when it stops for a reason that needs a per
 | `not confirmed`, `no longer exist` or `still running` | A rerun or cancellation couldn't be reconciled. | Look at the named runs. |
 | `stopped on an auth error` | Usually an App permission or an installation is missing. | Check the App's permissions and installations. |
 
-With linear landing, a landing that stops part way can leave a PR branch at its squashed commit with `main` unmoved. Qlander moves it back on the next tick and lands again. While the queue is paused it writes nothing, so the branch stays there until the pause closes, and each tick's log names it (DESIGN.md §7.4).
+With linear landing, the landing's move of each PR branch starts that PR's `pull_request` workflows on its squashed commit, about one more fast-lane run per landed PR, and nothing reads them. To skip a costly job on them, add `if: github.event.sender.login != '<queue App slug>[bot]'` to it. A landing that stops part way can leave a PR branch at its squashed commit with `main` unmoved. Qlander moves it back on the next tick and lands again. While the queue is paused it writes nothing, so the branch stays there until the pause closes, and each tick's log names it (DESIGN.md §7.4).
 
 ### A failed read counts as paused
 

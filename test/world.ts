@@ -243,6 +243,7 @@ export class World {
         repo: this.repo,
         stateRef: this.stateRef,
         cfg: this.config,
+        sleep: async () => {},
         now: () => new Date(this.now.getTime() + (o.skewMinutes ?? 0) * 60_000), // the runner's own clock
         runId: o.runId ?? `run-${++this.runs}`,
         ...(this.hooks ? { hooks: this.hooks } : {}),

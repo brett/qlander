@@ -31,11 +31,13 @@ Qlander opens a `pause` issue itself when it stops for a reason that needs a per
 | `configuration problem` | A required CI job was skipped, missing or never ran on a queue branch, often after a `ci.yml` change. | Fix the target's CI, or `queue.preLanding` in `qlander.yml`. |
 | `main is red` | The single PR under test failed only jobs that also fail on `main`. | Fix `main` first. |
 | `not signed and verified` | A merge commit (or, in linear mode, a stack commit) the App made isn't verified, so `main` would reject it. | Check the App and the signing rules. |
-| `while main still reads at its base` | Linear mode: for `queue.timeouts.reconcileMinutes`, PR branches have read at their stack commits while `main` has not moved, which GitHub's atomic update should never do. The landing's journal is kept. | Check `main`: if it is at the batch's head, the next tick records the landing. If not, restore each named branch to the head the issue gives, then close the issue. |
+| `could not settle its PR branches` | Linear mode: for `queue.timeouts.reconcileMinutes`, the landing did not complete and qlander's write moving its PR branches back has been refused. The landing's journal is kept. | Check `main`: if it is at the batch's head, the next tick records the landing. If not, find why the write was refused, usually a new rule on a PR branch or on `main`, then close the issue. Qlander moves the branches back itself and resends. |
 | `window budget` | The queue used `queue.budget.window` CI runs within `queue.budget.windowHours` hours. | Check `main` and CI: usually one is broken for queue branches. |
 | `bounces in a row` | `queue.batch.breakerBounces` PRs bounced in a row without a landing. | Check `main` and CI: usually one is broken for queue branches. |
 | `not confirmed`, `no longer exist` or `still running` | A rerun or cancellation couldn't be reconciled. | Look at the named runs. |
 | `stopped on an auth error` | Usually an App permission or an installation is missing. | Check the App's permissions and installations. |
+
+With linear landing, the landing's move of each PR branch starts that PR's `pull_request` workflows on its squashed commit, about one more fast-lane run per landed PR, and nothing reads them. To skip a costly job on them, add `if: github.event.sender.login != '<queue App slug>[bot]'` to it. A landing that stops part way can leave a PR branch at its squashed commit with `main` unmoved. Qlander moves it back on the next tick and lands again. While the queue is paused it writes nothing, so the branch stays there until the pause closes, and each tick's log names it (DESIGN.md §7.4).
 
 ### A failed read counts as paused
 
@@ -370,7 +372,8 @@ Qlander comments on a PR when something happens to it, and GitHub notifies every
 These comments are always posted, and most ask someone to act:
 
 - a bounce;
-- "Not queued": a conflict, or a PR that does not qualify;
+- "Not queued": a conflict, a PR that does not qualify, or, with linear landing, a PR carrying commits that already landed squashed. That last one must be rebased onto `main`, keeping only its own commits; the comment gives the command;
+- With linear landing, a PR GitHub closed without the merged mark says its change is on `main` anyway;
 - a removal from the queue: the head moved, the retry budget was used, or an operator bounced it;
 - a PR kept in the queue because every failure is also main's (`queue.strategy.mainBaseline`);
 - a landed revision with later commits that are not in `main`;

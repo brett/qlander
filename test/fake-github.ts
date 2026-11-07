@@ -3,7 +3,7 @@
 // and data-file allowlists), and keeps a call log. The Sim and the snapshot
 // tests use it; step 4's runner tests will too.
 
-import { type Account, type TargetApi, type Commit, type Compare, type RefActivity, type RefUpdate, type LabelEvent, type Listed, type MergeResult, type PullRequest, RELEASE_REPORT_MARKER, type Review, type StateIssue, type StateRefApi, type StateRepoApi, type Status, type StatusEntry } from "../src/github/api";
+import { type Account, type BranchAt, type TargetApi, type Commit, type Compare, type RefActivity, type RefUpdate, type LabelEvent, type Listed, type MergeResult, type PullRequest, RELEASE_REPORT_MARKER, type Review, type StateIssue, type StateRefApi, type StateRepoApi, type Status, type StatusEntry } from "../src/github/api";
 import { GitHubError } from "../src/github/http";
 import type { CheckRun, IssueComment, Job, Run } from "../src/types";
 import type { Names } from "../src/config";
@@ -148,13 +148,22 @@ export class FakeTarget implements TargetApi {
   createdMessages: string[] = [];
   /** createCommit makes commits GitHub does not sign. */
   unsignedCreated = false;
-  /**
-   * landStack as a GitHub that broke its atomicity promise (DESIGN.md §7.4):
-   * the PR branches move, and then the whole call is rejected with main unmoved.
-   */
-  partialLanding = false;
   /** The next this-many landStack calls are refused whole, with nothing moved (a refusal GitHub does not explain). */
   refuseLandings = 0;
+  /** The next this-many moveBranches calls are refused whole. */
+  refuseBranchMoves = 0;
+  /**
+   * GitHub processes a PR branch's move in the background: a PR's read shows
+   * its old head for this many reads after a move, and a main push that
+   * overtakes it closes the PR without the merged mark, as measured live.
+   */
+  headProcessingReads = 0;
+  private unprocessed = new Map<number, { before: string; reads: number }>();
+  /** GitHub catches up with every branch move. */
+  processAll(): void {
+    this.headProcessingReads = 0;
+    this.unprocessed.clear();
+  }
   refusal: () => Error = () => new GitHubError("validation", 422, "Reference update failed");
 
   private setContent(s: string, c: Set<string>): void {
@@ -323,6 +332,11 @@ export class FakeTarget implements TargetApi {
   async getPr(n: number) {
     this.log(`getPr ${n}`);
     const out = structuredClone(this.pr(n).pr);
+    const late = this.unprocessed.get(n);
+    if (late) {
+      out.head.sha = late.before;
+      if (--late.reads <= 0) this.unprocessed.delete(n);
+    }
     const calls = (this.getPrCalls.get(n) ?? 0) + 1;
     this.getPrCalls.set(n, calls);
     this.afterGetPr?.(n, calls);
@@ -583,44 +597,65 @@ export class FakeTarget implements TargetApi {
     return s;
   }
 
-  /** Every landStack call GitHub accepted: main and the PR branches it moved. */
-  landings: { main: RefUpdate; heads: RefUpdate[] }[] = [];
+  /** Every landStack call GitHub accepted: main, and the PR branches it guarded. */
+  landings: { main: RefUpdate; pinned: BranchAt[] }[] = [];
+  /** Every moveBranches call GitHub accepted, forward or restoring. */
+  branchMoves: { guard: BranchAt; moves: RefUpdate[] }[] = [];
 
-  async landStack(main: RefUpdate, heads: RefUpdate[], epoch: string | null): Promise<void> {
-    // The client-side guards (as TargetClient.landStack).
-    if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
-    if (main.branch !== this.names.main || heads.length === 0) throw new GitHubError("validation", null, "bad landStack");
-    const all = [main, ...heads];
-    if (all.some((u) => !isRealSha(u.before) || !isRealSha(u.after) || u.before === u.after)) throw new GitHubError("validation", null, "bad oids");
-    if (heads.some((h) => !isGitBranchName(h.branch) || isForbiddenHeadRef(this.names, h.branch) || h.branch === this.epochBranch)) throw new GitHubError("validation", null, "reserved branch");
-    if (new Set(all.map((u) => u.branch)).size !== all.length) throw new GitHubError("validation", null, "a branch twice");
+  private epochCheck(epoch: string | null): void {
     if ((epoch === null) !== (this.epochBranch === null)) throw new GitHubError("validation", null, "epoch mismatch");
-    this.log(`landStack ${main.before} -> ${main.after} with ${heads.map((h) => h.branch).join(",")}`);
-    // GitHub, atomically: every entry checked before any moves. A forced entry still needs its beforeOid.
-    const check = () => {
-      if (epoch !== null && this.refs.get(this.epochBranch!) !== epoch) throw new GitHubError("conflict", 200, "beforeOid does not match");
-      this.refCheck(main.branch, main.before, main.after);
-      for (const h of heads) {
-        const f = this.prOnBranch(h.branch);
-        if (!f || f.pr.head.sha !== h.before) throw new GitHubError("conflict", 200, "beforeOid does not match");
-        if (!this.commits.has(h.after)) throw new GitHubError("validation", 200, "Object does not exist");
-      }
-    };
-    const moveHeads = () => {
-      for (const h of heads) this.prOnBranch(h.branch)!.pr.head.sha = h.after;
-    };
+    if (epoch !== null && this.refs.get(this.epochBranch!) !== epoch) throw new GitHubError("conflict", 200, "beforeOid does not match");
+  }
+
+  private prBranchCheck(branches: string[]): void {
+    if (branches.some((b) => !isGitBranchName(b) || isForbiddenHeadRef(this.names, b) || b === this.epochBranch)) throw new GitHubError("validation", null, "reserved branch");
+    if (new Set(branches).size !== branches.length) throw new GitHubError("validation", null, "a branch twice");
+  }
+
+  async moveBranches(guard: BranchAt, moves: RefUpdate[], epoch: string | null): Promise<void> {
+    if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
+    if (guard.branch !== this.names.main) throw new GitHubError("validation", null, "bad moveBranches");
+    this.prBranchCheck(moves.map((m) => m.branch));
+    this.log(`moveBranches at ${guard.at} with ${moves.map((m) => m.branch).join(",")}`);
+    if (this.refuseBranchMoves > 0) {
+      this.refuseBranchMoves--;
+      throw this.refusal();
+    }
+    // GitHub, atomically: every entry checked on the write path before any moves. A forced entry still needs its beforeOid.
+    this.epochCheck(epoch);
+    if (this.refs.get(guard.branch) !== guard.at) throw new GitHubError("conflict", 200, "beforeOid does not match");
+    for (const m of moves) {
+      const f = this.prOnBranch(m.branch);
+      if (!f || f.pr.head.sha !== m.before) throw new GitHubError("conflict", 200, "beforeOid does not match");
+      if (!this.commits.has(m.after)) throw new GitHubError("validation", 200, "Object does not exist");
+    }
+    for (const m of moves) {
+      const f = this.prOnBranch(m.branch)!;
+      f.pr.head.sha = m.after;
+      if (this.headProcessingReads > 0 && m.before !== m.after) this.unprocessed.set(f.pr.number, { before: m.before, reads: this.headProcessingReads });
+    }
+    this.branchMoves.push({ guard, moves });
+  }
+
+  async landStack(main: RefUpdate, pinned: BranchAt[], epoch: string | null): Promise<void> {
+    if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
+    if (main.branch !== this.names.main || pinned.length === 0) throw new GitHubError("validation", null, "bad landStack");
+    if (!isRealSha(main.before) || !isRealSha(main.after) || main.before === main.after) throw new GitHubError("validation", null, "bad oids");
+    this.prBranchCheck(pinned.map((b) => b.branch));
+    this.log(`landStack ${main.before} -> ${main.after} with ${pinned.map((b) => b.branch).join(",")}`);
     if (this.refuseLandings > 0) {
       this.refuseLandings--;
       throw this.refusal();
     }
-    if (this.partialLanding) {
-      moveHeads();
-      throw new GitHubError("server", 502, "Bad gateway");
+    this.epochCheck(epoch);
+    this.refCheck(main.branch, main.before, main.after);
+    for (const b of pinned) {
+      if (this.prOnBranch(b.branch)?.pr.head.sha !== b.at) throw new GitHubError("conflict", 200, "beforeOid does not match");
     }
-    check();
-    moveHeads();
-    this.githubUpdateRefs(main.branch, main.before, main.after); // merge detection sees the moved heads
-    this.landings.push({ main, heads });
+    for (const n of this.unprocessed.keys()) Object.assign(this.pr(n).pr, { state: "closed", merged: false });
+    this.unprocessed.clear();
+    this.githubUpdateRefs(main.branch, main.before, main.after); // merge detection sees the branches the earlier call moved
+    this.landings.push({ main, pinned });
   }
 
   async rerunFailedJobs(id: number) {

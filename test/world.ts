@@ -45,6 +45,8 @@ export class World {
   hooks: Hook[] | undefined;
   /** PR comments left out (qlander.yml `comments`); every comment is posted by default. */
   commentSettings: CommentSettings | undefined;
+  /** qlander.yml `linkedIssues.close`; off by default. */
+  closeLinkedIssues = false;
   /**
    * How many ticks a queue CI run (or rerun) takes to finish: 0 (default)
    * finishes it as soon as it starts. With more, the run stays in progress
@@ -248,6 +250,7 @@ export class World {
         runId: o.runId ?? `run-${++this.runs}`,
         ...(this.hooks ? { hooks: this.hooks } : {}),
         ...(this.commentSettings ? { comments: this.commentSettings } : {}),
+        ...(this.closeLinkedIssues ? { closeLinkedIssues: true } : {}),
         ...(o.executor ? { executor: o.executor } : {}),
         crash: (p) => {
           if (o.crashWhen?.(p)) throw new CrashError(p);

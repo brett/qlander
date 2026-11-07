@@ -94,7 +94,7 @@ Setup creates the release App, and the `release-write` environment in step 2, on
 
 | App | Repository permissions |
 | --- | --- |
-| queue App | Contents: write, Workflows: write, Pull requests: write, Actions: write, Checks: read, Commit statuses: read, Metadata: read |
+| queue App | Contents: write, Workflows: write, Pull requests: write, Actions: write, Checks: read, Commit statuses: read, Metadata: read, plus Issues: write with [`linkedIssues.close`](how-it-works.md#closing-linked-issues) on (the template turns it on) |
 | release App | Contents: write, Workflows: write, Actions: read, Checks: read, Commit statuses: read, Metadata: read. With [`release.mode: dispatch`](how-it-works.md#dispatch-mode-opt-in), least privilege instead: Actions: write, Contents: read (write only with the epoch fence), no Workflows, Checks: read, Commit statuses: read, Metadata: read, plus Variables: read if `release.dispatch.freeze` is set. |
 | state App | Contents: write, Metadata: read |
 
@@ -111,7 +111,15 @@ GitHub behaviour to expect:
 - A permission added to an existing App takes effect only once the org accepts it on each installation. Until then, new tokens don't have it.
 - A ruleset can name an App as a bypass actor only once the App is installed on that repo. Install first, then edit the ruleset.
 - A commit made through the contents API with a user token is unsigned (`verified: false`). It can't land on a branch that requires signatures.
-- The queue App has no Issues permission, so the issues list endpoint (`/issues?labels=`) returns 403 for it. Qlander finds labelled PRs through `/pulls` instead. The per-PR issue endpoints for comments, labels and events work with the Pull requests permission.
+- Without Issues permission, the queue App gets a 403 from the issues list endpoint (`/issues?labels=`), so qlander finds labelled PRs through `/pulls` instead. The per-PR issue endpoints for comments, labels and events work with the Pull requests permission. Closing an issue, and commenting on one, needs Issues: write, which the queue App has only with `linkedIssues.close` on.
+
+To turn on `linkedIssues.close` in an existing deployment, add the permission first, because the tick's token request fails if it asks for a permission the App doesn't have:
+
+1. Set `linkedIssues.close: true` in your local copy of `qlander.yml`, and run `setup --step permissions --plan`, then `--apply`. It shows where to set **Issues** to **Read and write** on the queue App and waits until the org accepts the change on the installation.
+2. Run `render`, then commit `qlander.yml` and the rendered `tick.yml` together, through the control repo's usual review.
+3. Run `audit`. T11 should pass with Issues: write on the queue App.
+
+To turn it off, commit the config change and the rendered workflow first, then remove the permission.
 
 To check the installed permissions, where `<org>` is the owner the Apps are installed in:
 

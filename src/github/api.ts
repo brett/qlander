@@ -249,8 +249,17 @@ export interface TargetApi {
   landStack(main: RefUpdate, pinned: BranchAt[], epoch: string | null): Promise<void>;
   rerunFailedJobs(runId: number): Promise<void>;
   cancelRun(runId: number): Promise<void>;
-  /** Post a comment; returns its id (the delivery receipt). */
+  /** Post a comment on a PR or an issue; returns its id (the delivery receipt). */
   comment(n: number, body: string): Promise<number>;
+  /**
+   * The issues in this repository a PR says it closes, as GitHub resolves
+   * them (GraphQL `closingIssuesReferences`: closing keywords in the body and
+   * issues linked by hand). Issues in other repositories are left out.
+   * truncated: more were named than were read. Needs Issues: read.
+   */
+  closingIssues(pr: number): Promise<Listed<{ number: number; open: boolean }>>;
+  /** Close an issue as completed (src/outbox.ts closeIssues). Needs Issues: write. Queue only. */
+  closeIssue(n: number): Promise<void>;
   removeLabel(n: number, label: string): Promise<void>;
   /** A repository_dispatch event on this repo (lifecycle hooks, src/hooks.ts). Needs Contents: write. */
   dispatch(eventType: string, clientPayload: object): Promise<void>;
@@ -282,6 +291,7 @@ export type TargetWriteMethod =
   | "rerunFailedJobs"
   | "cancelRun"
   | "comment"
+  | "closeIssue"
   | "removeLabel"
   | "dispatch"
   | "dispatchWorkflow";

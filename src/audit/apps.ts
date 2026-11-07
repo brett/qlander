@@ -18,9 +18,15 @@ export const EXPECTED_PERMISSIONS: Record<AppRole, Record<string, string>> = {
   state: { contents: "write", metadata: "read" },
 };
 
-/** The permissions one App must have under this config: in release.mode dispatch the release App's set is src/release-permissions.ts's least-privilege one. */
-export function expectedPermissions(role: AppRole, release: Pick<ReleaseConfig, "mode" | "dispatch">, epochFence = false): Record<string, string> {
-  return role === "release" ? { ...releaseTokenPermissions(release, epochFence), metadata: "read" } : EXPECTED_PERMISSIONS[role];
+/**
+ * The permissions one App must have under this config: in release.mode
+ * dispatch the release App's set is src/release-permissions.ts's
+ * least-privilege one, and with `linkedIssues.close` the queue App also has
+ * Issues: write.
+ */
+export function expectedPermissions(role: AppRole, release: Pick<ReleaseConfig, "mode" | "dispatch">, epochFence = false, closeLinkedIssues = false): Record<string, string> {
+  if (role === "release") return { ...releaseTokenPermissions(release, epochFence), metadata: "read" };
+  return role === "queue" && closeLinkedIssues ? { ...EXPECTED_PERMISSIONS.queue, issues: "write" } : EXPECTED_PERMISSIONS[role];
 }
 
 export interface AppIdentity {
@@ -71,7 +77,7 @@ export async function readApps(gh: AuditGh, slugs: { role: AppRole; slug: string
  * accepted permissions and repository selection. Which repos an
  * installation covers needs the App's own JWT, so that line is SKIPPED.
  */
-export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], id = "T11", release: Pick<ReleaseConfig, "mode" | "dispatch"> = { mode: "advance", dispatch: null }, epochFence = false): Promise<Finding[]> {
+export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], id = "T11", release: Pick<ReleaseConfig, "mode" | "dispatch"> = { mode: "advance", dispatch: null }, epochFence = false, closeLinkedIssues = false): Promise<Finding[]> {
   const out: Finding[] = [];
   let installs: Installation[] | null = null;
   let installErr = "";
@@ -85,7 +91,7 @@ export async function appChecks(gh: AuditGh, org: string, apps: AppIdentity[], i
     installErr = e instanceof GitHubError && e.kind === "auth" ? "the token cannot list the organization's installations (it needs org admin read)" : why(e);
   }
   for (const app of apps) {
-    const want = expectedPermissions(app.role, release, epochFence);
+    const want = expectedPermissions(app.role, release, epochFence, closeLinkedIssues);
     const label = `${app.role} App ${app.slug}`;
     if (app.id === null || !app.permissions) {
       const f = fail(id, `${label}: cannot read its registration (${app.error ?? "no permissions in the response"})`, `check the slug (--${app.role}-app) and that the App exists`);

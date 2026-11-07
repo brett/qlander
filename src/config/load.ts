@@ -96,6 +96,13 @@ export interface LoadedConfig {
   /** Who is assigned the issues that say the queue has stopped (`notify`); kept out of Config like comments. */
   notify: { assignees: string[] };
   /**
+   * Whether a landing closes the issues each landed PR says it closes
+   * (`linkedIssues.close`, default false). Kept out of Config like comments:
+   * it decides nothing about what lands. The queue App needs Issues: write
+   * while it is on (src/setup/expected.ts, src/render.ts, src/audit/apps.ts).
+   */
+  closeLinkedIssues: boolean;
+  /**
    * The tick jobs' runner labels (`runner.runsOn`), rendered into tick.yml
    * (src/render.ts); null when absent. Wiring, not policy, like tokens.
    */
@@ -257,6 +264,7 @@ interface ConfigYaml {
   tokens?: Partial<Tokens>;
   comments?: { omit?: OptionalComment[] };
   notify?: { assignees?: string[] };
+  linkedIssues?: { close?: boolean };
   bundle?: { repo: string; private?: boolean; watchdog?: boolean };
 }
 
@@ -787,7 +795,8 @@ export function parseConfig(text: string, source = "qlander.yml"): LoadedConfig 
   if (meaning.length) throw new ConfigError(source, meaning);
   const comments: CommentSettings = { omit: [...new Set(y.comments?.omit ?? [])] };
   const notify = { assignees: [...new Set(y.notify?.assignees ?? [])] };
-  return { config, release, hooks, tokens, runner, runsOn, comments, notify, bundle, controlMain };
+  const closeLinkedIssues = y.linkedIssues?.close ?? false;
+  return { config, release, hooks, tokens, runner, runsOn, comments, notify, closeLinkedIssues, bundle, controlMain };
 }
 
 /** Read and check a config file. Throws ConfigError, including when the file cannot be read. */

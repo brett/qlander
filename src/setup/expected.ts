@@ -85,7 +85,8 @@ export function appSpecs(c: LoadedConfig, prefix: string): AppSpec[] {
     secret,
   });
   return [
-    spec("queue", target, QUEUE_TOKEN, "QUEUE_APP"),
+    // linkedIssues.close: closing an issue, and commenting on one, needs Issues: write (src/outbox.ts closeIssues).
+    spec("queue", target, c.closeLinkedIssues ? { ...QUEUE_TOKEN, issues: "write" } : QUEUE_TOKEN, "QUEUE_APP"),
     // release.mode dispatch: least privilege, src/release-permissions.ts.
     ...(c.release.enabled ? [spec("release", target, releaseTokenPermissions(c.release, c.runner.epochFence), "RELEASE_APP")] : []),
     spec("state", control, STATE_TOKEN, "STATE_APP"),

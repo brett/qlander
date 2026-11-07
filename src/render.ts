@@ -34,7 +34,8 @@ const CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 const APP_TOKEN = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0";
 
 /** What the renderer reads from the config: names, the runner contract, the token variables and whether release advance runs. */
-export type RenderInput = Pick<LoadedConfig, "runner" | "tokens" | "runsOn" | "bundle"> & { config: { names: Names }; release: { enabled: boolean } & Partial<Pick<ReleaseConfig, "mode" | "dispatch">> };
+export type RenderInput = Pick<LoadedConfig, "runner" | "tokens" | "runsOn" | "bundle"> &
+  Partial<Pick<LoadedConfig, "closeLinkedIssues">> & { config: { names: Names }; release: { enabled: boolean } & Partial<Pick<ReleaseConfig, "mode" | "dispatch">> };
 
 export class RenderError extends Error {
   constructor(message: string) {
@@ -304,6 +305,8 @@ export function renderTick(c: RenderInput): string {
       ["actions", "write"],
       ["checks", "read"],
       ["statuses", "read"],
+      // linkedIssues.close (src/outbox.ts closeIssues).
+      ...(c.closeLinkedIssues ? [["issues", "write"] as [string, string]] : []),
     ]),
     "",
     ...stateTokenStep(n),

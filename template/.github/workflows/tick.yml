@@ -74,6 +74,7 @@ jobs:
           permission-actions: write
           permission-checks: read
           permission-statuses: read
+          permission-issues: write
 
       - name: Mint the state App token (your-repo-qlander contents only)
         id: state

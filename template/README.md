@@ -47,7 +47,7 @@ bun "${bundle:?}" version
 
 ### 2. Configure and render
 
-Edit `qlander.yml`: this repo and the target (names and ids), the target's fast-lane check and full-suite jobs, and the policy approvers. The template uses GitHub-hosted runners with the epoch fence (`runner.mode: hosted`). For the self-hosted mode, see [Provide the runners](https://github.com/brett/qlander/blob/main/docs/getting-started.md#6-provide-the-runners).
+Edit `qlander.yml`: this repo and the target (names and ids), the target's fast-lane check and full-suite jobs, and the policy approvers. The template uses GitHub-hosted runners with the epoch fence (`runner.mode: hosted`), and turns on `linkedIssues.close`, so the queue App also gets Issues: write; set it to `false` to leave issues alone. For the self-hosted mode, see [Provide the runners](https://github.com/brett/qlander/blob/main/docs/getting-started.md#6-provide-the-runners).
 
 ```sh
 bun "${bundle:?}" validate --config qlander.yml

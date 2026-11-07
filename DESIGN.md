@@ -362,7 +362,7 @@ With `queue.concurrency` set, up to `maxActive` batches' CI runs at once (defaul
   - **Why nothing is hidden.** Landing still needs a green suite on the batch. A wrong match, such as a flaky test on main that a PR really breaks, or a match by job name, only delays the PR: it is tested again once main has moved, on a suite with nothing left to match, and then lands or bounces on its own.
   - **Staying loud.** The watchdog opens a `main is broken` alert while any PR is held, from the state mirror, and closes it when that ends. Holding `breakerBounces` PRs on one main pauses the queue, naming the failing tests. A pause ends the hold, so closing it is a real retry. A PR that fixes main is not held, because its suite is green. It lands without anyone resuming anything, and the held PRs then build as usual.
   - **Releases.** The run is on main's own commit, so a qualification manifest that accepts queue branches as evidence counts it, and a red baseline unqualifies that commit.
-  - **Staging.** `baseline` and `aloneRed` are written only with the key on. Run a release with this reader live first, then add the key: an older release refuses the state field, and refuses the config key too.
+  - **Staging.** `baseline` and `aloneRed` are written only with the key on. Run a release with this reader live first, then add the key: an older release refuses the state field, and one before 0.2.0 refuses the config key too. Releases 0.2.0 to 0.2.4 know the key but refuse `aloneRed`: before going back to one, turn the key off and let one unpaused tick drop it.
 
 ## 6. Pre-landing manifest and CI classification
 
@@ -674,7 +674,7 @@ The queue and state Apps always exist; the release App exists only when `release
 
 | App | Permissions | Ruleset bypass |
 | --- | --- | --- |
-| queue App | Contents: write · Workflows: write · Pull requests: write · Actions: write · Checks: read · Commit statuses: read · Metadata: read, plus Issues: write with `linkedIssues.close` (§7.4), on the **target only** | the target's main-landing and queue-refs rulesets |
+| queue App | Contents: write · Workflows: write · Pull requests: write · Actions: write · Checks: read · Commit statuses: read · Metadata: read, plus Issues: write with `linkedIssues.close` (docs/how-it-works.md, "Closing linked issues"), on the **target only** | the target's main-landing and queue-refs rulesets |
 | release App, advance mode | Contents: write · Workflows: write · Actions: read · Checks: read · Commit statuses: read · Metadata: read, on the **target only** | the target's release-landing ruleset only |
 | release App, dispatch mode (§8.1) | Contents: read (write only with the epoch fence) · Actions: write · Checks: read · Commit statuses: read · Metadata: read, plus Variables: read with a freeze, on the **target only** | none on release (only `release.dispatch.promoterApps` and named users bypass it); its epoch branch's ruleset only, with the fence |
 | state App | Contents: write · Metadata: read, on the **control repo only** | the state branches' ruleset only |

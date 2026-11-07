@@ -280,7 +280,7 @@ export class TargetClient implements TargetApi {
   async listOpenPrNumbersWithLabel(label: string): Promise<number[]> {
     if (!this.removable(label)) bad(`unexpected label ${label}`);
     // Through /pulls, not /issues?labels=: the queue App has Pull requests but
-    // no Issues permission, and the issues endpoint 403s without it.
+    // Issues permission only with linkedIssues.close, and the issues endpoint 403s without it.
     const { items, truncated } = await this.http.paginate(`${this.path}/pulls`, { state: "open" }, (p) => p as { number: number; labels: { name: string }[] }[]);
     // A PR past the last page read would be missed silently: refuse a partial list (the tick pauses and says why).
     if (truncated) bad(`the open PR list stopped at ${this.http.maxPages} pages (${items.length} PRs), so PRs labelled ${label} may be missing`);

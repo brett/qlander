@@ -39,7 +39,7 @@ Treat every config change as a policy change. Most keys are in the [policy hash]
 1. Edit the file, run `qlander validate` and `qlander render`, and put both in one PR. This repo's CI runs `render --check`.
 2. A person reviews it, and merges it while nothing is admitted. Check just before the merge, because PRs can be admitted during review: in a `qlander status --json` that exits 0, `queueState.kind` is `ok` (or `absent`, before the first live tick), `active` is null and `concurrent`, `pending`, `solo` and `queued` are empty.
 
-A key the pinned release doesn't know makes every tick fail, so upgrade before you add one.
+A key the pinned release doesn't know makes every tick fail, so upgrade before you add one. Turning on `linkedIssues.close` also needs a person to give the queue App Issues: write first, or every tick fails to mint its token ([the order](https://github.com/brett/qlander/blob/main/docs/getting-started.md#1-create-the-github-apps)).
 
 ## Upgrades
 

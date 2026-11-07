@@ -26,6 +26,7 @@ import { World } from "./world";
 const ON: Partial<Config> = { strategy: { mainBaseline: true } };
 const BROKEN = "tests/unit/test_main.py::test_broken_on_main";
 const OWN = "tests/unit/test_pr.py::test_broken_by_the_pr";
+const OWN_TOO = "tests/unit/test_pr.py::test_broken_by_another_pr";
 const log = (tests: string[]) => tests.map((t) => `FAILED ${t} - boom`).join("\n");
 
 interface Setup {
@@ -292,7 +293,7 @@ describe("a failure of the PR's own is never hidden", () => {
   });
 
   test("main is fine: bounced as ever, and a green run is not reused for the next PR", async () => {
-    const w = world({ main: () => [], pr: { 1: [OWN], 2: [OWN] } });
+    const w = world({ main: () => [], pr: { 1: [OWN], 2: [OWN_TOO] } });
     w.readyPr(1);
     await ticks(w, 10);
     expect(bouncedComments(w, 1)).toHaveLength(1);
@@ -483,5 +484,148 @@ describe("crashes, pauses and held batches", () => {
     const o: Observation = { now, workflowState: "active", runs: [], jobsComplete: true, unfinishedComplete: true, pause: [], releasePause: [], releaseBlocked: [], pausesComplete: true, pauseLabels: { queue: "pause", release: "release-pause" } };
     expect(evaluate({ ...o, mainRed: "unreadable" }, THRESHOLDS).unknown.map((u) => u.kind)).toContain("main-broken");
     expect(readWatchdogConfig(CONFIG_PATH)).toMatchObject({ ok: true, mainBaseline: false });
+  });
+});
+
+describe("a test that fails on and off on main", () => {
+  /**
+   * Main's own run always passes. Each PR fails `fails[pr]` (default BROKEN)
+   * on the first `first[pr]` batches it is in, on every attempt, and passes
+   * after that: a failure that comes and goes, as main's own run never shows.
+   */
+  function onAndOff(o: { first: Record<number, number>; fails?: Record<number, string[]>; over?: Partial<Config> }) {
+    const failing = new Map<number, string[]>();
+    const builds = new Map<number, number>();
+    const counted = new Set<number>();
+    const w: World = new World(
+      (b) => {
+        const isBaseline = w.stateRef.current ? parseState(w.stateRef.current.text, w.config.names).baseline?.n === b.n : false;
+        if (!isBaseline && !counted.has(b.n)) {
+          counted.add(b.n);
+          for (const pr of b.prs) builds.set(pr, (builds.get(pr) ?? 0) + 1);
+        }
+        const tests = isBaseline ? [] : b.prs.flatMap((pr) => ((builds.get(pr) ?? 0) <= (o.first[pr] ?? 0) ? (o.fails?.[pr] ?? [BROKEN]) : []));
+        failing.set(b.n, tests);
+        return tests.length > 0 ? "fail" : "pass";
+      },
+      { ...ON, ...o.over },
+    );
+    w.failLog = (n) => log(failing.get(n) ?? []);
+    return w;
+  }
+  const retried = (w: World, pr: number) => (w.target.prs.get(pr)?.comments ?? []).filter((c) => c.body.includes("is tested alone once more")).map((c) => c.body);
+
+  test("the second PR to fail it alone is tested again instead of bounced, and lands", async () => {
+    const w = onAndOff({ first: { 1: 1, 2: 1 } });
+    w.readyPr(1);
+    await ticks(w, 10);
+    expect(bouncedComments(w, 1)).toHaveLength(1);
+    expect(w.state().aloneRed?.seen.map((e) => e.pr)).toEqual([1]);
+    w.readyPr(2);
+    await w.runUntilIdle(60);
+    expect(bouncedComments(w, 2)).toEqual([]);
+    const told = retried(w, 2);
+    expect(told).toHaveLength(1);
+    expect(told[0]).toContain("#1");
+    expect(told[0]).toContain(BROKEN);
+    expect(told[0]).not.toContain("@");
+    expect(w.landed().flat()).toEqual([2]);
+    expect(w.paused()).toBe(false);
+    expect(w.state().bounceStreak).toBe(0); // the landing reset it; the retry never counted
+    expect(w.state().aloneRed).toBeUndefined(); // main moved
+    neverLandedOnRed(w);
+  });
+
+  test("three PRs in a row each fail it alone: the second is retried and lands, and the bounces never reach the pause", async () => {
+    const w = onAndOff({ first: { 1: 1, 2: 1, 3: 1 } });
+    for (const n of [1, 2, 3]) {
+      w.readyPr(n);
+      await ticks(w, 24);
+    }
+    expect(bouncedComments(w, 1)).toHaveLength(1);
+    expect(retried(w, 2)).toHaveLength(1);
+    expect(bouncedComments(w, 2)).toEqual([]);
+    expect(w.landed().flat()).toEqual([2]);
+    // Main moved when #2 landed: #3 is the first to fail it on the new main, so it bounces, as #1 did.
+    expect(bouncedComments(w, 3)).toHaveLength(1);
+    expect(w.pauseReasons()).toEqual([]);
+    expect(w.state().bounceStreak).toBe(1);
+    neverLandedOnRed(w);
+  });
+
+  test("a PR that really breaks the same test is retried once, then bounced and counted, and the breaker still pauses", async () => {
+    const w = onAndOff({ first: { 1: 99, 2: 99, 3: 99 } });
+    for (const n of [1, 2, 3]) {
+      w.readyPr(n);
+      await ticks(w, 24);
+    }
+    expect(bouncedComments(w, 1)).toHaveLength(1);
+    for (const n of [2, 3]) {
+      expect(retried(w, n)).toHaveLength(1);
+      expect(bouncedComments(w, n)).toHaveLength(1);
+    }
+    expect(retried(w, 1)).toEqual([]);
+    expect(w.pauseReasons().join()).toContain("3 bounces in a row");
+    // #2's marker went when #3 was retried, since #2 had left the queue; #3's stays, but the watchdog skips it, as #3 left too.
+    expect(w.state().aloneRed?.retried.map((r) => [r.pr, r.failing])).toEqual([[3, [BROKEN]]]);
+    expect(mainRedFrom(`Mirror.\n\n${renderState(w.state())}`)).toBeNull();
+    expect(w.landed()).toEqual([]);
+  });
+
+  test("a different failure is the PR's own: bounced with no retry", async () => {
+    const w = onAndOff({ first: { 1: 99, 2: 99 }, fails: { 1: [OWN], 2: [OWN_TOO] } });
+    w.readyPr(1);
+    await ticks(w, 10);
+    w.readyPr(2);
+    await ticks(w, 10);
+    expect(retried(w, 2)).toEqual([]);
+    expect(bouncedComments(w, 2)).toHaveLength(1);
+    expect(w.state().bounceStreak).toBe(2);
+  });
+
+  test("off: nothing is remembered and nothing is retried", async () => {
+    const w = onAndOff({ first: { 1: 99, 2: 99 }, over: { strategy: {} } });
+    w.readyPr(1);
+    await ticks(w, 10);
+    w.readyPr(2);
+    await ticks(w, 10);
+    expect(retried(w, 2)).toEqual([]);
+    expect(bouncedComments(w, 2)).toHaveLength(1);
+    expect(w.state().aloneRed).toBeUndefined();
+  });
+
+  test("the watchdog says main most likely fails on and off, from the state mirror", () => {
+    const base = sha("main");
+    const result = { red: true, jobs: ["unit"], tests: [BROKEN], byJob: [] };
+    const state = (retried: number[]): State =>
+      ({ ...emptyState(), auth: { "2": { head: sha("h2") } as unknown as State["auth"][string] }, aloneRed: { base, seen: [{ pr: 1, n: 3, result }, { pr: 2, n: 6, result: { ...result, tests: ["later::only_this_pr"] } }], retried: retried.map((pr) => ({ pr, head: sha(`h${pr}`), other: 1, failing: [BROKEN] })) } }) as State;
+    const body = (s: State) => `Mirror.\n\n${renderState(s)}`;
+    expect(mainRedFrom(body(state([])))).toBeNull();
+    const seen = mainRedFrom(body(state([2])));
+    // What the retry was for, not what #2 failed later on its own.
+    expect(seen).toEqual({ base, failing: [BROKEN], held: [2], onAndOff: true });
+    expect(summariseQueueState(body(state([2]))).join("\n")).toContain("tested alone again 1");
+    const now = new Date("2026-10-21T12:00:00Z");
+    const o: Observation = { now, workflowState: "active", runs: [], jobsComplete: true, unfinishedComplete: true, pause: [], releasePause: [], releaseBlocked: [], pausesComplete: true, pauseLabels: { queue: "pause", release: "release-pause" } };
+    const alert = evaluate({ ...o, mainRed: seen }, THRESHOLDS).alerts.find((a) => a.kind === "main-broken");
+    expect(alert?.detail).toContain("on and off");
+    expect(alert?.detail).toContain("test\\_broken\\_on\\_main"); // markdown-escaped
+    expect(alert?.detail).toContain("PR 2");
+  });
+
+  test("state round-trips through the strict reader, and refuses a malformed record", () => {
+    const base = sha("main");
+    const result = { red: true, jobs: ["unit"], tests: [BROKEN], byJob: [] };
+    const retry = { pr: 2, head: sha("h2"), other: 1, failing: [BROKEN] };
+    const ok = { ...emptyState(), aloneRed: { base, seen: [{ pr: 1, n: 3, result }], retried: [retry] } };
+    expect(parseState(JSON.stringify(ok), NAMES).aloneRed?.retried).toEqual([retry]);
+    const bad = (aloneRed: unknown) => () => parseState(JSON.stringify({ ...ok, aloneRed }), NAMES);
+    expect(bad({ ...ok.aloneRed, seen: [] })).toThrow();
+    expect(bad({ ...ok.aloneRed, seen: [ok.aloneRed.seen[0], ok.aloneRed.seen[0]] })).toThrow();
+    expect(bad({ ...ok.aloneRed, seen: [{ pr: 1, n: 3, result: { ...result, red: false } }] })).toThrow();
+    expect(bad({ ...ok.aloneRed, retried: [retry, { ...retry, head: sha("h3") }] })).toThrow();
+    expect(bad({ ...ok.aloneRed, retried: [{ pr: 2, head: sha("h2") }] })).toThrow();
+    expect(bad({ ...ok.aloneRed, retried: Array.from({ length: 9 }, (_, i) => ({ ...retry, pr: i + 2 })) })).toThrow();
+    expect(bad({ base, seen: ok.aloneRed.seen })).toThrow();
   });
 });

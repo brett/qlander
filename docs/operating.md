@@ -332,7 +332,7 @@ Each alert issue says what is wrong, whether PRs are still landing, and what to 
 | `ticks failing` | The last 3 completed queue-tick jobs all failed. A timeout counts. The issue links the newest failed run. | Open the linked run. A failure at a token step usually means an App key or installation problem. A failure in the tick step is in qlander or GitHub. |
 | `runner not picking up ticks` | A tick run or job has waited more than 20 minutes for a runner. A ghost run, queued with no jobs at all, is ignored once a newer tick has finished. Disabling and re-enabling `tick.yml` can leave one. | A tick is stuck waiting. Other ticks may still be running, so this doesn't by itself mean every pool is down. Check the runners and the controllers on their hosts. Read [Restarting a runner host's controller](#restarting-a-runner-hosts-controller) before you restart one. |
 | `paused` | A `pause` or `release-pause` issue has been open for more than 2 hours. The issue shows the oldest one's title. | Read the pause issue and fix its cause (see [Pause and resume](#pause-and-resume)). Then close it. |
-| `main is broken` | With `queue.strategy.mainBaseline` on: PRs are held because `main` fails the same tests with no PR in it. | Land a PR that fixes `main`. It isn't held, and the held PRs are then tested again. |
+| `main is broken` | With `queue.strategy.mainBaseline` on: PRs are held because `main` fails the same tests with no PR in it. Or `main` most likely fails tests on and off: two PRs each failed exactly the same tests alone on it, though its own run did not, and the later one is being tested alone once more instead of bounced. | Land a PR that fixes `main`. It isn't held, and the held PRs are then tested again. For tests that fail on and off, fix or quarantine them; the alert clears once `main` moves. |
 | `tick workflow disabled` | `tick.yml` is disabled, by hand or by GitHub. | If it was disabled on purpose, for a controller restart, finish that procedure. Otherwise run `gh workflow enable tick.yml -R "$R"`. |
 | `config invalid` | `qlander.yml` does not load. Ticks fail until it is fixed. | Open the linked run for the exact error, fix `qlander.yml` on `main`, and merge the fix. |
 
@@ -375,7 +375,7 @@ These comments are always posted, and most ask someone to act:
 - "Not queued": a conflict, a PR that does not qualify, or, with linear landing, a PR carrying commits that already landed squashed. That last one must be rebased onto `main`, keeping only its own commits; the comment gives the command;
 - With linear landing, a PR GitHub closed without the merged mark says its change is on `main` anyway;
 - a removal from the queue: the head moved, the retry budget was used, or an operator bounced it;
-- a PR kept in the queue because every failure is also main's (`queue.strategy.mainBaseline`);
+- a PR kept in the queue because every failure is also main's, or tested alone once more because another PR failed exactly the same alone on `main` (`queue.strategy.mainBaseline`);
 - a landed revision with later commits that are not in `main`;
 - a PR that GitHub has not marked merged;
 - the notice that a batch was stopped for a prioritised PR;

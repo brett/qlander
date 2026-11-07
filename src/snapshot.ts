@@ -377,7 +377,8 @@ export async function buildSnapshot(i: SnapshotInput): Promise<Snapshot> {
   const b = i.cfg.strategy?.mainBaseline ? i.state.baseline : undefined;
   const baselineCi = b && !b.result && !i.paused ? await batchCi(i, l, baselineBatch(b)) : undefined;
   const baselineTests = baselineCi?.kind === "red" ? await failingTests(i.api, baselineCi.failedJobs, BASELINE_LOGS) : undefined;
-  const redJobs = b?.result?.red || baselineCi?.kind === "red"
+  // Once main's own run is in, red or not: a red PR is compared with it, or with what other PRs failed alone (aloneRed), or remembered for that.
+  const redJobs = b?.result || (baselineCi && baselineCi.kind !== "pending")
     ? actives(i.state).flatMap((a) => {
         const k = cis?.[String(a.n)] ?? (a.n === i.state.active?.n ? ci : null);
         return k?.kind === "red" ? k.failedJobs : [];

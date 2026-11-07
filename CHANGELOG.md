@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `queue.strategy.mainBaseline`: a test that fails on and off on `main` no longer bounces PR after PR. Main's own run can pass on such a test, and until now a PR that failed alone then bounced and counted towards `breakerBounces`. Now, when a PR fails alone (after its rerun) on a `main` whose own run is not red, and another PR already failed exactly the same alone on that `main`, it is not bounced or counted: it gets a comment naming the other PR and the tests, and is tested alone once more. If it fails again it bounces as before. The first PR on each `main` still bounces. The watchdog's `main is broken` alert also opens for this, saying `main` most likely fails those tests on and off. A retry costs at most the PR's run and rerun and one more run of `main`, from the usual budgets. CI-policy PRs, stacked batches and a `main` that moved are judged as before. The key stays opt-in and off by default, and there is no new config key. With the key on, the queue state can hold a new `aloneRed` field, which older releases refuse: to go back to an older release, turn the key off and let one unpaused tick run first (that drops the field). The policy hash is unchanged.
+
 ## 0.2.4
 
 A cleaner merge commit subject, and two opt-in modes. A repo that uses neither mode sees only the new subject and the `render` change below: state stays v5 and reads and writes back unchanged, and the policy hash of an existing config is the same, so no admitted PR loses its place. The new state fields appear only when a new mode is on.

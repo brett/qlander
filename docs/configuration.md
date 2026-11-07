@@ -292,7 +292,7 @@ How a red batch is isolated and how big fresh batches grow. Absent: every key is
 | `queue.strategy.firstAlone` | boolean | `false` | Split a red fresh batch into its first PR and the rest, instead of halves. The oldest PR then gets a run of its own next. |
 | `queue.strategy.skipSeenRed` | boolean | `false` | Split a group of PRs at once, without a run, when its tree was already seen red on the current main. A single PR is always built. |
 | `queue.strategy.reuseGreen` | boolean | `false` | Remember a batch abandoned as the queue paused. On resume, land it without a rebuild if main has not moved and its run is now green. |
-| `queue.strategy.mainBaseline` | boolean | `false` | Before bouncing a PR that failed alone, run the suite on main with no PR in it. A PR whose failing tests all fail there too stays admitted, is not bounced or counted, and is retried once main moves. Nothing lands on a red suite. The watchdog alerts, and breakerBounces held PRs pause the queue. See DESIGN.md §5.7. |
+| `queue.strategy.mainBaseline` | boolean | `false` | Before bouncing a PR that failed alone, run the suite on main with no PR in it. A PR whose failing tests all fail there too stays admitted, is not bounced or counted, and is retried once main moves. A PR whose failures main's run does not show, but another PR already failed exactly alone on the same main, is tested alone once more instead of bounced, as main most likely fails them on and off. Nothing lands on a red suite. The watchdog alerts, and breakerBounces held PRs pause the queue. See DESIGN.md §5.7. |
 | `queue.strategy.adaptive` | mapping | none | Adapt the fresh batch size limit. See [queue.strategy.adaptive](#queuestrategyadaptive). |
 
 ```yaml

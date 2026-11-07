@@ -66,7 +66,7 @@ export interface Observation {
   /** The two pause labels, as qlander.yml names them (queue.controlLabels.pause, release.labels.pause), for the alert text. */
   pauseLabels: { queue: string; release: string };
   /** What the queue found about main (queue.strategy.mainBaseline), from the state mirror. Absent or null: nothing. */
-  mainRed?: { base: string; failing: string[]; held: number[] } | "unreadable" | null;
+  mainRed?: { base: string; failing: string[]; held: number[]; onAndOff?: true } | "unreadable" | null;
 }
 
 export type AlertKind = "ticks-stopped" | "ticks-failing" | "runner-stuck" | "paused" | "main-broken" | "workflow-disabled" | "config-invalid";
@@ -108,7 +108,7 @@ export const ALERT_HELP: Record<AlertKind, { meaning: string; impact: string; ac
     action: "Read the pause issue, fix what it describes, then close it to resume.",
   },
   "main-broken": {
-    meaning: "The target's main fails the suite with no PR in it. PRs that fail only the same tests stay admitted, and are not bounced, while they wait for main to move.",
+    meaning: "The target's main fails the suite with no PR in it. PRs that fail only the same tests stay admitted, and are not bounced, while they wait for main to move. Or two PRs each failed exactly the same tests alone on main, which main's own run did not show: main most likely fails them on and off, and the later PR is tested alone once more instead of bounced.",
     impact: "Yes, for every PR except one that fixes main. Such a PR still lands, and the held PRs are then tested again.",
     action: "Fix main: land a PR that makes the failing tests pass. If enough PRs are held, the queue also pauses, and the pause issue says so.",
   },
@@ -364,7 +364,9 @@ export function evaluate(o: Observation, t: Thresholds = THRESHOLDS): Evaluation
     alerts.push({
       kind: "main-broken",
       key: `${o.mainRed.base}:${o.mainRed.held.join(",")}`,
-      detail: `main ${esc(o.mainRed.base, 40)} fails with no PR in it: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Held, still admitted: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`,
+      detail: o.mainRed.onAndOff
+        ? `main ${esc(o.mainRed.base, 40)} most likely fails on and off: two PRs each failed exactly this alone on it, though its own run with no PR in it did not: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Tested alone once more instead of bounced: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`
+        : `main ${esc(o.mainRed.base, 40)} fails with no PR in it: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Held, still admitted: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`,
     });
   }
   for (const i of o.releaseBlocked) warnings.push({ detail: `release blocked: ${esc(i.title)} (issue ${i.number})`, ...link(i.url) });

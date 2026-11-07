@@ -37,8 +37,8 @@ export type OpResult =
   | { kind: "landRejected"; retry: boolean; reason: string }
   /** Linear landing (DESIGN.md §7.4): refused because these PRs' branches moved since admission; settled, nothing of ours is left on them. */
   | { kind: "headMoved"; prs: number[] }
-  /** Linear landing (DESIGN.md §7.4): the write that settles the branches was refused, so nothing is proved. The journal stays; `overdue` also pauses. */
-  | { kind: "landUnsettled"; overdue: boolean; reason: string }
+  /** Linear landing (DESIGN.md §7.4): the write that settles the branches was refused, or a PR's read still lags, so the journal stays; `overdue` also pauses. `refusal`: the landing was refused and the write proved it, only the read lags, so it counts as landRefused does. */
+  | { kind: "landUnsettled"; overdue: boolean; reason: string; refusal?: { counted: boolean; reason: string } }
   /** Linear landing (DESIGN.md §7.4): main at its base and every branch back at its admitted head, on the write path. The journal stays; the next tick resends. */
   | { kind: "landRestored" }
   /**
@@ -142,7 +142,11 @@ export function applyOpResult(prev: State, result: OpResult, cfg: Config, now: D
   }
   if (result.kind === "landUnsettled" && op.kind === "land") {
     // Never terminal: the journal stays, so the next tick observes again, paused or not.
+    const refused = (op.refused ?? 0) + (result.refusal?.counted ? 1 : 0);
+    if (refused > 0) s.journal = { ...j, op: { ...op, refused } };
+    const max = cfg.landing?.maxRefusals ?? 1;
     if (result.overdue) pause(c, `batch ${s.active?.n ?? "?"}: ${result.reason}`);
+    else if (result.refusal?.counted && refused >= max) pause(c, `batch ${s.active?.n ?? "?"}: the linear landing was refused ${refused} times in a row: ${result.refusal.reason}`);
     return withEvents(c, { state: s, log: [...c.log, `landing unsettled: ${result.reason}`] });
   }
   if (result.kind === "landRestored" && op.kind === "land") return { state: s, log: ["landing: PR branches back at their admitted heads; resent next tick"] };

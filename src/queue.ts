@@ -387,12 +387,13 @@ class Tick {
     await this.perform(snap);
   }
 
-  private unsettled(op: Extract<Op, { kind: "land" }>, since: string, why: string): OpResult {
+  private unsettled(op: Extract<Op, { kind: "land" }>, since: string, why: string, refusal?: { counted: boolean; reason: string }): OpResult {
     const heads = op.heads ?? [];
     return {
       kind: "landUnsettled",
       overdue: this.d.now().getTime() - Date.parse(since) >= this.d.cfg.reconcileMinutes * 60_000,
       reason: `the linear landing could not settle its PR branches (${why}). Qlander retries each tick; each should read at its admitted head: ${heads.map((h) => `${h.ref} (#${h.pr}) ${h.before}`).join(", ")}, and ${heads.map((h) => h.after).join(", ")} are its stack commits. The journal is kept, so a landing that did apply is still recorded`,
+      ...(refusal ? { refusal } : {}),
     };
   }
 
@@ -406,7 +407,7 @@ class Tick {
    * Returns null when main is at its base and every branch back at its admitted
    * head; a pushed branch is guarded, never moved.
    */
-  private async settle(op: Extract<Op, { kind: "land" }>, since: string): Promise<OpResult | null> {
+  private async settle(op: Extract<Op, { kind: "land" }>, since: string, refusal?: { counted: boolean; reason: string }): Promise<OpResult | null> {
     const c = this.d.target;
     const name = this.d.cfg.names.main;
     const main = await c.getRef(name);
@@ -438,9 +439,9 @@ class Tick {
       return unsettled(String(e));
     }
     // The next decision reads PRs, not branches: none may still read at its stack commit, or it would pass for an author's push. Until then the journal stays.
-    if (!(await this.waitForPrs(heads.filter((h) => now.get(h.pr) !== null), (h, sha) => sha !== h.after, LAND_SETTLE_WAIT_MS))) return unsettled("a PR still reads at its stack commit");
-    if (main !== op.before) return { kind: "baseMoved" };
     const pushed = heads.filter((h) => now.get(h.pr) !== h.before && now.get(h.pr) !== h.after).map((h) => h.pr);
+    if (!(await this.waitForPrs(heads.filter((h) => now.get(h.pr) !== null), (h, sha) => sha !== h.after, LAND_SETTLE_WAIT_MS))) return this.unsettled(op, since, "a PR still reads at its stack commit", main === op.before && pushed.length === 0 ? refusal : undefined);
+    if (main !== op.before) return { kind: "baseMoved" };
     return pushed.length > 0 ? { kind: "headMoved", prs: pushed } : null;
   }
 
@@ -540,7 +541,8 @@ class Tick {
           if (e instanceof CrashError || e instanceof LostLockError) throw e;
           if (op.heads) {
             // Linear: every ref where the batch left it is a refusal the next tick retries.
-            result = (await this.settle(op, j.at)) ?? { kind: "landRefused", counted: isGraphqlInternal(e) || !isTransient(e), reason: String(e) };
+            const refusal = { counted: isGraphqlInternal(e) || !isTransient(e), reason: String(e) };
+            result = (await this.settle(op, j.at, refusal)) ?? { kind: "landRefused", ...refusal };
           } else {
             // Judge by the ref, not the error text: did it move, and where to?
             const now = await c.getRef(main);

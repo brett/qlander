@@ -173,6 +173,21 @@ describe("between the writes", () => {
     expect(w.target.prs.get(1)!.pr.merged).toBe(true);
   });
 
+  test("main refused, the branches go back, but a PR's read stays stale: the refusal still counts", async () => {
+    const w = new World(() => "pass", { landing: { ...LINEAR, maxRefusals: 1 } });
+    w.readyPr(1);
+    w.target.refuseLandings = 1;
+    const land = w.target.landStack.bind(w.target);
+    w.target.landStack = async (...args) => {
+      w.target.headProcessingReads = 1000;
+      return land(...args);
+    };
+    for (let i = 0; i < 15 && w.target.branchMoves.length < 2; i++) await w.tick();
+    expect((w.state().journal?.op as { refused?: number }).refused).toBe(1);
+    expect(w.paused()).toBe(true);
+    expect(w.landed()).toEqual([]);
+  });
+
   test("a crash between them: restored on the next tick, resent only after revalidating, and it lands", async () => {
     const w = linearWorld();
     const before = pr(w, 1).pr.head.sha;

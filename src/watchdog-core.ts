@@ -108,9 +108,9 @@ export const ALERT_HELP: Record<AlertKind, { meaning: string; impact: string; ac
     action: "Read the pause issue, fix what it describes, then close it to resume.",
   },
   "main-broken": {
-    meaning: "The target's main fails the suite with no PR in it. PRs that fail only the same tests stay admitted, and are not bounced, while they wait for main to move. Or two PRs each failed exactly the same tests alone on main, which main's own run did not show: main most likely fails them on and off, and the later PR is tested alone once more instead of bounced.",
-    impact: "Yes, for every PR except one that fixes main. Such a PR still lands, and the held PRs are then tested again.",
-    action: "Fix main: land a PR that makes the failing tests pass. If enough PRs are held, the queue also pauses, and the pause issue says so.",
+    meaning: "The target's main fails the suite with no PR in it. PRs that fail only the same tests stay admitted, and are not bounced, while they wait for main to move. Or two PRs each failed the same tests alone on main, which main's own run did not show: main most likely fails them on and off, and the later PR is tested alone once more instead of bounced.",
+    impact: "Yes, for every PR except one that fixes main. Such a PR still lands, and the held PRs are then tested again. When main fails on and off, PRs that pass still land, and the retested PR bounces if it fails again.",
+    action: "Fix main: land a PR that makes the failing tests pass, or fix or quarantine the tests that fail on and off. If enough PRs are held, the queue also pauses, and the pause issue says so.",
   },
   "workflow-disabled": {
     meaning: "The landing queue's workflow (tick.yml) is switched off, so it cannot run.",
@@ -365,7 +365,7 @@ export function evaluate(o: Observation, t: Thresholds = THRESHOLDS): Evaluation
       kind: "main-broken",
       key: `${o.mainRed.base}:${o.mainRed.held.join(",")}`,
       detail: o.mainRed.onAndOff
-        ? `main ${esc(o.mainRed.base, 40)} most likely fails on and off: two PRs each failed exactly this alone on it, though its own run with no PR in it did not: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Tested alone once more instead of bounced: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`
+        ? `main ${esc(o.mainRed.base, 40)} most likely fails on and off: two PRs each failed this alone on it, though its own run with no PR in it did not: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Tested alone once more instead of bounced: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`
         : `main ${esc(o.mainRed.base, 40)} fails with no PR in it: ${esc(o.mainRed.failing.slice(0, 5).join(", "), 600)}. Held, still admitted: ${o.mainRed.held.map((p) => `PR ${p}`).join(", ")}`,
     });
   }

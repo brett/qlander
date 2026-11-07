@@ -232,7 +232,7 @@ export interface Strategy {
   /**
    * Before a PR is bounced, run the suite on main alone (state.baseline). A PR
    * that fails only what main fails stays admitted, and is not bounced or counted.
-   * One that fails exactly what another PR failed alone on the same main, which
+   * One that fails only what another PR failed alone on the same main, which
    * main's own run did not show, is tested alone once more (state.aloneRed).
    */
   mainBaseline?: true;

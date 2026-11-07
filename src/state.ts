@@ -343,7 +343,7 @@ export const ALONE_RED_MAX = 8;
  * queue.strategy.mainBaseline (DESIGN.md §5.7), on main `base`: what each PR
  * failed alone (after its rerun) while main's own run with no PR in it was
  * not red, and the pins tested alone a second time because another PR failed
- * exactly the same. A pin is retried once.
+ * the same tests. A pin is retried once.
  */
 export interface AloneRed {
   base: string;

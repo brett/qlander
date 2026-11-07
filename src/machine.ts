@@ -821,7 +821,7 @@ function rememberAlone(c: Ctx, a: Active, pr: number, failedJobs: FailedJob[]): 
 
 /**
  * Main's own run did not show this PR's failures, but a failure that comes and
- * goes can pass once. If another PR already failed exactly these alone on this
+ * goes can pass once. If another PR already failed all of these alone on this
  * main (each after its rerun), the two most likely share main's failure, not
  * one of their own: this PR is tested alone once more instead of bounced, and
  * is not counted. A pin is retried once; failing again bounces it as ever.
@@ -848,7 +848,7 @@ function retryAlone(c: Ctx, a: Active, pr: number, failedJobs: FailedJob[]): boo
     c,
     pr,
     `alone-retry:${a.n}`,
-    `Still in the landing queue, and not bounced: batch ${a.n} (this PR alone, at \`${head}\`, on top of ${names} \`${a.base}\`) failed, and failed again on a rerun, on ${what}. #${other.pr} failed exactly that alone on the same ${names}, and ${names}'s own run with no PR in it did not, so ${names} most likely fails it on and off. This PR is tested alone once more, and is bounced only if it fails again.`,
+    `Still in the landing queue, and not bounced: batch ${a.n} (this PR alone, at \`${head}\`, on top of ${names} \`${a.base}\`) failed, and failed again on a rerun, on ${what}. #${other.pr} also failed that alone on the same ${names}, and ${names}'s own run with no PR in it did not, so ${names} most likely fails it on and off. This PR is tested alone once more, and is bounced only if it fails again.`,
   );
   record(c, { n: a.n, outcome: "solo", prs: a.prs, head: a.head, note: `${names} most likely fails ${what} on and off: #${other.pr} failed the same alone on it; tested alone once more`, failedJobs });
   requeueSolo(c, [{ pr, lineage: a.lineage, reason: "split" }]);

@@ -88,7 +88,7 @@ export function mainRedFrom(body: string): { base: string; failing: string[]; he
   const r = obj(b?.result);
   const held = prsOf(b?.held);
   if (r?.red === true && held.length > 0) return { base: str(b!.base, 40), failing: failing(r), held };
-  // PRs tested alone again because another PR failed exactly the same alone on this main, which its own run did not show.
+  // PRs tested alone again because another PR already failed the same tests alone on this main, which its own run did not show.
   // Only while the retried PR is still admitted at that head: one that failed again and bounced no longer says main fails it on and off.
   const a = obj(s.aloneRed);
   const auth = obj(s.auth);

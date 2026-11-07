@@ -78,16 +78,26 @@ export function flakySummary(flakes: unknown, now: Date): string {
 export const WINDOW_WARN_SHARE = 0.75;
 
 /** What the mirror says about main (queue.strategy.mainBaseline): null when nothing. */
-export function mainRedFrom(body: string): { base: string; failing: string[]; held: number[] } | "unreadable" | null {
+export function mainRedFrom(body: string): { base: string; failing: string[]; held: number[]; onAndOff?: true } | "unreadable" | null {
   const s = mirrorJson(body);
   if (!s) return "unreadable";
+  const prsOf = (x: unknown) => (Array.isArray(x) ? x.flatMap((h) => (Number.isSafeInteger(obj(h)?.pr) ? [obj(h)!.pr as number] : [])) : []);
+  const list = (x: unknown) => (Array.isArray(x) ? x.filter((v): v is string => typeof v === "string") : []);
+  const failing = (r: Obj | null) => (list(r?.tests).length > 0 ? list(r?.tests) : list(r?.jobs));
   const b = obj(s.baseline);
   const r = obj(b?.result);
-  const held = Array.isArray(b?.held) ? b.held.flatMap((h) => (Number.isSafeInteger(obj(h)?.pr) ? [obj(h)!.pr as number] : [])) : [];
-  if (r?.red !== true || held.length === 0) return null;
-  const list = (x: unknown) => (Array.isArray(x) ? x.filter((v): v is string => typeof v === "string") : []);
-  const tests = list(r.tests);
-  return { base: str(b!.base, 40), failing: tests.length > 0 ? tests : list(r.jobs), held };
+  const held = prsOf(b?.held);
+  if (r?.red === true && held.length > 0) return { base: str(b!.base, 40), failing: failing(r), held };
+  // PRs tested alone again because another PR failed exactly the same alone on this main, which its own run did not show.
+  // Only while the retried PR is still admitted at that head: one that failed again and bounced no longer says main fails it on and off.
+  const a = obj(s.aloneRed);
+  const auth = obj(s.auth);
+  const live = (Array.isArray(a?.retried) ? a.retried.map(obj) : []).filter((e) => typeof e?.head === "string" && obj(auth?.[String(e.pr)])?.head === e.head);
+  const retried = prsOf(live);
+  if (retried.length === 0) return null;
+  // The failures each retry was for, as recorded then: not what its PR failed later.
+  const tests = [...new Set(live.flatMap((e) => list(e?.failing)))];
+  return { base: str(a!.base, 40), failing: tests, held: retried, onAndOff: true };
 }
 
 export function summariseQueueState(body: string, budget?: { window: number; windowHours: number; now: Date }): string[] {
@@ -102,6 +112,8 @@ export function summariseQueueState(body: string, budget?: { window: number; win
   if (s.journal !== null && s.journal !== undefined) out.push(`journal: ${str(obj(obj(s.journal)?.op)?.kind, 30)}`);
   const b = obj(s.baseline);
   if (b) out.push(`main with no PR in it: batch ${int(b.n)} at ${str(b.base, 40)} is ${obj(b.result)?.red === true ? "red" : "running"} · held PRs ${count(b.held)}`);
+  const alone = obj(s.aloneRed);
+  if (alone) out.push(`failed alone on ${str(alone.base, 40)} while main's own run did not: PRs ${count(alone.seen)} · tested alone again ${count(alone.retried)}`);
   out.push(`last landed ${when(s.lastLandedAt)} · red streak ${int(s.redStreak)} · bounce streak ${int(s.bounceStreak)}`);
   if (budget !== undefined) out.push(flakySummary(s.flakes, budget.now));
   if (budget !== undefined && Array.isArray(s.window)) {

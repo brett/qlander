@@ -324,6 +324,8 @@ export interface State {
   adaptive?: { size: number; greens: number };
   /** queue.strategy.mainBaseline: a run of the suite on main alone, and the PRs set aside because they fail only what it fails. */
   baseline?: Baseline;
+  /** queue.strategy.mainBaseline: PRs that failed alone on this main while main's own run did not, and those given a second test for it (DESIGN.md §5.7). */
+  aloneRed?: AloneRed;
 }
 
 /** What a run of main alone showed. `byJob`: jobs that can match by name only (src/baseline.ts). */
@@ -332,6 +334,31 @@ export interface BaselineResult {
   jobs: string[];
   tests: string[];
   byJob: string[];
+}
+
+/** The most PRs remembered in each list of aloneRed: the newest. */
+export const ALONE_RED_MAX = 8;
+
+/**
+ * queue.strategy.mainBaseline (DESIGN.md §5.7), on main `base`: what each PR
+ * failed alone (after its rerun) while main's own run with no PR in it was
+ * not red, and the pins tested alone a second time because another PR failed
+ * exactly the same. A pin is retried once.
+ */
+export interface AloneRed {
+  base: string;
+  seen: { pr: number; n: number; result: BaselineResult }[];
+  /** Each retried pin, with the other PR and the failures the two shared, as they were when it was retried. */
+  retried: AloneRetry[];
+}
+
+export interface AloneRetry {
+  pr: number;
+  head: string;
+  /** The PR that failed the same alone first. */
+  other: number;
+  /** The shared failures: test ids, or job names where none compare. */
+  failing: string[];
 }
 
 /** queue.strategy.mainBaseline (DESIGN.md §5.7): queue/<n> at main's own commit `base`, with no PR in it. */
@@ -800,12 +827,38 @@ function checkStrategyState(s: O): void {
     iso(o.builtAt, "baseline.builtAt");
     if (arr(o.held, "baseline.held").length > 0) distinctPins(o.held, "baseline.held", 1);
     if ("stopped" in o && o.stopped !== true) fail("baseline.stopped: must be true when present");
-    if (o.result !== undefined) {
-      const r = obj(o.result, "baseline.result", ["red", "jobs", "tests", "byJob"]);
-      if (typeof r.red !== "boolean") fail("baseline.result.red: not a boolean");
-      for (const k of ["jobs", "tests", "byJob"]) arr(r[k], `baseline.result.${k}`).forEach((x, i) => str(x, `baseline.result.${k}[${i}]`));
-    }
+    if (o.result !== undefined) baselineResultOk(o.result, "baseline.result");
   }
+  if (s.aloneRed !== undefined) {
+    const o = obj(s.aloneRed, "aloneRed", ["base", "seen", "retried"]);
+    sha(o.base, "aloneRed.base");
+    const seen = arr(o.seen, "aloneRed.seen");
+    if (seen.length < 1 || seen.length > ALONE_RED_MAX) fail(`aloneRed.seen: must hold 1 to ${ALONE_RED_MAX} entries`);
+    seen.forEach((e, i) => {
+      const x = obj(e, `aloneRed.seen[${i}]`, ["pr", "n", "result"]);
+      int(x.pr, `aloneRed.seen[${i}].pr`, 1);
+      int(x.n, `aloneRed.seen[${i}].n`, 1);
+      if (baselineResultOk(x.result, `aloneRed.seen[${i}].result`).red !== true) fail(`aloneRed.seen[${i}].result.red: must be true`);
+    });
+    if (new Set(seen.map((e) => (e as O).pr)).size !== seen.length) fail("aloneRed.seen: a PR is listed twice");
+    const retried = arr(o.retried, "aloneRed.retried");
+    if (retried.length > ALONE_RED_MAX) fail(`aloneRed.retried: more than ${ALONE_RED_MAX} entries`);
+    retried.forEach((e, i) => {
+      const x = obj(e, `aloneRed.retried[${i}]`, ["pr", "head", "other", "failing"]);
+      int(x.pr, `aloneRed.retried[${i}].pr`, 1);
+      sha(x.head, `aloneRed.retried[${i}].head`);
+      int(x.other, `aloneRed.retried[${i}].other`, 1);
+      arr(x.failing, `aloneRed.retried[${i}].failing`).forEach((v, j) => str(v, `aloneRed.retried[${i}].failing[${j}]`));
+    });
+    if (new Set(retried.map((e) => (e as O).pr)).size !== retried.length) fail("aloneRed.retried: duplicate PR");
+  }
+}
+
+function baselineResultOk(x: unknown, where: string): O {
+  const r = obj(x, where, ["red", "jobs", "tests", "byJob"]);
+  if (typeof r.red !== "boolean") fail(`${where}.red: not a boolean`);
+  for (const k of ["jobs", "tests", "byJob"]) arr(r[k], `${where}.${k}`).forEach((v, i) => str(v, `${where}.${k}[${i}]`));
+  return r;
 }
 
 /** Refs and labels are checked against the config's names. */
@@ -818,7 +871,7 @@ export function parseState(json: string, names: Names): State {
   }
   raw = migrate(raw);
   if ((raw as O)?.v !== 5) fail(`unknown version ${JSON.stringify((raw as O | null)?.v)}`);
-  const s = obj(raw, "state", Object.keys(emptyState()), ["eligibleSince", "go", "hooks", "held", "concurrent", "flakes", "epochBranch", "seenRed", "squashed", "parked", "adaptive", "baseline", "internalErrors"]);
+  const s = obj(raw, "state", Object.keys(emptyState()), ["eligibleSince", "go", "hooks", "held", "concurrent", "flakes", "epochBranch", "seenRed", "squashed", "parked", "adaptive", "baseline", "aloneRed", "internalErrors"]);
   if ("go" in s && s.go !== true) fail("go: must be true when present");
   if ("internalErrors" in s) {
     const times = arr(s.internalErrors, "internalErrors");

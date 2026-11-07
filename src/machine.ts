@@ -41,7 +41,7 @@ import {
   withEvents,
 } from "./ctx";
 import { jobsOf } from "./hooks";
-import { type Active, type Baseline, type BaselineResult, type BuildSource, FLAKE_DAYS, type Op, type Pending, type Pin, type SeenRed, type Solo, type State } from "./state";
+import { type Active, ALONE_RED_MAX, type Baseline, type BaselineResult, type BuildSource, FLAKE_DAYS, type Op, type Pending, type Pin, type SeenRed, type Solo, type State } from "./state";
 import type { FailedJob, RunRef } from "./types";
 import { type Command, queueRef } from "./validate";
 
@@ -736,6 +736,8 @@ function handleActive(c: Ctx, a: Active): void {
 function handleRed(c: Ctx, a: Active, failedJobs: FailedJob[], reason: string): void {
   const mainFailed = c.snap.mainFailedJobs;
   const mainRunRed = a.prs.length === 1 && mainFailed !== null && failedJobs.length > 0 && failedJobs.every((j) => mainFailed.includes(j.name));
+  // Main's own run for this batch is in and not red (queue.strategy.mainBaseline): a PR that fails alone now is compared with other PRs that did.
+  const mainNotRed = !mainRunRed && a.prs.length === 1 && c.s.baseline?.result?.red === false && c.s.baseline.forBatch === a.n;
   const seen = mainRunRed ? null : againstBaseline(c, a, failedJobs);
   if (seen === "wait") return; // the batch keeps its slot until main's own run is in
   c.s.redStreak += 1;
@@ -750,6 +752,7 @@ function handleRed(c: Ctx, a: Active, failedJobs: FailedJob[], reason: string): 
       abandon(c, a, a.prs, "main red");
       return;
     }
+    if (mainNotRed && retryAlone(c, a, pr, failedJobs)) return;
     const pin = c.s.auth[String(pr)]?.head ?? "?";
     const tag = `bounce:${a.n}`;
     emit(c, {
@@ -768,6 +771,7 @@ function handleRed(c: Ctx, a: Active, failedJobs: FailedJob[], reason: string): 
     );
     delete c.s.auth[String(pr)];
     c.s.bounceStreak += 1;
+    if (mainNotRed) rememberAlone(c, a, pr, failedJobs);
     record(c, { n: a.n, outcome: "bounced", prs: a.prs, head: a.head, note: reason, failedJobs });
     retire(c, a);
     if (c.s.bounceStreak >= c.cfg.breakerBounces) pause(c, `${c.s.bounceStreak} bounces in a row without a landing`);
@@ -803,6 +807,55 @@ function againstBaseline(c: Ctx, a: Active, failedJobs: FailedJob[]): "wait" | {
   return { own: ownFailures(failedJobs, c.snap.redTests ?? {}, b.result), main: b.result };
 }
 
+/** Could this single PR's red run be compared with other PRs' (aloneRed)? The same limits as a comparison with main's own run. */
+const aloneComparable = (c: Ctx, a: Active, failedJobs: FailedJob[]) =>
+  c.cfg.strategy?.mainBaseline === true && failedJobs.length > 0 && a.on === undefined && a.base === c.snap.main && !c.s.auth[String(a.prs[0])]?.policyPr;
+
+/** A PR that failed alone on this main while main's own run did not: remember what it failed (retryAlone compares later PRs with it). */
+function rememberAlone(c: Ctx, a: Active, pr: number, failedJobs: FailedJob[]): void {
+  if (!aloneComparable(c, a, failedJobs)) return;
+  const r = c.s.aloneRed?.base === a.base ? c.s.aloneRed : undefined;
+  const entry = { pr, n: a.n, result: baselineResult(failedJobs, c.snap.redTests ?? {}) };
+  c.s.aloneRed = { base: a.base, seen: [...(r?.seen ?? []).filter((e) => e.pr !== pr), entry].slice(-ALONE_RED_MAX), retried: r?.retried ?? [] };
+}
+
+/**
+ * Main's own run did not show this PR's failures, but a failure that comes and
+ * goes can pass once. If another PR already failed exactly these alone on this
+ * main (each after its rerun), the two most likely share main's failure, not
+ * one of their own: this PR is tested alone once more instead of bounced, and
+ * is not counted. A pin is retried once; failing again bounces it as ever.
+ * Nothing is held and nothing lands without a green suite.
+ */
+function retryAlone(c: Ctx, a: Active, pr: number, failedJobs: FailedJob[]): boolean {
+  const r = c.s.aloneRed;
+  const head = c.s.auth[String(pr)]?.head;
+  if (!r || r.base !== a.base || head === undefined || !aloneComparable(c, a, failedJobs)) return false;
+  if (r.retried.some((p) => p.pr === pr && p.head === head)) return false;
+  // A marker goes only once its pin has left the queue, never to make room: a full list means no retry.
+  r.retried = r.retried.filter((p) => c.s.auth[String(p.pr)]?.head === p.head);
+  if (r.retried.length >= ALONE_RED_MAX) return false;
+  const tests = c.snap.redTests ?? {};
+  const other = r.seen.find((e) => e.pr !== pr && ownFailures(failedJobs, tests, e.result).length === 0);
+  if (!other) return false;
+  const mine = baselineResult(failedJobs, tests);
+  rememberAlone(c, a, pr, failedJobs);
+  const failing = (mine.tests.length > 0 ? mine.tests : mine.jobs).slice(0, 10);
+  c.s.aloneRed!.retried = [...c.s.aloneRed!.retried.filter((p) => p.pr !== pr), { pr, head, other: other.pr, failing }];
+  const what = mainFailures(mine);
+  const names = c.cfg.names.main;
+  comment(
+    c,
+    pr,
+    `alone-retry:${a.n}`,
+    `Still in the landing queue, and not bounced: batch ${a.n} (this PR alone, at \`${head}\`, on top of ${names} \`${a.base}\`) failed, and failed again on a rerun, on ${what}. #${other.pr} failed exactly that alone on the same ${names}, and ${names}'s own run with no PR in it did not, so ${names} most likely fails it on and off. This PR is tested alone once more, and is bounced only if it fails again.`,
+  );
+  record(c, { n: a.n, outcome: "solo", prs: a.prs, head: a.head, note: `${names} most likely fails ${what} on and off: #${other.pr} failed the same alone on it; tested alone once more`, failedJobs });
+  requeueSolo(c, [{ pr, lineage: a.lineage, reason: "split" }]);
+  retire(c, a);
+  return true;
+}
+
 /** Queue a run of the suite on main alone. A ref at a commit that is already on main needs no merge and no journal: a lost ref just reads as no run. */
 function startBaseline(c: Ctx, a: Active): void {
   reserve(c, a.lineage);
@@ -828,6 +881,8 @@ function holdOnRedMain(c: Ctx, a: Active, main: BaselineResult): void {
 
 /** Read main's own run, and drop a baseline that no longer says anything about main. */
 function settleBaseline(c: Ctx): void {
+  // What PRs failed alone says something only about this main.
+  if (c.s.aloneRed && (c.s.aloneRed.base !== c.snap.main || !c.cfg.strategy?.mainBaseline)) delete c.s.aloneRed;
   const b = c.s.baseline;
   if (!b) return;
   b.held = b.held.filter((h) => c.s.auth[String(h.pr)]?.head === h.head);

@@ -37,6 +37,8 @@ Qlander opens a `pause` issue itself when it stops for a reason that needs a per
 | `not confirmed`, `no longer exist` or `still running` | A rerun or cancellation couldn't be reconciled. | Look at the named runs. |
 | `stopped on an auth error` | Usually an App permission or an installation is missing. | Check the App's permissions and installations. |
 
+With linear landing, a landing that stops part way can leave a PR branch at its squashed commit with `main` unmoved. Qlander moves it back on the next tick and lands again. While the queue is paused it writes nothing, so the branch stays there until the pause closes, and each tick's log names it (DESIGN.md §7.4).
+
 ### A failed read counts as paused
 
 The queue treats itself as paused whenever it can't read the `pause` issues or can't list them completely. It opens a pause, release-pause, release-blocked or mirror issue only if two complete listings both lack it, so a short read can't open a duplicate. See [DESIGN.md, Operator surface](../DESIGN.md#10-operator-surface).
@@ -370,7 +372,8 @@ Qlander comments on a PR when something happens to it, and GitHub notifies every
 These comments are always posted, and most ask someone to act:
 
 - a bounce;
-- "Not queued": a conflict, or a PR that does not qualify;
+- "Not queued": a conflict, a PR that does not qualify, or, with linear landing, a PR carrying commits that already landed squashed. That last one must be rebased onto `main`, keeping only its own commits; the comment gives the command;
+- With linear landing, a PR GitHub closed without the merged mark says its change is on `main` anyway;
 - a removal from the queue: the head moved, the retry budget was used, or an operator bounced it;
 - a PR kept in the queue because every failure is also main's (`queue.strategy.mainBaseline`);
 - a landed revision with later commits that are not in `main`;

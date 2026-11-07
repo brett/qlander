@@ -18,7 +18,7 @@
 
 import { revalidate } from "./admission";
 import { type Config, epochClientProblem, invariantProblems } from "./config";
-import { epochHandover, fenced, takeEpoch } from "./fenced";
+import { epochHandover, fenced, LAG_WAITS_MS, takeEpoch } from "./fenced";
 import { actives, type Snapshot, type Verdict } from "./ctx";
 import type { TargetApi, StateRefApi, StateRepoApi } from "./github/api";
 import { GitHubError, isGraphqlInternal } from "./github/http";
@@ -202,6 +202,8 @@ export function prAuthor(live: { author?: string; authorId?: number } | undefine
 /** How long, and how often, a landing waits for GitHub to process its PR branch moves (DESIGN.md §7.4). */
 export const LAND_HEAD_WAIT_MS = 120_000;
 export const LAND_HEAD_POLL_MS = 500;
+/** Shorter than the wait above, so a tick that does both still fits a job. */
+export const LAND_SETTLE_WAIT_MS = 30_000;
 
 const stableId = (s: string) => new Bun.CryptoHasher("sha256").update(s).digest("hex").slice(0, 12);
 
@@ -415,7 +417,16 @@ class Tick {
     const seen = await c.compare(op.after, main);
     if (seen.status === "ahead" || seen.status === "identical") return { kind: "landed" };
     const now = new Map<number, string | null>();
-    for (const h of heads) now.set(h.pr, await c.getPrBranch(h.ref));
+    for (const h of heads) {
+      let at = await c.getPrBranch(h.ref);
+      // An absent branch can have no guard in the write below, so one read is not enough: it must stay absent.
+      for (const ms of at === null ? LAG_WAITS_MS : []) {
+        await this.pause(ms);
+        at = await c.getPrBranch(h.ref);
+        if (at !== null) break;
+      }
+      now.set(h.pr, at);
+    }
     const moves = heads.flatMap((h) => {
       const at = now.get(h.pr)!;
       return at === null ? [] : [{ branch: h.ref, before: at, after: at === h.after ? h.before : at }];
@@ -426,6 +437,8 @@ class Tick {
       if (e instanceof CrashError || e instanceof LostLockError) throw e;
       return unsettled(String(e));
     }
+    // The next decision reads PRs, not branches: none may still read at its stack commit, or it would pass for an author's push. Until then the journal stays.
+    if (!(await this.waitForPrs(heads.filter((h) => now.get(h.pr) !== null), (h, sha) => sha !== h.after, LAND_SETTLE_WAIT_MS))) return unsettled("a PR still reads at its stack commit");
     if (main !== op.before) return { kind: "baseMoved" };
     const pushed = heads.filter((h) => now.get(h.pr) !== h.before && now.get(h.pr) !== h.after).map((h) => h.pr);
     return pushed.length > 0 ? { kind: "headMoved", prs: pushed } : null;
@@ -438,14 +451,25 @@ class Tick {
    * takes it to settle, and a head that was pushed to refuses landStack anyway.
    */
   private async headsProcessed(op: Extract<Op, { kind: "land" }>): Promise<void> {
-    let left = op.heads ?? [];
-    for (let i = 0; left.length > 0; i++) {
-      if (i > 0) await (this.d.sleep ?? ((ms) => this.store.sleep(ms)))(LAND_HEAD_POLL_MS);
+    const heads = op.heads ?? [];
+    // Somebody's push: no reason to wait for a head that will not come, and landStack refuses it.
+    if (!(await this.waitForPrs(heads, (h, sha) => sha === h.after || sha !== h.before, LAND_HEAD_WAIT_MS))) throw new GitHubError("server", null, `GitHub has not processed the move of ${heads.map((h) => `${h.ref} (#${h.pr})`).join(", ")} after ${LAND_HEAD_WAIT_MS / 1000} seconds`);
+  }
+
+  private pause(ms: number): Promise<void> {
+    return (this.d.sleep ?? ((x) => this.store.sleep(x)))(ms);
+  }
+
+  /** Read each PR until `done` holds for its head, up to `ms` by the clock or by the waits alone. False when time ran out. */
+  private async waitForPrs(heads: NonNullable<Extract<Op, { kind: "land" }>["heads"]>, done: (h: { before: string; after: string }, sha: string) => boolean, ms: number): Promise<boolean> {
+    const started = Date.now();
+    let left = heads;
+    for (let i = 0; ; i++) {
       const seen = await Promise.all(left.map((h) => this.d.target.getPr(h.pr)));
-      // Somebody's push: no reason to wait for a head that will not come, and landStack refuses it.
-      if (left.some((h, k) => seen[k]!.head.sha !== h.after && seen[k]!.head.sha !== h.before)) return;
-      left = left.filter((h, k) => seen[k]!.head.sha !== h.after);
-      if (left.length > 0 && i * LAND_HEAD_POLL_MS >= LAND_HEAD_WAIT_MS) throw new GitHubError("server", null, `GitHub has not processed the move of ${left.map((h) => `${h.ref} (#${h.pr})`).join(", ")} after ${LAND_HEAD_WAIT_MS / 1000} seconds`);
+      left = left.filter((h, k) => !done(h, seen[k]!.head.sha));
+      if (left.length === 0) return true;
+      if (Date.now() - started >= ms || i * LAND_HEAD_POLL_MS >= ms) return false;
+      await this.pause(LAND_HEAD_POLL_MS);
     }
   }
 

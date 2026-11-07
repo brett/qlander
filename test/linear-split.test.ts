@@ -276,35 +276,95 @@ describe("lost responses and lagging reads", () => {
     expect(w.target.branchMoves).toHaveLength(1);
   });
 
-  test("a crash after the first write, then a read still at the admitted head: the resend is refused on the write path, nothing is dropped, and it lands", async () => {
+  /** The next reads of the branch, and of the PR, still show the admitted head. */
+  function staleAtAdmitted(w: World, reads: number, pullReads = reads): string {
+    const admitted = (w.state().journal!.op as { heads: { before: string }[] }).heads[0]!.before;
+    const branch = w.target.getPrBranch.bind(w.target);
+    const pull = w.target.getPr.bind(w.target);
+    let staleBranch = reads;
+    let stalePull = pullReads;
+    w.target.getPrBranch = async (b) => (staleBranch-- > 0 ? admitted : branch(b));
+    w.target.getPr = async (n) => {
+      const p = await pull(n);
+      if (stalePull-- > 0) p.head.sha = admitted;
+      return p;
+    };
+    return admitted;
+  }
+
+  test("a crash after the first write, then reads still at the admitted head: the resend is refused on the write path, nothing is dropped, and it lands", async () => {
     const w = linearWorld();
     pr(w, 1);
     await crashBetween(w);
-    const admitted = (w.state().journal!.op as { heads: { before: string }[] }).heads[0]!.before;
-    const read = w.target.getPrBranch.bind(w.target);
-    let stale = 1;
-    w.target.getPrBranch = async (b) => (stale-- > 0 ? admitted : read(b));
+    const moves = w.target.branchMoves.length;
+    const move = w.target.moveBranches.bind(w.target);
+    let refused = 0;
+    w.target.moveBranches = (g, m, e) => move(g, m, e).catch((err) => {
+      refused++;
+      throw err;
+    });
+    staleAtAdmitted(w, 1, 4);
     await w.runUntilIdle();
+    expect(refused).toBeGreaterThan(0);
+    expect(w.target.branchMoves.length).toBeGreaterThan(moves);
     expect(w.paused()).toBe(false);
     expect(w.landed()).toEqual([[1]]);
     expect(w.comments(1).some((c) => c.startsWith("Removed from"))).toBe(false);
     expect(w.target.prs.get(1)!.pr.merged).toBe(true);
   });
 
-  test("a resend no longer valid, with a branch read stale at its admitted head: the op cannot end until the write path agrees", async () => {
+  test("a resend no longer valid, with reads stale at the admitted head: the op cannot end until the write path agrees", async () => {
     const w = linearWorld();
     pr(w, 1);
     await crashBetween(w);
-    const op = w.state().journal!.op as { heads: { before: string; after: string }[] };
-    const read = w.target.getPrBranch.bind(w.target);
-    let stale = 1; // the observation
-    w.target.getPrBranch = async (b) => (stale-- > 0 ? op.heads[0]!.before : read(b));
+    const before = (w.state().journal!.op as { heads: { before: string }[] }).heads[0]!.before;
+    staleAtAdmitted(w, 2, 4); // observation and the settling read; the snapshot's PR reads
     w.config = { ...w.config, maxBatch: w.config.maxBatch + 1 }; // the policy changes: the resend does not revalidate
     const t = await w.tick();
     expect(t !== "crashed" && t.log.some((l) => l.startsWith("landing unsettled"))).toBe(true);
     expect(w.state().journal?.op.kind).toBe("land");
     await w.tick();
-    expect(w.target.prs.get(1)!.pr.head.sha).toBe(op.heads[0]!.before);
+    expect(w.target.prs.get(1)!.pr.head.sha).toBe(before);
+    await w.tick();
+    expect(w.state().journal).toBeNull();
+    expect(w.target.landings).toEqual([]);
+  });
+
+  test("a branch that reads absent once: not taken for a deleted one; it is moved back", async () => {
+    const w = linearWorld();
+    const before = pr(w, 1).pr.head.sha;
+    await crashBetween(w);
+    const read = w.target.getPrBranch.bind(w.target);
+    let absent = 2; // the observation and the first settling read
+    w.target.getPrBranch = async (b) => (absent-- > 0 ? null : read(b));
+    await w.tick();
+    expect(w.target.prs.get(1)!.pr.head.sha).toBe(before);
+    expect(w.state().journal?.op.kind).toBe("land");
+    await w.runUntilIdle();
+    expect(w.landed()).toEqual([[1]]);
+  });
+
+  test("a push refuses main, and the other PR's read lags behind its move back: the journal waits, so that PR is not dropped as a push", async () => {
+    const w = linearWorld();
+    for (const n of [1, 2]) pr(w, n);
+    const land = w.target.landStack.bind(w.target);
+    let first = true;
+    w.target.landStack = async (m, p, e) => {
+      if (first) {
+        first = false;
+        w.target.push(2);
+        w.target.headProcessingReads = 1000; // the move back takes GitHub a while
+      }
+      return land(m, p, e);
+    };
+    for (let i = 0; i < 12 && w.target.branchMoves.length < 2; i++) await w.tick();
+    expect(w.state().journal?.op.kind).toBe("land");
+    expect(w.comments(1).some((c) => c.startsWith("Removed from"))).toBe(false);
+    w.target.processAll();
+    await w.runUntilIdle();
+    expect(w.comments(1).some((c) => c.startsWith("Removed from"))).toBe(false);
+    expect(w.landed()).toEqual([[1]]);
+    expect(w.target.prs.get(1)!.pr.merged).toBe(true);
   });
 
   test("a restore that keeps being refused: journal kept, it pauses only past the reconcile window naming the branch and head, and finishes after resuming", async () => {

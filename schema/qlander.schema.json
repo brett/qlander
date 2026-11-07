@@ -736,6 +736,19 @@
           "examples": [["queued"]]
         }
       }
+    },
+    "linkedIssues": {
+      "description": "What a landing does to the issues a PR says it closes. Not policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "close": {
+          "description": "Close the issues in the target that each landed PR says it closes (`Closes #n`, `Fixes #n`, `Resolves #n` and GitHub's other closing keywords, plus issues linked to the PR by hand), with a comment naming the PR, as a merge by a person would. Only once main holds the landing, and only issues in the target repo. Needs Issues: write on the queue App: `setup`, `render` and `audit` add it while this is true, so change the App's permissions (`setup --step permissions`) before you render and deploy the workflow with this on. GitHub resolves closing keywords only for PRs whose base is the repo's default branch. Upgrade to a release that knows this key before adding it: an older release refuses the whole file.",
+          "type": "boolean",
+          "default": false,
+          "examples": [true]
+        }
+      }
     }
   },
   "$defs": {

@@ -67,6 +67,7 @@ export function dispatchOnly(t: TargetApi): DispatchTarget {
     permission: (l) => t.permission(l),
     listBranchActivity: (b) => t.listBranchActivity(b),
     listComments: (n) => t.listComments(n),
+    closingIssues: (n) => t.closingIssues(n),
     listReviews: (n) => t.listReviews(n),
     listRuns: (q) => t.listRuns(q),
     listWorkflowRuns: (p, q) => t.listWorkflowRuns(p, q),

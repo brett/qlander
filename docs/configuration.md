@@ -5,7 +5,7 @@
 Qlander reads one file: `qlander.yml`, at the root of the control repo. Start from the template's copy and change what you need. This page lists every key.
 
 - **Default** is the value used when you leave the key out. `required` means you must set it. `none` means no single default: the meaning, or the block's own section, says what leaving it out does.
-- **Policy.** Most keys are in the policy hash: changing one makes every admitted PR lose `ready` at the next tick. Outside the hash: `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `hooks`, `tokens`, `bundle`, `notify`, `comments`, `runner` except its timings, and `release` except `branch`, `stateBranch` and `labels`. See [the policy hash](deployment.md#82-the-policy-hash).
+- **Policy.** Most keys are in the policy hash: changing one makes every admitted PR lose `ready` at the next tick. Outside the hash: `control.mainProtection`, `queue.concurrency`, `queue.strategy`, `hooks`, `tokens`, `bundle`, `notify`, `comments`, `linkedIssues`, `runner` except its timings, and `release` except `branch`, `stateBranch` and `labels`. See [the policy hash](deployment.md#82-the-policy-hash).
 - **Checking.** Run `bun "${bundle:?}" validate --config qlander.yml` to check a config. After any change, run `bun "${bundle:?}" render --config qlander.yml` and commit the workflows with it. (In the qlander source repo, `bun src/cli.ts` in place of the bundle.)
 
 ## Contents
@@ -61,6 +61,7 @@ Qlander reads one file: `qlander.yml`, at the root of the control repo. Start fr
 - [bundle](#bundle)
 - [notify](#notify)
 - [comments](#comments)
+- [linkedIssues](#linkedissues)
 - [Formats](#formats)
 
 ## Top level
@@ -82,6 +83,7 @@ qlander.yml: the whole configuration of one deployment. It lives in the control 
 | `bundle` | mapping | none | Run a pinned release instead of the control repo's own source. See [bundle](#bundle). |
 | `notify` | mapping | none | Who to tell when the queue stops. See [notify](#notify). |
 | `comments` | mapping | none | PR comments to leave out. See [comments](#comments). |
+| `linkedIssues` | mapping | none | What a landing does to the issues a PR says it closes. See [linkedIssues](#linkedissues). |
 
 ```yaml
 version: 1
@@ -1026,6 +1028,19 @@ PR comments to leave out. Not policy.
 comments:
   omit:
     - queued
+```
+
+## `linkedIssues`
+
+What a landing does to the issues a PR says it closes. Not policy.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `linkedIssues.close` | boolean | `false` | Close the issues in the target that each landed PR says it closes (`Closes #n`, `Fixes #n`, `Resolves #n` and GitHub's other closing keywords, plus issues linked to the PR by hand), with a comment naming the PR, as a merge by a person would. Only once main holds the landing, and only issues in the target repo. Needs Issues: write on the queue App: `setup`, `render` and `audit` add it while this is true, so change the App's permissions (`setup --step permissions`) before you render and deploy the workflow with this on. GitHub resolves closing keywords only for PRs whose base is the repo's default branch. Upgrade to a release that knows this key before adding it: an older release refuses the whole file. |
+
+```yaml
+linkedIssues:
+  close: true
 ```
 
 ## Formats

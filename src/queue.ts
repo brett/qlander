@@ -75,6 +75,8 @@ export interface RunnerDeps {
   hooks?: Hook[];
   /** PR comments to leave out (qlander.yml `comments`). Not policy: not in cfg. Absent: every comment is posted. */
   comments?: CommentSettings;
+  /** Close the issues a landed PR says it closes (qlander.yml `linkedIssues.close`). Not policy: not in cfg. Absent: off. */
+  closeLinkedIssues?: boolean;
 }
 
 export type TickOutcome = "acted" | "idle" | "waiting" | "stale" | "busy" | "lost-lock" | "retry-later" | "paused";
@@ -256,7 +258,7 @@ class Tick {
 
   private async apply(r: OpResult): Promise<void> {
     this.lastResult = r.kind;
-    const out = applyOpResult(this.state, r, this.d.cfg, this.d.now(), this.d.comments);
+    const out = applyOpResult(this.state, r, this.d.cfg, this.d.now(), this.d.comments, this.d.closeLinkedIssues ?? false);
     this.state = this.withHooks(out.state, out.events);
     this.log.push(...out.log);
     await this.save();

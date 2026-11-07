@@ -16,6 +16,10 @@ import type { Account, BranchAt, CommitAuthor, TargetApi, Commit, Compare, Label
 export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 const UPDATE_REFS = "mutation($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }";
+/** Pages of 50 closing references read per PR (src/outbox.ts closeIssues): 1,000, far past any real PR. More is reported as truncated. */
+export const CLOSING_ISSUES_PAGES = 20;
+const CLOSING_ISSUES =
+  "query($id: ID!, $pr: Int!, $after: String) { node(id: $id) { ... on Repository { pullRequest(number: $pr) { closingIssuesReferences(first: 50, after: $after) { nodes { number state repository { databaseId } } pageInfo { hasNextPage endCursor } } } } } }";
 
 /** A job log is read only up to its last this-many bytes: failure summaries are printed at the end. */
 const MAX_LOG_BYTES = 2_000_000;
@@ -654,6 +658,31 @@ export class TargetClient implements TargetApi {
     if (body.length === 0 || body.length > 60_000) bad("comment body length");
     const r = await this.http.request<{ id: number }>("POST", `${this.path}/issues/${prn(n)}/comments`, { body: { body } });
     return r.json.id;
+  }
+
+  async closingIssues(pr: number): Promise<Listed<{ number: number; open: boolean }>> {
+    type Node = { number?: unknown; state?: unknown; repository?: { databaseId?: unknown } | null } | null;
+    type Page = { node: { pullRequest: { closingIssuesReferences: { nodes: Node[] | null; pageInfo: { hasNextPage: boolean; endCursor: string | null } } | null } | null } | null };
+    const items: { number: number; open: boolean }[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < CLOSING_ISSUES_PAGES; page++) {
+      const data: Page = await this.http.graphql<Page>(CLOSING_ISSUES, { id: this.nodeId, pr: prn(pr), after }, false);
+      const refs = data.node?.pullRequest?.closingIssuesReferences;
+      if (!refs) throw new GitHubError("not_found", 200, `#${pr} has no closing references to read`);
+      // Only this repository's issues: a reference into another repo is never touched.
+      for (const x of refs.nodes ?? []) {
+        if (x && x.repository?.databaseId === this.repoId && typeof x.number === "number" && isPrNumber(x.number) && (x.state === "OPEN" || x.state === "CLOSED")) items.push({ number: x.number, open: x.state === "OPEN" });
+      }
+      if (!refs.pageInfo.hasNextPage) return { items, truncated: false };
+      if (!refs.pageInfo.endCursor) break;
+      after = refs.pageInfo.endCursor;
+    }
+    return { items, truncated: true };
+  }
+
+  async closeIssue(n: number): Promise<void> {
+    this.can("queueOps");
+    await this.http.request("PATCH", `${this.path}/issues/${prn(n)}`, { body: { state: "closed", state_reason: "completed" } });
   }
 
   /**

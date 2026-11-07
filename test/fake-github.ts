@@ -672,8 +672,41 @@ export class FakeTarget implements TargetApi {
     if (r && r.status !== "completed") this.updateRun(r, { status: "completed", conclusion: "cancelled" });
     this.log(`cancel ${id}`);
   }
+  /** Issues in this repo (closingIssues, closeIssue), by number: their state and the comments posted on them. */
+  issues = new Map<number, { open: boolean; comments: string[] }>();
+  /** The issues each PR says it closes, as GitHub resolves them; `repo: "other"` is an issue in another repository, which the client leaves out. */
+  closing = new Map<number, { number: number; repo?: "other" }[]>();
+  /** closingIssues reports more than it returned. */
+  closingTruncated = false;
+  /** The next closingIssues calls throw these (each call shifts one off). */
+  closingErrors: GitHubError[] = [];
+  /** The next comment-on-issue or closeIssue calls throw these (each call shifts one off). */
+  issueErrors: GitHubError[] = [];
+  async closingIssues(pr: number): Promise<Listed<{ number: number; open: boolean }>> {
+    const e = this.closingErrors.shift();
+    if (e) throw e;
+    this.log(`closing ${pr}`);
+    const items = (this.closing.get(pr) ?? []).filter((r) => r.repo !== "other").map((r) => ({ number: r.number, open: this.issues.get(r.number)?.open ?? false }));
+    return { items, truncated: this.closingTruncated };
+  }
+  async closeIssue(n: number) {
+    if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
+    const e = this.issueErrors.shift();
+    if (e) throw e;
+    const i = this.issues.get(n);
+    if (!i) throw new GitHubError("not_found", 404, "no issue");
+    i.open = false;
+    this.log(`close issue ${n}`);
+  }
   async comment(n: number, body: string) {
     if (this.role !== "queue") throw new GitHubError("validation", null, "queue only");
+    const issue = this.issues.get(n);
+    if (issue) {
+      const e = this.issueErrors.shift();
+      if (e) throw e;
+      issue.comments.push(body);
+      return nextId();
+    }
     this.pr(n);
     this.posted.push({ pr: n, body });
     const id = nextId();

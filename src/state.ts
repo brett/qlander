@@ -182,7 +182,14 @@ export type Notice =
   | { id: string; kind: "deleteRef"; ref: string }
   | { id: string; kind: "createRef"; ref: string; head: string }
   /** Open or update one `flaky` issue per item key in this repo (src/flaky.ts). Best effort: never pauses. */
-  | { id: string; kind: "flaky"; n: number; at: string; giveUpAt: string; runs: RunRef[]; items: FlakyItem[]; done?: string[] };
+  | { id: string; kind: "flaky"; n: number; at: string; giveUpAt: string; runs: RunRef[]; items: FlakyItem[]; done?: string[] }
+  /**
+   * Close the issues in the target that a landed PR says it closes, with a
+   * comment naming the PR (src/outbox.ts, `linkedIssues.close`). Best effort:
+   * never pauses. `sent`: issues whose comment may have been posted (never
+   * posted again); `done`: issues finished.
+   */
+  | { id: string; kind: "closeIssues"; pr: number; landedIn: string; giveUpAt: string; sent?: number[]; done?: number[] };
 
 /** One flaky failure: a test id parsed from the job log, or the job name when none was. */
 export interface FlakyItem {
@@ -652,8 +659,9 @@ function checkOp(x: unknown, where: string): string {
 }
 
 function checkNotice(x: unknown, where: string, names: Names): void {
-  const kind = oneOf((x as O)?.kind, `${where}.kind`, ["comment", "unready", "unlabel", "pause", "cancelRuns", "deleteRef", "createRef", "flaky"] as const);
+  const kind = oneOf((x as O)?.kind, `${where}.kind`, ["comment", "unready", "unlabel", "pause", "cancelRuns", "deleteRef", "createRef", "flaky", "closeIssues"] as const);
   if (kind === "flaky") return checkFlakyNotice(x, where);
+  if (kind === "closeIssues") return checkCloseIssuesNotice(x, where);
   const fields: Record<typeof kind, string[]> = {
     comment: ["id", "kind", "pr", "body"],
     unready: ["id", "kind", "pr"],
@@ -686,6 +694,15 @@ function failedJobs(x: unknown, where: string): void {
     if (o.id !== undefined) int(o.id, `${where}[${i}].id`, 1);
     if (o.tests !== undefined) arr(o.tests, `${where}[${i}].tests`).forEach((t, k) => str(t, `${where}[${i}].tests[${k}]`));
   });
+}
+
+function checkCloseIssuesNotice(x: unknown, where: string): void {
+  const o = obj(x, where, ["id", "kind", "pr", "landedIn", "giveUpAt"], ["sent", "done"]);
+  str(o.id, `${where}.id`);
+  pr(o.pr, `${where}.pr`);
+  sha(o.landedIn, `${where}.landedIn`);
+  iso(o.giveUpAt, `${where}.giveUpAt`);
+  for (const k of ["sent", "done"] as const) if (o[k] !== undefined) arr(o[k], `${where}.${k}`).forEach((n, i) => pr(n, `${where}.${k}[${i}]`));
 }
 
 function checkFlakyNotice(x: unknown, where: string): void {

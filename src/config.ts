@@ -252,6 +252,9 @@ export const defaultHooks = controlConfig().hooks;
 /** The PR comments the same file leaves out (docs/operating.md, "PR comments"). Not part of Config either. */
 export const defaultComments = controlConfig().comments;
 
+/** Whether a landing closes the issues its PRs say they close (qlander.yml `linkedIssues.close`). Not part of Config either. */
+export const defaultCloseLinkedIssues = controlConfig().closeLinkedIssues;
+
 /** Who is assigned a pause the queue or the release job opens (docs/operating.md, "Getting notified"). Not part of Config either. */
 export const defaultNotify = controlConfig().notify;
 

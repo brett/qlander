@@ -133,6 +133,12 @@ watchdog:
     alert: qlander-alert
     status: qlander-status
 
+# Close the issues a landed PR says it closes (Closes #n, Fixes #n, ...),
+# as a merge by a person would. The queue App needs Issues: write for it,
+# which setup asks for while this is true.
+linkedIssues:
+  close: true
+
 # The release this repo runs, pinned (with its sha256) in
 # .github/qlander-release.txt. Change the pin, never this, to upgrade.
 bundle:

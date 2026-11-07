@@ -1,1 +1,1 @@
-0.2.3 qlander-0.2.3.js a5f96e924aad8b94e6ba5e892c8e0d3208d23a45b827bd4193cf2f5fc78cbd32
+0.2.4 qlander-0.2.4.js 15e76b36ad1fe51f010f69b6a269aa3f4358c9b0fbedaa4b003ab3df0fd6fdad

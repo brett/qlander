@@ -41,6 +41,8 @@ export class FakeTarget implements TargetApi {
   /** The most commits a compare lists (oldest first, as GitHub pages them); null: all. */
   compareCommitLimit: number | null = null;
   incompleteJobs = new Set<number>();
+  /** Runs listRuns leaves out although they exist (getRun still finds them): a gap in GitHub's run listing. */
+  unlistedRuns = new Set<number>();
   /** listRuns stops after this many runs and says so (a page limit). */
   runListLimit: number | null = null;
   rejectDeletes = new Set<string>();
@@ -375,7 +377,7 @@ export class FakeTarget implements TargetApi {
     return this.pr(n).reviews;
   }
   async listRuns(q: { headSha: string; branch?: string; event?: string }): Promise<Listed<Run>> {
-    const all = this.listed(this.runs).filter((r) => r.head_sha === q.headSha && (!q.branch || r.head_branch === q.branch) && (!q.event || r.event === q.event));
+    const all = this.listed(this.runs).filter((r) => !this.unlistedRuns.has(r.id) && r.head_sha === q.headSha && (!q.branch || r.head_branch === q.branch) && (!q.event || r.event === q.event));
     const cap = this.runListLimit ?? all.length;
     return { items: all.slice(0, cap), truncated: all.length > cap };
   }

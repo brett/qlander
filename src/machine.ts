@@ -410,6 +410,19 @@ function applyCommand(c: Ctx, cmd: Command): void {
 export const VERIFY_MIN_MINUTES = 15;
 
 /** DESIGN.md §7.3: never closes a PR; reports exactly what landed. */
+/**
+ * Each running batch keeps the manifest runs seen for it (DESIGN.md §6.2),
+ * so a run that a later listing leaves out is read again by id rather than
+ * counted as no run. Only ever added to; cleared with the batch.
+ */
+function recordSeen(c: Ctx): void {
+  for (const a of actives(c.s)) {
+    const seen = [...(a.seen ?? [])];
+    for (const r of c.snap.ciSeen?.[String(a.n)] ?? []) if (!seen.some((x) => x.runId === r.runId)) seen.push(r);
+    if (seen.length > (a.seen?.length ?? 0)) a.seen = seen;
+  }
+}
+
 function processVerify(c: Ctx): void {
   const keep = [];
   for (const v of c.s.verify) {
@@ -1386,6 +1399,7 @@ export function decide(prev: State, snap: Snapshot, cfg: Config): Decision {
   pruneOperatorSolo(c);
   applyCommands(c);
   processVerify(c);
+  recordSeen(c);
   // A pause still waiting in the outbox counts as paused: the runner has not
   // opened the pause issue yet, so snap.paused cannot know about it.
   const pausePending = prev.outbox.some((n) => n.kind === "pause");

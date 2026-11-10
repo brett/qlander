@@ -98,6 +98,18 @@ export interface Active {
   on?: number;
   /** Linear landing only (optional, DESIGN.md §7.4): the stack, one commit per PR in `prs` order; `head` is the last. */
   stack?: StackCommit[];
+  /**
+   * The manifest runs seen for this batch (optional; absent until one is
+   * seen, DESIGN.md §6.2): a run once seen is read again by id when a later
+   * run listing leaves it out, so a gap in the listing never reads as no run.
+   */
+  seen?: SeenRun[];
+}
+
+/** A pre-landing run seen at a batch's head on its queue branch: its id and workflow path. */
+export interface SeenRun {
+  runId: number;
+  path: string;
 }
 
 export interface Pending {
@@ -751,8 +763,18 @@ export function checkLease(x: unknown): Lease {
 
 /** One running batch, strictly (state.active, or an entry of state.concurrent). */
 function checkActive(x: unknown, where: string): O {
-  const a = obj(x, where, ["n", "base", "head", "depth", "prs", "lineage", "rerun", "rerunAt", "cancels", "builtAt"], ["redJobs", "on", "stack"]);
+  const a = obj(x, where, ["n", "base", "head", "depth", "prs", "lineage", "rerun", "rerunAt", "cancels", "builtAt"], ["redJobs", "on", "stack", "seen"]);
   if (a.redJobs !== undefined) failedJobs(a.redJobs, `${where}.redJobs`);
+  if (a.seen !== undefined) {
+    const seen = arr(a.seen, `${where}.seen`);
+    if (seen.length === 0) fail(`${where}.seen: empty (absent when no run was seen)`);
+    seen.forEach((x, i) => {
+      const o = obj(x, `${where}.seen[${i}]`, ["runId", "path"]);
+      int(o.runId, `${where}.seen[${i}].runId`, 1);
+      if (str(o.path, `${where}.seen[${i}].path`) === "") fail(`${where}.seen[${i}].path: empty`);
+    });
+    if (new Set(seen.map((x) => (x as O).runId)).size !== seen.length) fail(`${where}.seen: duplicate run`);
+  }
   if (a.on !== undefined && int(a.on, `${where}.on`, 1) >= int(a.n, `${where}.n`, 1)) fail(`${where}.on: not an earlier batch`);
   if (a.rerunAt !== null) iso(a.rerunAt, `${where}.rerunAt`);
   int(a.n, `${where}.n`, 1);

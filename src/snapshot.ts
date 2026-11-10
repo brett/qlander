@@ -13,8 +13,9 @@ import type { TargetApi, Compare } from "./github/api";
 import { GitHubError } from "./github/http";
 import type { Observation } from "./ops";
 import { type BypassRead, forceUpdateOf } from "./force-update";
-import type { Active, Journal, State } from "./state";
+import type { Active, Journal, SeenRun, State } from "./state";
 import type { FailedJob, JobsByRun, Run } from "./types";
+import { eligible } from "./verdict";
 import { type Command, COMMAND_KINDS, isForbiddenHeadRef, isGitBranchName, queueRef } from "./validate";
 
 export interface SnapshotInput {
@@ -243,11 +244,30 @@ async function trustOf(i: SnapshotInput, bot: TrustedAutomation, headRef: string
   }
 }
 
-async function batchCi(i: SnapshotInput, l: Lookups, a: Active | null): Promise<Snapshot["ci"]> {
+/**
+ * A batch's CI (DESIGN.md §6.2). A run seen on an earlier tick (`a.seen`)
+ * that the listing leaves out is read again by id: GitHub's run listing can
+ * drop a run for a while, and that must not read as no run. A run read back
+ * counts only if it is still a manifest run at this head on this queue branch
+ * in this repo (classify filters again); otherwise it is gone. The manifest
+ * runs seen this tick go to `seen`, by batch number, for decide() to record.
+ */
+async function batchCi(i: SnapshotInput, l: Lookups, a: Active | null, seen?: Record<string, SeenRun[]>): Promise<Snapshot["ci"]> {
   if (!a) return null;
   const branch = queueRef(i.cfg.names, a.n);
   const listed = await i.api.listRuns({ headSha: a.head, branch, event: "push" });
-  const runs = listed.items;
+  const branchRe = new RegExp(`^${branch.replace(/[/.]/g, "\\$&")}$`);
+  const paths = new Set(i.cfg.preLanding.map((wf) => wf.path));
+  const counts = (r: Run, path: string) => r.path === path && paths.has(path) && eligible(r, a.head, i.api.repoId, [branchRe]);
+  const runs = [...listed.items];
+  const gone: SeenRun[] = [];
+  for (const s of a.seen ?? []) {
+    if (runs.some((r) => r.id === s.runId && counts(r, s.path))) continue;
+    const run = await i.api.getRun(s.runId);
+    if (run && counts(run, s.path)) runs.push(run);
+    else gone.push(s);
+  }
+  if (seen) seen[String(a.n)] = runs.filter((r) => counts(r, r.path)).map((r) => ({ runId: r.id, path: r.path }));
   const newestPerPath = i.cfg.preLanding.map((wf) => newest(runs.filter((r) => r.path === wf.path))).filter((r): r is Run => r !== undefined);
   const jobsByRun = await l.jobsFor(newestPerPath);
   return classify({
@@ -261,6 +281,7 @@ async function batchCi(i: SnapshotInput, l: Lookups, a: Active | null): Promise<
     jobsByRun,
     incomplete: newestPerPath.filter((r) => l.incomplete.has(r.id)).map((r) => r.id),
     runsIncomplete: listed.truncated,
+    gone,
     cancels: a.cancels,
     expect: a.rerun ?? [],
     expectSince: a.rerunAt,
@@ -353,7 +374,8 @@ export async function buildSnapshot(i: SnapshotInput): Promise<Snapshot> {
   }
   const pinReachable: Record<string, boolean> = {};
   for (const v of i.state.verify) pinReachable[v.pin] = await l.isOnMain(v.pin);
-  const ci = await batchCi(i, l, i.state.active);
+  const ciSeen: Record<string, SeenRun[]> = {};
+  const ci = await batchCi(i, l, i.state.active, ciSeen);
   // queue.strategy.reuseGreen (DESIGN.md §5.7): a parked batch's CI, only when decide() could act on it.
   const p = i.state.parked;
   // Best effort: an unreadable run only means no reuse this tick (null), never a failed tick.
@@ -363,7 +385,7 @@ export async function buildSnapshot(i: SnapshotInput): Promise<Snapshot> {
   if (i.state.concurrent) {
     cis = {};
     for (const a of actives(i.state)) {
-      const k = a.n === i.state.active?.n ? ci : await batchCi(i, l, a);
+      const k = a.n === i.state.active?.n ? ci : await batchCi(i, l, a, ciSeen);
       if (k) cis[String(a.n)] = k;
     }
   }
@@ -408,6 +430,7 @@ export async function buildSnapshot(i: SnapshotInput): Promise<Snapshot> {
     prs,
     ci,
     ...(cis ? { cis } : {}),
+    ...(Object.keys(ciSeen).length > 0 ? { ciSeen } : {}),
     ...(parkedCi !== undefined ? { parkedCi } : {}),
     ...(baselineCi ? { baselineCi } : {}),
     ...(baselineTests ? { baselineTests } : {}),

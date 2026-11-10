@@ -4,7 +4,7 @@
 import type { LivePr } from "./admission";
 import type { CiClass } from "./classify";
 import type { Config } from "./config";
-import type { Active, Baseline, HistoryItem, Notice, Parked, State } from "./state";
+import type { Active, Baseline, HistoryItem, Notice, Parked, SeenRun, State } from "./state";
 import { BUDGET_WARN_SHARE, type HookBatch, type HookPr, type LifecycleEvent, prOf } from "./hooks";
 import type { FailedJob } from "./types";
 import type { Command } from "./validate";
@@ -19,6 +19,8 @@ export interface Snapshot {
   prs: Record<string, LivePr>;
   /** For `state.active` (the batch running when the snapshot was read). */
   ci: CiClass | null;
+  /** The manifest runs seen this tick for each running batch whose CI was read, by batch number: decide() adds them to its `seen`. */
+  ciSeen?: Record<string, SeenRun[]>;
   /** For state.parked (queue.strategy.reuseGreen, DESIGN.md §5.7): its CI on main, read only while unpaused and main is its base. */
   parkedCi?: CiClass | null;
   /** For every running batch, by batch number (optional; present only while more than one batch runs, DESIGN.md §5.6). */

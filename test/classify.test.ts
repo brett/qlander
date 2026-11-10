@@ -133,6 +133,17 @@ describe("classify", () => {
     expect(classify(input([scanRun()], { "200": okScan })).kind).toBe("config");
   });
 
+  test("a seen run that is gone is config at once, for an if_triggered workflow too; one with a newer run is not judged", () => {
+    const early = { now: new Date("2026-10-21T10:05:00Z") };
+    const gone = [{ runId: 99, path: ".github/workflows/ci.yml" }];
+    expect(classify(input([scanRun()], { "200": okScan }, { ...early, gone }))).toEqual({ kind: "config", reason: "CI: run 99 seen earlier is gone" });
+    const optional: Manifest = [{ ...manifest[0]!, when: "if_triggered" }, manifest[1]!];
+    expect(classify(input([scanRun()], { "200": okScan }, { manifest: optional, gone })).kind).toBe("config");
+    expect(classify(input([scanRun()], { "200": okScan }, { manifest: optional })).kind).toBe("green");
+    expect(classify(input([ciRun(), scanRun()], { "100": okCi, "200": okScan }, { gone })).kind).toBe("green");
+    expect(classify(input([scanRun()], { "200": okScan }, { ...early, gone, hasPolicyPr: true }))).toMatchObject({ kind: "red", policy: true });
+  });
+
   test("runs from another repo, another branch, a PR event or another sha are not evidence", () => {
     const fakes = [
       ciRun({ repository: { id: 1 } }),

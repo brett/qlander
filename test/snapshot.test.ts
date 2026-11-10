@@ -226,6 +226,16 @@ describe("batch CI, main's failures, pin reachability", () => {
       expect(d.state.outbox.some((n) => n.kind === "pause")).toBe(true);
     });
 
+    test("a newer seen run that was deleted is not hidden by an older green run of the same workflow", async () => {
+      const f = new FakeTarget();
+      const state = activeState(f);
+      const older = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9" }, green());
+      const newer = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9", status: "in_progress", conclusion: null }, green());
+      state.active!.seen = [{ runId: older.id, path: PATH }, { runId: newer.id, path: PATH }];
+      f.runs = f.runs.filter((r) => r.id !== newer.id);
+      expect((await snap(f, state)).ci).toEqual({ kind: "config", reason: `CI: run ${newer.id} seen earlier is gone, newer than run ${older.id}` });
+    });
+
     test("a run read by id on another branch, head or repository, or for another workflow, is never accepted", async () => {
       for (const patch of [{ head_branch: "queue/8" }, { head_sha: sha("other") }, { repository: { id: TARGET + 1 } }, { event: "workflow_dispatch" }]) {
         const f = new FakeTarget();

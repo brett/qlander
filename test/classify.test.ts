@@ -144,6 +144,11 @@ describe("classify", () => {
     expect(classify(input([scanRun()], { "200": okScan }, { ...early, gone, hasPolicyPr: true }))).toMatchObject({ kind: "red", policy: true });
   });
 
+  test("a newer seen run that is gone is no verdict, even with an older green run of the workflow left", () => {
+    const gone = [{ runId: 150, path: ".github/workflows/ci.yml" }];
+    expect(classify(input([ciRun(), scanRun()], { "100": okCi, "200": okScan }, { gone }))).toEqual({ kind: "config", reason: "CI: run 150 seen earlier is gone, newer than run 100" });
+  });
+
   test("runs from another repo, another branch, a PR event or another sha are not evidence", () => {
     const fakes = [
       ciRun({ repository: { id: 1 } }),

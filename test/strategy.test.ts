@@ -7,8 +7,8 @@ import type { Config } from "../src/config";
 import { parseConfig } from "../src/config/load";
 import { policyHash } from "../src/queue";
 import { BASE_CONFIG, cfg, cmd, green, livePr, OPT_IN_FREE_HASH, OPT_IN_FREE_YAML, red, sha, Sim } from "./sim";
-import { actives } from "../src/ctx";
-import type { State } from "../src/state";
+import { actives, parkedBatch } from "../src/ctx";
+import { parseState, type State } from "../src/state";
 import { bench, meanOverCulprit, traceAbandons, traceAll } from "./strategy-bench";
 import { World } from "./world";
 import type { CiClass } from "../src/classify";
@@ -294,6 +294,21 @@ describe("reuseGreen: after a pause, a parked batch whose run went green lands w
     expect(on.s.lands[0]!.before).toBe(sha("main0"));
     expect(on.s.state.parked).toBeUndefined();
     expect(on.s.state.history.filter((h) => h.outcome === "landed").map((h) => h.n)).toEqual([1]);
+  });
+
+  test("a parked batch keeps the runs seen for it, adds those seen while parked, and has them back when it lands", () => {
+    const infra: CiClass = { kind: "infra", runs: [{ runId: 9, attempt: 1 }], reason: "cancelled" };
+    const s = new Sim(cfg(REUSE), () => infra).add(livePr(1), livePr(2));
+    const PATH = s.config.preLanding[0]!.path;
+    for (let i = 0; i < 6 && !s.paused; i++) {
+      if (s.state.active) s.state.active.seen = [{ runId: 9, path: PATH }];
+      s.tick();
+    }
+    expect(s.state.parked?.seen).toEqual([{ runId: 9, path: PATH }]);
+    expect(parkedBatch(s.state.parked!).seen).toEqual([{ runId: 9, path: PATH }]);
+    const d = decide(s.state, s.snapshot({ ciSeen: { [String(s.state.parked!.n)]: [{ runId: 9, path: PATH }, { runId: 12, path: PATH }] } }), s.config);
+    expect(d.state.parked?.seen).toEqual([{ runId: 9, path: PATH }, { runId: 12, path: PATH }]);
+    expect(parseState(JSON.stringify(d.state), s.config.names).parked?.seen).toEqual([{ runId: 9, path: PATH }, { runId: 12, path: PATH }]);
   });
 
   test("its runs are left to finish while it is parked, and cancelled once it is unparked", () => {

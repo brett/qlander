@@ -379,7 +379,7 @@ export async function buildSnapshot(i: SnapshotInput): Promise<Snapshot> {
   // queue.strategy.reuseGreen (DESIGN.md §5.7): a parked batch's CI, only when decide() could act on it.
   const p = i.state.parked;
   // Best effort: an unreadable run only means no reuse this tick (null), never a failed tick.
-  const parkedCi = i.cfg.strategy?.reuseGreen && p && !i.paused && p.base === main ? await batchCi(i, l, parkedBatch(p)).catch(() => null) : undefined;
+  const parkedCi = i.cfg.strategy?.reuseGreen && p && !i.paused && p.base === main ? await batchCi(i, l, parkedBatch(p), ciSeen).catch(() => null) : undefined;
   // Several batches running (DESIGN.md §5.6): each one's CI, by batch number.
   let cis: Snapshot["cis"];
   if (i.state.concurrent) {

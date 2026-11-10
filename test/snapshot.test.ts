@@ -6,7 +6,7 @@ import { admit } from "../src/admission";
 import { decide } from "../src/machine";
 import { interpretObservation } from "../src/ops";
 import { buildSnapshot, observe, prsOfInterest } from "../src/snapshot";
-import { emptyState, type State } from "../src/state";
+import { emptyState, parseState, type State } from "../src/state";
 import { FakeTarget } from "./fake-github";
 import { TARGET, job, sha } from "./sim";
 
@@ -131,8 +131,10 @@ describe("PR evidence", () => {
 });
 
 describe("batch CI, main's failures, pin reachability", () => {
-  function activeState(f: FakeTarget): State {
-    f.addPr(1);
+  /** `ready`: PR 1 also has its fast lane and review, so decide() keeps the batch. */
+  function activeState(f: FakeTarget, ready = false): State {
+    if (ready) readyPr(f, 1);
+    else f.addPr(1);
     const base = f.refs.get("main")!;
     const head = f.commit([base, sha("pr1")], "queue-head");
     f.refs.set("queue/9", head);
@@ -161,6 +163,107 @@ describe("batch CI, main's failures, pin reachability", () => {
     const s = await snap(f, state);
     expect(s.ci?.kind).toBe("red");
     expect(s.mainFailedJobs).toEqual(["Test"]);
+  });
+
+  describe("a run once seen is not lost to a gap in the run listing", () => {
+    const PATH = C.preLanding[0]!.path;
+    const green = () => C.preLanding[0]!.required_jobs.map((n) => job(n));
+
+    test("left out of one listing, it is read by id and stays pending; listed again, it lands green", async () => {
+      const f = new FakeTarget();
+      let state = activeState(f, true);
+      const run = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9", status: "in_progress", conclusion: null }, green());
+      const first = await snap(f, state);
+      expect(first.ci?.kind).toBe("pending");
+      expect(first.ciSeen).toEqual({ "9": [{ runId: run.id, path: PATH }] });
+      state = decide(state, first, C).state;
+      expect(state.active?.seen).toEqual([{ runId: run.id, path: PATH }]);
+
+      // The next listing drops it, well past noRunMinutes: still pending, never "no run".
+      f.unlistedRuns.add(run.id);
+      const gap = await snap(f, state);
+      expect(gap.ci?.kind).toBe("pending");
+      const d = decide(state, gap, C);
+      expect(d.state.outbox.some((n) => n.kind === "pause")).toBe(false);
+      expect(d.state.active?.seen).toEqual([{ runId: run.id, path: PATH }]);
+      state = d.state;
+
+      // Listed again, and finished: green.
+      f.unlistedRuns.delete(run.id);
+      f.updateRun(run, { status: "completed", conclusion: "success" });
+      expect((await snap(f, state)).ci).toEqual({ kind: "green" });
+    });
+
+    test("a seen run read by id carries its verdict: a red run left out of the listing is still red", async () => {
+      const f = new FakeTarget();
+      const state = activeState(f);
+      const run = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9", conclusion: "failure" }, [job("vet", "failure")]);
+      state.active!.seen = [{ runId: run.id, path: PATH }];
+      f.unlistedRuns.add(run.id);
+      expect((await snap(f, state)).ci?.kind).toBe("red");
+    });
+
+    test("a run never seen is still no run once noRunMinutes have passed", async () => {
+      const f = new FakeTarget();
+      const state = activeState(f);
+      const run = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9" }, green());
+      f.unlistedRuns.add(run.id);
+      const s = await snap(f, state);
+      expect(s.ci).toEqual({ kind: "config", reason: "CI: no run" });
+      expect(s.ciSeen).toEqual({ "9": [] });
+    });
+
+    test("a seen run that was deleted is gone: a configuration problem at once, and the queue pauses", async () => {
+      const f = new FakeTarget();
+      const state = activeState(f, true);
+      state.active!.builtAt = "2026-10-21T11:59:00.000Z"; // inside noRunMinutes: gone does not wait for it
+      const run = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9", status: "in_progress", conclusion: null }, green());
+      state.active!.seen = [{ runId: run.id, path: PATH }];
+      f.runs = f.runs.filter((r) => r.id !== run.id);
+      const s = await snap(f, state);
+      expect(s.ci).toEqual({ kind: "config", reason: `CI: run ${run.id} seen earlier is gone` });
+      const d = decide(state, s, C);
+      expect(d.state.outbox.some((n) => n.kind === "pause")).toBe(true);
+    });
+
+    test("a newer seen run that was deleted is not hidden by an older green run of the same workflow", async () => {
+      const f = new FakeTarget();
+      const state = activeState(f);
+      const older = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9" }, green());
+      const newer = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9", status: "in_progress", conclusion: null }, green());
+      state.active!.seen = [{ runId: older.id, path: PATH }, { runId: newer.id, path: PATH }];
+      f.runs = f.runs.filter((r) => r.id !== newer.id);
+      expect((await snap(f, state)).ci).toEqual({ kind: "config", reason: `CI: run ${newer.id} seen earlier is gone, newer than run ${older.id}` });
+    });
+
+    test("a run read by id on another branch, head or repository, or for another workflow, is never accepted", async () => {
+      for (const patch of [{ head_branch: "queue/8" }, { head_sha: sha("other") }, { repository: { id: TARGET + 1 } }, { event: "workflow_dispatch" }]) {
+        const f = new FakeTarget();
+        const state = activeState(f);
+        const run = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9" }, green());
+        state.active!.seen = [{ runId: run.id, path: PATH }];
+        f.updateRun(run, patch);
+        const s = await snap(f, state);
+        expect(s.ci).toEqual({ kind: "config", reason: `CI: run ${run.id} seen earlier is gone` });
+        expect(s.ciSeen).toEqual({ "9": [] });
+      }
+      const f = new FakeTarget();
+      const state = activeState(f);
+      const other = f.addRun({ head_sha: state.active!.head, head_branch: "queue/9", path: ".github/workflows/other.yml" }, green());
+      state.active!.seen = [{ runId: other.id, path: PATH }]; // recorded under the manifest path, but it is not that workflow's run
+      f.unlistedRuns.add(other.id);
+      expect((await snap(f, state)).ci).toEqual({ kind: "config", reason: `CI: run ${other.id} seen earlier is gone` });
+    });
+
+    test("seen survives a state round trip, and a malformed one is refused", () => {
+      const f = new FakeTarget();
+      const state = activeState(f);
+      state.active!.seen = [{ runId: 5, path: PATH }];
+      expect(parseState(JSON.stringify(state), NAMES).active?.seen).toEqual([{ runId: 5, path: PATH }]);
+      for (const seen of [[], [{ runId: 0, path: PATH }], [{ runId: 5, path: "" }], [{ runId: 5, path: PATH }, { runId: 5, path: PATH }], [{ runId: 5 }]]) {
+        expect(() => parseState(JSON.stringify({ ...state, active: { ...state.active, seen } }), NAMES)).toThrow();
+      }
+    });
   });
 
   test("pins reachable from main, and not", async () => {

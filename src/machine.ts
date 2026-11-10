@@ -41,7 +41,7 @@ import {
   withEvents,
 } from "./ctx";
 import { jobsOf } from "./hooks";
-import { type Active, ALONE_RED_MAX, type Baseline, type BaselineResult, type BuildSource, FLAKE_DAYS, type Op, type Pending, type Pin, type SeenRed, type Solo, type State } from "./state";
+import { type Active, ALONE_RED_MAX, type Baseline, type BaselineResult, type BuildSource, FLAKE_DAYS, type Op, type Parked, type Pending, type Pin, type SeenRed, type Solo, type State } from "./state";
 import type { FailedJob, RunRef } from "./types";
 import { type Command, queueRef } from "./validate";
 
@@ -296,7 +296,7 @@ function abandon(c: Ctx, a: Active, survivors: number[], note: string): void {
   const park = c.cfg.strategy?.reuseGreen && c.pausing && a.on === undefined && survivors.length === a.prs.length;
   if (park) {
     if (c.s.parked) unpark(c, `batch ${a.n} is parked instead`);
-    c.s.parked = { n: a.n, base: a.base, head: a.head, pins: pinsOf(c, a.prs), depth: a.depth, lineage: a.lineage, builtAt: a.builtAt, ...(a.stack ? { stack: a.stack } : {}) };
+    c.s.parked = { n: a.n, base: a.base, head: a.head, pins: pinsOf(c, a.prs), depth: a.depth, lineage: a.lineage, builtAt: a.builtAt, ...(a.stack ? { stack: a.stack } : {}), ...(a.seen ? { seen: a.seen } : {}) };
     c.log.push(`batch ${a.n} parked: it lands without a rebuild if its run on ${a.base} is green when the queue resumes`);
   } else cancelRuns(c, a.n, a.head);
   if (survivors.length > 0 && a.on === undefined) requeuePending(c, [{ prs: survivors, depth: a.depth, lineage: a.lineage }]);
@@ -410,6 +410,21 @@ function applyCommand(c: Ctx, cmd: Command): void {
 export const VERIFY_MIN_MINUTES = 15;
 
 /** DESIGN.md §7.3: never closes a PR; reports exactly what landed. */
+/**
+ * Each running batch keeps the manifest runs seen for it (DESIGN.md §6.2),
+ * so a run that a later listing leaves out is read again by id rather than
+ * counted as no run. Only ever added to; kept while the batch is parked,
+ * and cleared with it.
+ */
+function recordSeen(c: Ctx): void {
+  const batches: (Active | Parked)[] = [...actives(c.s), ...(c.s.parked ? [c.s.parked] : [])];
+  for (const a of batches) {
+    const seen = [...(a.seen ?? [])];
+    for (const r of c.snap.ciSeen?.[String(a.n)] ?? []) if (!seen.some((x) => x.runId === r.runId)) seen.push(r);
+    if (seen.length > (a.seen?.length ?? 0)) a.seen = seen;
+  }
+}
+
 function processVerify(c: Ctx): void {
   const keep = [];
   for (const v of c.s.verify) {
@@ -1386,6 +1401,7 @@ export function decide(prev: State, snap: Snapshot, cfg: Config): Decision {
   pruneOperatorSolo(c);
   applyCommands(c);
   processVerify(c);
+  recordSeen(c);
   // A pause still waiting in the outbox counts as paused: the runner has not
   // opened the pause issue yet, so snap.paused cannot know about it.
   const pausePending = prev.outbox.some((n) => n.kind === "pause");

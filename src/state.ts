@@ -98,6 +98,18 @@ export interface Active {
   on?: number;
   /** Linear landing only (optional, DESIGN.md §7.4): the stack, one commit per PR in `prs` order; `head` is the last. */
   stack?: StackCommit[];
+  /**
+   * The manifest runs seen for this batch (optional; absent until one is
+   * seen, DESIGN.md §6.2): a run once seen is read again by id when a later
+   * run listing leaves it out, so a gap in the listing never reads as no run.
+   */
+  seen?: SeenRun[];
+}
+
+/** A pre-landing run seen at a batch's head on its queue branch: its id and workflow path. */
+export interface SeenRun {
+  runId: number;
+  path: string;
 }
 
 export interface Pending {
@@ -395,6 +407,8 @@ export interface Parked {
   builtAt: string;
   /** Linear landing only (optional): the parked batch's stack, landed with it. */
   stack?: StackCommit[];
+  /** The runs seen for it (optional, as Active.seen), kept while it is parked. */
+  seen?: SeenRun[];
 }
 
 /** How long a flake counts towards the weekly figure. */
@@ -751,8 +765,9 @@ export function checkLease(x: unknown): Lease {
 
 /** One running batch, strictly (state.active, or an entry of state.concurrent). */
 function checkActive(x: unknown, where: string): O {
-  const a = obj(x, where, ["n", "base", "head", "depth", "prs", "lineage", "rerun", "rerunAt", "cancels", "builtAt"], ["redJobs", "on", "stack"]);
+  const a = obj(x, where, ["n", "base", "head", "depth", "prs", "lineage", "rerun", "rerunAt", "cancels", "builtAt"], ["redJobs", "on", "stack", "seen"]);
   if (a.redJobs !== undefined) failedJobs(a.redJobs, `${where}.redJobs`);
+  if (a.seen !== undefined) seenRuns(a.seen, `${where}.seen`);
   if (a.on !== undefined && int(a.on, `${where}.on`, 1) >= int(a.n, `${where}.n`, 1)) fail(`${where}.on: not an earlier batch`);
   if (a.rerunAt !== null) iso(a.rerunAt, `${where}.rerunAt`);
   int(a.n, `${where}.n`, 1);
@@ -774,6 +789,18 @@ function checkActive(x: unknown, where: string): O {
     if ((a.stack as StackCommit[]).at(-1)!.commit !== a.head) fail(`${where}.stack: its last commit is not the head`);
   }
   return a;
+}
+
+/** A batch's seen runs (Active.seen, Parked.seen): non-empty, distinct run ids. */
+function seenRuns(x: unknown, where: string): void {
+  const seen = arr(x, where);
+  if (seen.length === 0) fail(`${where}: empty (absent when no run was seen)`);
+  seen.forEach((v, i) => {
+    const o = obj(v, `${where}[${i}]`, ["runId", "path"]);
+    int(o.runId, `${where}[${i}].runId`, 1);
+    if (str(o.path, `${where}[${i}].path`) === "") fail(`${where}[${i}].path: empty`);
+  });
+  if (new Set(seen.map((v) => (v as O).runId)).size !== seen.length) fail(`${where}: duplicate run`);
 }
 
 /** Pins with distinct PRs, at least `min` of them. */
@@ -801,7 +828,8 @@ function checkStrategyState(s: O): void {
     });
   }
   if (s.parked !== undefined) {
-    const o = obj(s.parked, "parked", ["n", "base", "head", "pins", "depth", "lineage", "builtAt"], ["stack"]);
+    const o = obj(s.parked, "parked", ["n", "base", "head", "pins", "depth", "lineage", "builtAt"], ["stack", "seen"]);
+    if (o.seen !== undefined) seenRuns(o.seen, "parked.seen");
     int(o.n, "parked.n", 1);
     sha(o.base, "parked.base");
     sha(o.head, "parked.head");

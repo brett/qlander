@@ -28,6 +28,13 @@ export interface ClassifyInput {
   manifest: Manifest;
   runs: Run[];
   jobsByRun: JobsByRun;
+  /**
+   * Runs seen for this batch on an earlier tick that are gone now: missing
+   * from the listing, and a read by id found no such run at this head and
+   * queue branch. A workflow whose newest run is gone (none is left, or
+   * only older ones) is a configuration problem at once, whatever its `when`.
+   */
+  gone?: { runId: number; path: string }[];
   /** Evidence runs whose job list is incomplete: never classified green. */
   incomplete?: number[];
   /** The run listing itself is incomplete (a page limit, or fewer runs than GitHub's total): pending, never a verdict. */
@@ -202,11 +209,18 @@ export function classify(i: ClassifyInput): CiClass {
     };
   }
 
-  // Shape problems: no run, missing job list, missing or wrongly skipped required job.
+  // Shape problems: no run, a seen run gone, missing job list, missing or wrongly skipped required job.
+  const lost = (wf: WorkflowEntry, run: Run | undefined) => (i.gone ?? []).filter((g) => g.path === wf.path && (!run || g.runId > run.id)).map((g) => g.runId);
   const shape: string[] = [];
   for (const { wf, run, jobs } of perWf) {
     if (!run) {
-      if (wf.when === "always" && minutes(i.now, i.builtAt) > i.limits.noRunMinutes) shape.push(`${wf.name}: no run`);
+      if (lost(wf, run).length > 0) shape.push(`${wf.name}: run ${lost(wf, run).join(", ")} seen earlier is gone`);
+      else if (wf.when === "always" && minutes(i.now, i.builtAt) > i.limits.noRunMinutes) shape.push(`${wf.name}: no run`);
+      continue;
+    }
+    // A newer run seen earlier is gone: the run left may not be the newest, so it is no verdict.
+    if (lost(wf, run).length > 0) {
+      shape.push(`${wf.name}: run ${lost(wf, run).join(", ")} seen earlier is gone, newer than run ${run.id}`);
       continue;
     }
     if (run.status !== "completed") continue;

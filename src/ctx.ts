@@ -4,7 +4,7 @@
 import type { LivePr } from "./admission";
 import type { CiClass } from "./classify";
 import type { Config } from "./config";
-import type { Active, Baseline, HistoryItem, Notice, Parked, State } from "./state";
+import type { Active, Baseline, HistoryItem, Notice, Parked, SeenRun, State } from "./state";
 import { BUDGET_WARN_SHARE, type HookBatch, type HookPr, type LifecycleEvent, prOf } from "./hooks";
 import type { FailedJob } from "./types";
 import type { Command } from "./validate";
@@ -19,6 +19,8 @@ export interface Snapshot {
   prs: Record<string, LivePr>;
   /** For `state.active` (the batch running when the snapshot was read). */
   ci: CiClass | null;
+  /** The manifest runs seen this tick for each running batch whose CI was read, by batch number: decide() adds them to its `seen`. */
+  ciSeen?: Record<string, SeenRun[]>;
   /** For state.parked (queue.strategy.reuseGreen, DESIGN.md §5.7): its CI on main, read only while unpaused and main is its base. */
   parkedCi?: CiClass | null;
   /** For every running batch, by batch number (optional; present only while more than one batch runs, DESIGN.md §5.6). */
@@ -197,7 +199,7 @@ export const speculationRefused = (n: number) => `speculation on batch ${n} refu
 
 /** A parked batch (queue.strategy.reuseGreen) as a running batch, at this depth and lineage: for reading its CI, and for landing it. */
 export function parkedBatch(p: Parked, depth = p.depth, lineage = p.lineage): Active {
-  return { n: p.n, base: p.base, head: p.head, depth, prs: p.pins.map((x) => x.pr), lineage, rerun: null, rerunAt: null, cancels: [], builtAt: p.builtAt, ...(p.stack ? { stack: p.stack } : {}) };
+  return { n: p.n, base: p.base, head: p.head, depth, prs: p.pins.map((x) => x.pr), lineage, rerun: null, rerunAt: null, cancels: [], builtAt: p.builtAt, ...(p.stack ? { stack: p.stack } : {}), ...(p.seen ? { seen: p.seen } : {}) };
 }
 
 /** A main baseline as a running batch with no PRs: for reading its CI. */
